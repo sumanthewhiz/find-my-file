@@ -1,14 +1,15 @@
 # Find My File!
 
-A high-performance Windows application that reads and displays the NTFS Master File Table (MFT) directly, providing instant access to your entire file system structure.
+A high-performance Windows application that instantly readsthe NTFS Master File Table (MFT) directly, and provides instant searchability by name for any file or folder on your entire file system structure.
 
 ## Features
 
-- **Lightning-fast scanning**: Reads the MFT directly for sub-second indexing of millions of files
+- **Lightning-fast initial scanning**: Reads the MFT directly for sub-second indexing of millions of files
 - **Multi-drive support**: Scans all fixed NTFS drives (C:, D:, E:, etc.)
 - **Hierarchical tree view**: Browse your entire file system in an intuitive tree structure
-- **Real-time progress**: Live progress updates during MFT scanning
-- **Comprehensive statistics**: Shows total scan time, number of folders and files
+- **Blazing fast search**: Search results in <200ms
+- **Scoped Searches**: Clicking on a tree node automatically scopes the searches to that folder and its subfolders only
+- **Preview Pane**: Quick property previews for search results
 
 ## Requirements
 
@@ -27,7 +28,7 @@ A high-performance Windows application that reads and displays the NTFS Master F
 1. Run as Administrator
 2. Click anywhere in the window to start scanning
 3. Wait for MFT reading to complete
-4. Browse the file system tree
+4. Search for your files or folders by their names or part of it
 
 ## Technical Details
 
