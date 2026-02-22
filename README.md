@@ -49,4 +49,4 @@ MIT License - See LICENSE file for details
 
 ## Author
 
-Your Name - [@sumanthewhiz](https://github.com/sumanthewhiz)
+Suman Ghosh - [@sumanthewhiz](https://github.com/sumanthewhiz)
