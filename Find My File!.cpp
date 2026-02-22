@@ -15,6 +15,9 @@
 #include <cctype>
 #include <set>
 #include <uxtheme.h>
+#include <thread>
+#include <atomic>
+#include <mutex>
 
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "shlwapi.lib")
@@ -33,6 +36,17 @@
 #define IDM_CTX_COPY_PATH   4001
 #define IDM_CTX_OPEN_FOLDER 4002
 #define IDC_DARKMODE_BTN    5000
+#define IDT_SEARCH_DEBOUNCE 6000
+#define SEARCH_DEBOUNCE_MS  300
+#define IDT_USN_POLL        6001
+#define USN_POLL_MS         2000
+#define WM_USN_UPDATED      (WM_USER + 1)
+#define IDC_PROPERTIES      7000
+#define IDC_PROP_TOGGLE     7001
+#define PROPERTIES_PANEL_W  420
+#define SPLITTER_WIDTH      5
+#define MIN_LIST_WIDTH      200
+#define MIN_PROP_WIDTH      150
 
 // Global Variables:
 HINSTANCE hInst;
@@ -49,12 +63,51 @@ HWND hListView = NULL;
 std::wstring currentDriveLetter;
 std::wstring currentSearchKeyword;
 std::wstring currentSearchScope;
+bool bWildcardSearch = false;  // true when current search uses wildcard/glob pattern
 HFONT hUIFont = NULL;
 HBRUSH hToolbarBrush = NULL;
 HBRUSH hStatusBrush = NULL;
 HBRUSH hEditBrush = NULL;
 HWND hDarkModeBtn = NULL;
 bool bDarkMode = false;
+bool bTreeRenderedOnce = false;
+HIMAGELIST hSysImageList = NULL;
+std::unordered_map<std::wstring, int> iconCache;  // extension -> icon index
+int iFolderIcon = -1;  // cached folder icon index
+
+// USN journal live monitor
+std::thread usnMonitorThread;
+std::atomic<bool> bUsnMonitorRunning{false};
+std::mutex usnMutex;  // protects pendingUsnChanges
+struct UsnChange {
+    ULONGLONG fileRef;
+    ULONGLONG parentRef;
+    std::wstring fileName;
+    bool isDirectory;
+    DWORD reason;
+    LARGE_INTEGER timestamp;
+};
+std::vector<UsnChange> pendingUsnChanges;
+USN lastUsnProcessed = 0;
+ULONGLONG usnJournalId = 0;
+HWND hMainWnd = NULL;
+
+// Properties panel
+HWND hPropertiesPanel = NULL;
+HBRUSH hPropertiesBrush = NULL;
+HWND hPropToggleBtn = NULL;
+HWND hPropToggleTooltip = NULL;
+bool bPropertiesCollapsed = false;
+HFONT hToggleFont = NULL;       // larger font for the toggle button glyph
+HFONT hHeaderFont = NULL;       // bold font for ListView column headers
+bool bToggleHovered = false;    // mouse is hovering over the toggle button
+
+// Splitter between list view and properties panel
+int propertiesPanelW = PROPERTIES_PANEL_W;  // current width (resizable)
+bool bSplitterDragging = false;
+int splitterDragStartX = 0;
+int splitterDragStartW = 0;
+RECT splitterRect = {0, 0, 0, 0};  // cached hit-test rect in client coords
 
 struct ColorScheme {
     COLORREF toolbarBg;
@@ -71,6 +124,14 @@ struct ColorScheme {
     COLORREF highlightBg;
     COLORREF highlightText;
     COLORREF matchHighlight;
+    COLORREF buttonBg;
+    COLORREF buttonText;
+    COLORREF buttonBorder;
+    COLORREF buttonDisabledBg;
+    COLORREF buttonDisabledText;
+    COLORREF headerBg;
+    COLORREF headerText;
+    COLORREF headerBorder;
 };
 
 static const ColorScheme LightScheme = {
@@ -88,6 +149,14 @@ static const ColorScheme LightScheme = {
     RGB(0, 120, 215),    // highlightBg
     RGB(255, 255, 255),  // highlightText
     RGB(255, 255, 0),    // matchHighlight
+    RGB(225, 228, 235),  // buttonBg
+    RGB(30, 30, 30),     // buttonText
+    RGB(180, 185, 195),  // buttonBorder
+    RGB(235, 235, 235),  // buttonDisabledBg
+    RGB(160, 160, 160),  // buttonDisabledText
+    RGB(234, 238, 246),  // headerBg
+    RGB(45, 50, 65),     // headerText
+    RGB(200, 206, 218),  // headerBorder
 };
 
 static const ColorScheme DarkScheme = {
@@ -105,6 +174,14 @@ static const ColorScheme DarkScheme = {
     RGB(60, 90, 140),    // highlightBg
     RGB(255, 255, 255),  // highlightText
     RGB(180, 150, 0),    // matchHighlight
+    RGB(65, 65, 70),     // buttonBg
+    RGB(220, 220, 220),  // buttonText
+    RGB(100, 100, 110),  // buttonBorder
+    RGB(50, 50, 55),     // buttonDisabledBg
+    RGB(100, 100, 100),  // buttonDisabledText
+    RGB(45, 47, 52),     // headerBg
+    RGB(190, 195, 210),  // headerText
+    RGB(65, 68, 78),     // headerBorder
 };
 
 static const ColorScheme& CurrentScheme() { return bDarkMode ? DarkScheme : LightScheme; }
@@ -114,6 +191,7 @@ struct FileEntry {
     ULONGLONG fileReference;
     ULONGLONG parentReference;
     std::wstring fileName;
+    std::wstring lowerFileName;  // pre-computed lowercased filename for fast search
     bool isDirectory;
     bool hasChildren;       // cached: does this dir have children in childrenMap?
     bool childrenLoaded;    // have we populated children into the TreeView?
@@ -129,6 +207,12 @@ std::unordered_map<HTREEITEM, ULONGLONG> treeItemToRef;
 std::unordered_map<std::wstring, std::vector<ULONGLONG>> invertedIndex;
 // Stemmed index: stemmed token -> list of file references
 std::unordered_map<std::wstring, std::vector<ULONGLONG>> stemmedIndex;
+// Sorted token lists for O(log N) prefix lookups during search
+std::vector<std::wstring> sortedTokens;
+std::vector<std::wstring> sortedStemTokens;
+// Trigram index: 3-char hash -> sorted list of file references containing that trigram.
+// Used to eliminate the O(N) fileMap scan for substring matching.
+std::unordered_map<ULONGLONG, std::vector<ULONGLONG>> trigramIndex;
 // Cached full paths for each file reference
 std::unordered_map<ULONGLONG, std::wstring> fullPathCache;
 // Cached timestamps (USN timestamp) for each file reference
@@ -172,6 +256,29 @@ void                PerformSearch(const std::wstring& keyword, ULONGLONG scopeRe
 void                PopulateSearchResults();
 void                LaunchSearchResult(int index);
 void                ShowTab(int tabIndex);
+void                TriggerSearch(HWND hWnd);
+int                 GetFileIconIndex(const std::wstring& fileName, bool isDirectory);
+void                AddFileToIndex(ULONGLONG fileRef, const std::wstring& lowerName);
+void                RemoveFileFromIndex(ULONGLONG fileRef, const std::wstring& lowerName);
+void                StartUsnMonitor(const std::wstring& drive);
+void                StopUsnMonitor();
+void                ProcessPendingUsnChanges();
+void                UpdatePropertiesPanel(int selectedIndex);
+void                RebuildSortedTokens();
+
+// Update the tooltip text for the properties toggle button to reflect its current action.
+static void UpdateToggleTooltip()
+{
+    if (!hPropToggleTooltip || !hPropToggleBtn)
+        return;
+    TOOLINFOW ti = {0};
+    ti.cbSize = sizeof(TOOLINFOW);
+    ti.uFlags = TTF_IDISHWND | TTF_SUBCLASS;
+    ti.hwnd = GetParent(hPropToggleBtn);
+    ti.uId = (UINT_PTR)hPropToggleBtn;
+    ti.lpszText = (LPWSTR)(bPropertiesCollapsed ? L"Show properties panel" : L"Hide properties panel");
+    SendMessage(hPropToggleTooltip, TTM_UPDATETIPTEXTW, 0, (LPARAM)&ti);
+}
 
 static void ApplyFontToAllChildren(HWND hParent, HFONT hFont)
 {
@@ -212,6 +319,9 @@ static void ApplyTheme(HWND hWnd)
     if (hDarkModeBtn)
         SetWindowTextW(hDarkModeBtn, bDarkMode ? L"\u2600 Light" : L"\u263D Dark");
 
+    if (hPropertiesBrush) { DeleteObject(hPropertiesBrush); hPropertiesBrush = NULL; }
+    hPropertiesBrush = CreateSolidBrush(cs.editBg);
+
     InvalidateRect(hWnd, NULL, TRUE);
     HWND hChild = GetWindow(hWnd, GW_CHILD);
     while (hChild)
@@ -219,6 +329,13 @@ static void ApplyTheme(HWND hWnd)
         InvalidateRect(hChild, NULL, TRUE);
         hChild = GetWindow(hChild, GW_HWNDNEXT);
     }
+
+    // Force the properties panel to fully repaint its background on theme change;
+    // a plain InvalidateRect is not enough for an EDIT control that caches its brush.
+    if (hPropertiesPanel)
+        RedrawWindow(hPropertiesPanel, NULL, NULL, RDW_ERASE | RDW_INVALIDATE | RDW_FRAME);
+    if (hSearchEdit)
+        RedrawWindow(hSearchEdit, NULL, NULL, RDW_ERASE | RDW_INVALIDATE | RDW_FRAME);
 }
 
 static const int TOOLBAR_ROW_HEIGHT = 44;
@@ -511,6 +628,9 @@ void BuildSearchIndex(const std::wstring& drive)
     invertedIndex.clear();
     stemmedIndex.clear();
     fullPathCache.clear();
+    sortedTokens.clear();
+    sortedStemTokens.clear();
+    trigramIndex.clear();
     invertedIndex.reserve(fileMap.size());
     stemmedIndex.reserve(fileMap.size());
 
@@ -525,10 +645,7 @@ void BuildSearchIndex(const std::wstring& drive)
         if (entry.fileName.empty() || entry.fileName.length() > 255)
             continue;
 
-        // Index the full filename as a lowercased key
-        std::wstring lowerName = entry.fileName;
-        for (auto& ch : lowerName)
-            ch = towlower(ch);
+        const std::wstring& lowerName = entry.lowerFileName;
 
         invertedIndex[lowerName].push_back(fileRef);
 
@@ -598,33 +715,418 @@ void BuildSearchIndex(const std::wstring& drive)
             UpdateProgress(92 + (int)((processed * 6ULL) / total), status);
         }
     }
+
+    // Build sorted token vectors for O(log N) prefix range lookups
+    sortedTokens.reserve(invertedIndex.size());
+    for (auto& kv : invertedIndex)
+        sortedTokens.push_back(kv.first);
+    std::sort(sortedTokens.begin(), sortedTokens.end());
+
+    sortedStemTokens.reserve(stemmedIndex.size());
+    for (auto& kv : stemmedIndex)
+        sortedStemTokens.push_back(kv.first);
+    std::sort(sortedStemTokens.begin(), sortedStemTokens.end());
+
+    // Build trigram index for O(1) substring candidate lookup.
+    // For each filename, extract every 3-character window and map it to the file ref.
+    trigramIndex.clear();
+    trigramIndex.reserve(32768);
+    for (auto& pair : fileMap)
+    {
+        const std::wstring& ln = pair.second.lowerFileName;
+        if (ln.length() < 3)
+            continue;
+        ULONGLONG ref = pair.first;
+        for (size_t i = 0; i + 2 < ln.length(); i++)
+        {
+            ULONGLONG key = ((ULONGLONG)(unsigned short)ln[i]) |
+                            ((ULONGLONG)(unsigned short)ln[i + 1] << 16) |
+                            ((ULONGLONG)(unsigned short)ln[i + 2] << 32);
+            trigramIndex[key].push_back(ref);
+        }
+    }
+    // Sort and deduplicate each posting list for fast intersection
+    for (auto& kv : trigramIndex)
+    {
+        std::sort(kv.second.begin(), kv.second.end());
+        kv.second.erase(std::unique(kv.second.begin(), kv.second.end()), kv.second.end());
+    }
 }
 
-// Compute a recency bonus (0-10) based on USN timestamp age
-static int GetRecencyBonus(ULONGLONG fileRef)
+// Add a single file to the inverted/stemmed/trigram indexes incrementally.
+void AddFileToIndex(ULONGLONG fileRef, const std::wstring& lowerName)
+{
+    if (lowerName.empty() || lowerName.length() > 255)
+        return;
+
+    invertedIndex[lowerName].push_back(fileRef);
+
+    std::wstring token;
+    for (size_t i = 0; i < lowerName.size(); i++)
+    {
+        wchar_t ch = lowerName[i];
+        if (ch == L' ' || ch == L'.' || ch == L'-' || ch == L'_')
+        {
+            if (!token.empty())
+            {
+                if (token != lowerName)
+                    invertedIndex[token].push_back(fileRef);
+                std::wstring stemmedTok = StemWord(token);
+                if (stemmedTok != token && stemmedTok != lowerName)
+                    stemmedIndex[stemmedTok].push_back(fileRef);
+                token.clear();
+            }
+        }
+        else
+        {
+            token += ch;
+        }
+    }
+    if (!token.empty() && token != lowerName)
+    {
+        invertedIndex[token].push_back(fileRef);
+        std::wstring stemmedTok = StemWord(token);
+        if (stemmedTok != token && stemmedTok != lowerName)
+            stemmedIndex[stemmedTok].push_back(fileRef);
+    }
+
+    std::wstring stemmedName = StemWord(lowerName);
+    if (stemmedName != lowerName)
+        stemmedIndex[stemmedName].push_back(fileRef);
+
+    if (lowerName.length() >= 3)
+    {
+        for (size_t i = 0; i + 2 < lowerName.length(); i++)
+        {
+            ULONGLONG key = ((ULONGLONG)(unsigned short)lowerName[i]) |
+                            ((ULONGLONG)(unsigned short)lowerName[i + 1] << 16) |
+                            ((ULONGLONG)(unsigned short)lowerName[i + 2] << 32);
+            auto& list = trigramIndex[key];
+            list.push_back(fileRef);
+        }
+    }
+}
+
+// Remove a single file from the inverted/stemmed/trigram indexes.
+void RemoveFileFromIndex(ULONGLONG fileRef, const std::wstring& lowerName)
+{
+    if (lowerName.empty() || lowerName.length() > 255)
+        return;
+
+    auto removeRef = [fileRef](std::vector<ULONGLONG>& v) {
+        v.erase(std::remove(v.begin(), v.end(), fileRef), v.end());
+    };
+
+    auto tryRemove = [&](std::unordered_map<std::wstring, std::vector<ULONGLONG>>& idx,
+                         const std::wstring& key) {
+        auto it = idx.find(key);
+        if (it != idx.end())
+        {
+            removeRef(it->second);
+            if (it->second.empty())
+                idx.erase(it);
+        }
+    };
+
+    tryRemove(invertedIndex, lowerName);
+
+    std::wstring token;
+    for (size_t i = 0; i < lowerName.size(); i++)
+    {
+        wchar_t ch = lowerName[i];
+        if (ch == L' ' || ch == L'.' || ch == L'-' || ch == L'_')
+        {
+            if (!token.empty())
+            {
+                if (token != lowerName)
+                    tryRemove(invertedIndex, token);
+                std::wstring stemmedTok = StemWord(token);
+                if (stemmedTok != token && stemmedTok != lowerName)
+                    tryRemove(stemmedIndex, stemmedTok);
+                token.clear();
+            }
+        }
+        else
+        {
+            token += ch;
+        }
+    }
+    if (!token.empty() && token != lowerName)
+    {
+        tryRemove(invertedIndex, token);
+        std::wstring stemmedTok = StemWord(token);
+        if (stemmedTok != token && stemmedTok != lowerName)
+            tryRemove(stemmedIndex, stemmedTok);
+    }
+
+    std::wstring stemmedName = StemWord(lowerName);
+    if (stemmedName != lowerName)
+        tryRemove(stemmedIndex, stemmedName);
+
+    if (lowerName.length() >= 3)
+    {
+        for (size_t i = 0; i + 2 < lowerName.length(); i++)
+        {
+            ULONGLONG key = ((ULONGLONG)(unsigned short)lowerName[i]) |
+                            ((ULONGLONG)(unsigned short)lowerName[i + 1] << 16) |
+                            ((ULONGLONG)(unsigned short)lowerName[i + 2] << 32);
+            auto tgIt = trigramIndex.find(key);
+            if (tgIt != trigramIndex.end())
+            {
+                removeRef(tgIt->second);
+                if (tgIt->second.empty())
+                    trigramIndex.erase(tgIt);
+            }
+        }
+    }
+}
+
+// Rebuild the sorted token vectors after incremental changes.
+void RebuildSortedTokens()
+{
+    sortedTokens.clear();
+    sortedTokens.reserve(invertedIndex.size());
+    for (auto& kv : invertedIndex)
+        sortedTokens.push_back(kv.first);
+    std::sort(sortedTokens.begin(), sortedTokens.end());
+
+    sortedStemTokens.clear();
+    sortedStemTokens.reserve(stemmedIndex.size());
+    for (auto& kv : stemmedIndex)
+        sortedStemTokens.push_back(kv.first);
+    std::sort(sortedStemTokens.begin(), sortedStemTokens.end());
+}
+
+// Process pending USN changes (called on the UI thread via WM_USN_UPDATED).
+void ProcessPendingUsnChanges()
+{
+    std::vector<UsnChange> changes;
+    {
+        std::lock_guard<std::mutex> lock(usnMutex);
+        changes.swap(pendingUsnChanges);
+    }
+
+    if (changes.empty())
+        return;
+
+    bool indexDirty = false;
+
+    for (auto& ch : changes)
+    {
+        ULONGLONG fileRef = ch.fileRef;
+        ULONGLONG parentRef = ch.parentRef;
+
+        if (ch.reason & USN_REASON_FILE_DELETE)
+        {
+            auto it = fileMap.find(fileRef);
+            if (it != fileMap.end())
+            {
+                RemoveFileFromIndex(fileRef, it->second.lowerFileName);
+                ULONGLONG oldParent = it->second.parentReference & 0x0000FFFFFFFFFFFF;
+                auto cIt = childrenMap.find(oldParent);
+                if (cIt != childrenMap.end())
+                {
+                    auto& cv = cIt->second;
+                    cv.erase(std::remove(cv.begin(), cv.end(), fileRef), cv.end());
+                }
+                fullPathCache.erase(fileRef);
+                timestampCache.erase(fileRef);
+                fileMap.erase(it);
+                indexDirty = true;
+            }
+        }
+        else if (ch.reason & (USN_REASON_FILE_CREATE | USN_REASON_RENAME_NEW_NAME))
+        {
+            auto existing = fileMap.find(fileRef);
+            if (existing != fileMap.end())
+            {
+                RemoveFileFromIndex(fileRef, existing->second.lowerFileName);
+                ULONGLONG oldParent = existing->second.parentReference & 0x0000FFFFFFFFFFFF;
+                auto cIt = childrenMap.find(oldParent);
+                if (cIt != childrenMap.end())
+                {
+                    auto& cv = cIt->second;
+                    cv.erase(std::remove(cv.begin(), cv.end(), fileRef), cv.end());
+                }
+                fullPathCache.erase(fileRef);
+            }
+
+            FileEntry entry;
+            entry.fileReference = fileRef;
+            entry.parentReference = parentRef;
+            entry.fileName = ch.fileName;
+            entry.lowerFileName = ch.fileName;
+            for (auto& lch : entry.lowerFileName)
+                lch = towlower(lch);
+            entry.isDirectory = ch.isDirectory;
+            entry.hasChildren = false;
+            entry.childrenLoaded = false;
+
+            timestampCache[fileRef] = ch.timestamp;
+            fileMap[fileRef] = std::move(entry);
+            ULONGLONG parentRef48 = parentRef & 0x0000FFFFFFFFFFFF;
+            childrenMap[parentRef48].push_back(fileRef);
+
+            auto parentIt = fileMap.find(parentRef48);
+            if (parentIt != fileMap.end() && parentIt->second.isDirectory)
+                parentIt->second.hasChildren = true;
+
+            AddFileToIndex(fileRef, fileMap[fileRef].lowerFileName);
+            indexDirty = true;
+        }
+        else if (ch.reason & USN_REASON_BASIC_INFO_CHANGE)
+        {
+            timestampCache[fileRef] = ch.timestamp;
+        }
+    }
+
+    if (indexDirty)
+    {
+        RebuildSortedTokens();
+        fullPathCache.clear();
+    }
+}
+
+// Background thread: poll USN journal for new changes.
+static void UsnMonitorThreadFunc(std::wstring drive)
+{
+    std::wstring volumePath = L"\\\\.\\" + drive + L":";
+    HANDLE hVolume = CreateFileW(volumePath.c_str(), GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
+    if (hVolume == INVALID_HANDLE_VALUE)
+        return;
+
+    const DWORD bufferSize = 64 * 1024;
+    std::vector<BYTE> buffer(bufferSize);
+
+    while (bUsnMonitorRunning.load())
+    {
+        READ_USN_JOURNAL_DATA_V0 readData = {0};
+        readData.StartUsn = lastUsnProcessed;
+        readData.ReasonMask = USN_REASON_FILE_CREATE | USN_REASON_FILE_DELETE |
+                              USN_REASON_RENAME_NEW_NAME | USN_REASON_RENAME_OLD_NAME |
+                              USN_REASON_BASIC_INFO_CHANGE;
+        readData.ReturnOnlyOnClose = FALSE;
+        readData.Timeout = 0;
+        readData.BytesToWaitFor = 0;
+        readData.UsnJournalID = usnJournalId;
+
+        DWORD bytesReturned = 0;
+        BOOL ok = DeviceIoControl(hVolume, FSCTL_READ_USN_JOURNAL,
+            &readData, sizeof(readData),
+            buffer.data(), bufferSize,
+            &bytesReturned, NULL);
+
+        if (!ok || bytesReturned <= sizeof(USN))
+        {
+            Sleep(USN_POLL_MS);
+            continue;
+        }
+
+        USN nextUsn = *(USN*)buffer.data();
+        DWORD offset = sizeof(USN);
+
+        std::vector<UsnChange> batch;
+
+        while (offset < bytesReturned)
+        {
+            USN_RECORD* record = (USN_RECORD*)(buffer.data() + offset);
+            if (record->RecordLength == 0)
+                break;
+            if (offset + record->RecordLength > bytesReturned)
+                break;
+
+            DWORD fnLen = record->FileNameLength / sizeof(WCHAR);
+            if (fnLen > 0 && fnLen <= 255 &&
+                record->FileNameOffset + record->FileNameLength <= record->RecordLength)
+            {
+                WCHAR* fn = (WCHAR*)((BYTE*)record + record->FileNameOffset);
+                UsnChange ch;
+                ch.fileRef = record->FileReferenceNumber & 0x0000FFFFFFFFFFFF;
+                ch.parentRef = record->ParentFileReferenceNumber;
+                ch.fileName = std::wstring(fn, fnLen);
+                ch.isDirectory = (record->FileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+                ch.reason = record->Reason;
+                ch.timestamp.QuadPart = record->TimeStamp.QuadPart;
+                batch.push_back(std::move(ch));
+            }
+
+            offset += record->RecordLength;
+        }
+
+        if (!batch.empty())
+        {
+            {
+                std::lock_guard<std::mutex> lock(usnMutex);
+                pendingUsnChanges.insert(pendingUsnChanges.end(),
+                    std::make_move_iterator(batch.begin()),
+                    std::make_move_iterator(batch.end()));
+            }
+            if (hMainWnd)
+                PostMessage(hMainWnd, WM_USN_UPDATED, 0, 0);
+        }
+
+        lastUsnProcessed = nextUsn;
+        Sleep(USN_POLL_MS);
+    }
+
+    CloseHandle(hVolume);
+}
+
+void StartUsnMonitor(const std::wstring& drive)
+{
+    StopUsnMonitor();
+
+    std::wstring volumePath = L"\\\\.\\" + drive + L":";
+    HANDLE hVolume = CreateFileW(volumePath.c_str(), GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
+    if (hVolume != INVALID_HANDLE_VALUE)
+    {
+        DWORD bytesReturned = 0;
+        USN_JOURNAL_DATA_V0 journalData = {0};
+        if (DeviceIoControl(hVolume, FSCTL_QUERY_USN_JOURNAL, NULL, 0,
+            &journalData, sizeof(journalData), &bytesReturned, NULL))
+        {
+            lastUsnProcessed = journalData.NextUsn;
+            usnJournalId = journalData.UsnJournalID;
+        }
+        CloseHandle(hVolume);
+    }
+
+    bUsnMonitorRunning.store(true);
+    usnMonitorThread = std::thread(UsnMonitorThreadFunc, drive);
+}
+
+void StopUsnMonitor()
+{
+    bUsnMonitorRunning.store(false);
+    if (usnMonitorThread.joinable())
+        usnMonitorThread.join();
+    std::lock_guard<std::mutex> lock(usnMutex);
+    pendingUsnChanges.clear();
+}
+
+// Compute a recency bonus (0-10) based on USN timestamp age.
+// 'now' is the current time as a 64-bit FILETIME value, passed in to avoid repeated syscalls.
+static int GetRecencyBonus(ULONGLONG fileRef, ULONGLONG now)
 {
     auto tsIt = timestampCache.find(fileRef);
     if (tsIt == timestampCache.end())
         return 0;
 
-    // Get current time as FILETIME (100-nanosecond intervals since 1601)
-    FILETIME ftNow;
-    GetSystemTimeAsFileTime(&ftNow);
-    ULONGLONG now = ((ULONGLONG)ftNow.dwHighDateTime << 32) | ftNow.dwLowDateTime;
     ULONGLONG fileTime = (ULONGLONG)tsIt->second.QuadPart;
 
     if (fileTime == 0 || fileTime > now)
         return 0;
 
-    // Time difference in 100-ns units
     ULONGLONG diff = now - fileTime;
     const ULONGLONG TICKS_PER_DAY = 864000000000ULL; // 10^7 * 86400
 
     ULONGLONG daysOld = diff / TICKS_PER_DAY;
 
-    if (daysOld <= 7)   return 10;  // Modified within last week
-    if (daysOld <= 30)  return 7;   // Modified within last month
-    if (daysOld <= 365) return 3;   // Modified within last year
+    if (daysOld <= 7)   return 10;
+    if (daysOld <= 30)  return 7;
+    if (daysOld <= 365) return 3;
     return 0;
 }
 
@@ -640,6 +1142,84 @@ static bool HasExactCaseMatch(const std::wstring& fileName, const std::wstring& 
         return true;
     }
     return false;
+}
+
+// Check if a search keyword contains wildcard characters (* or ?)
+static bool IsWildcardPattern(const std::wstring& s)
+{
+    for (wchar_t ch : s)
+    {
+        if (ch == L'*' || ch == L'?')
+            return true;
+    }
+    return false;
+}
+
+// Case-insensitive glob/wildcard match. Supports * (any sequence) and ? (any single char).
+// Uses an iterative algorithm with backtracking — no recursion, O(N*M) worst case.
+static bool WildcardMatch(const wchar_t* str, const wchar_t* pattern)
+{
+    const wchar_t* sp = nullptr;  // backtrack position in str
+    const wchar_t* pp = nullptr;  // backtrack position in pattern
+
+    while (*str)
+    {
+        if (*pattern == L'*')
+        {
+            pattern++;
+            // Collapse consecutive *'s
+            while (*pattern == L'*') pattern++;
+            if (!*pattern)
+                return true; // trailing * matches everything
+            pp = pattern;
+            sp = str;
+        }
+        else if (*pattern == L'?' || towlower(*str) == towlower(*pattern))
+        {
+            str++;
+            pattern++;
+        }
+        else if (pp)
+        {
+            // Backtrack: advance the match-start position by one
+            sp++;
+            str = sp;
+            pattern = pp;
+        }
+        else
+        {
+            return false;
+        }
+    }
+    // Consume trailing *'s in pattern
+    while (*pattern == L'*') pattern++;
+    return *pattern == L'\0';
+}
+
+// Extract contiguous literal (non-wildcard) spans from a pattern.
+// Used to accelerate wildcard search via trigram pre-filtering.
+static std::vector<std::wstring> ExtractLiteralSpans(const std::wstring& pattern)
+{
+    std::vector<std::wstring> spans;
+    std::wstring current;
+    for (wchar_t ch : pattern)
+    {
+        if (ch == L'*' || ch == L'?')
+        {
+            if (!current.empty())
+            {
+                spans.push_back(current);
+                current.clear();
+            }
+        }
+        else
+        {
+            current += ch;
+        }
+    }
+    if (!current.empty())
+        spans.push_back(current);
+    return spans;
 }
 
 // Check if a file reference is a descendant of the given ancestor directory reference
@@ -664,11 +1244,34 @@ static bool IsDescendantOf(ULONGLONG fileRef, ULONGLONG ancestorRef)
     return false;
 }
 
+// Helper: use binary search on a sorted token vector to find all tokens with a given prefix.
+// Calls 'callback' for each matching token's posting list in the given index.
+template<typename Func>
+static void ForEachPrefixMatch(
+    const std::vector<std::wstring>& sortedKeys,
+    const std::unordered_map<std::wstring, std::vector<ULONGLONG>>& index,
+    const std::wstring& prefix,
+    Func callback)
+{
+    auto lo = std::lower_bound(sortedKeys.begin(), sortedKeys.end(), prefix);
+    for (auto it = lo; it != sortedKeys.end(); ++it)
+    {
+        const std::wstring& token = *it;
+        if (token.length() < prefix.length() ||
+            token.compare(0, prefix.length(), prefix) != 0)
+            break;
+        auto idxIt = index.find(token);
+        if (idxIt != index.end())
+            callback(token, idxIt->second);
+    }
+}
+
 // Perform a search and populate searchResults sorted by match quality.
 // If scopeRef != 0, only include results that are descendants of that directory.
 void PerformSearch(const std::wstring& keyword, ULONGLONG scopeRef)
 {
     searchResults.clear();
+    bWildcardSearch = false;
 
     if (keyword.empty() || fileMap.empty())
         return;
@@ -677,62 +1280,225 @@ void PerformSearch(const std::wstring& keyword, ULONGLONG scopeRef)
     for (auto& ch : lowerKeyword)
         ch = towlower(ch);
 
-    // Collect matching file refs with base scores
-    std::unordered_map<ULONGLONG, int> matchScores;
-
-    // 1) Exact full-name match (highest base score = 100)
-    auto exactIt = invertedIndex.find(lowerKeyword);
-    if (exactIt != invertedIndex.end())
+    // --- Wildcard/glob search path ---
+    if (IsWildcardPattern(lowerKeyword))
     {
-        for (ULONGLONG ref : exactIt->second)
+        bWildcardSearch = true;
+
+        // Get current time once for recency bonus
+        FILETIME ftNow;
+        GetSystemTimeAsFileTime(&ftNow);
+        ULONGLONG now = ((ULONGLONG)ftNow.dwHighDateTime << 32) | ftNow.dwLowDateTime;
+
+        // Try to accelerate via trigram pre-filtering:
+        // Extract literal spans from the pattern, pick the longest one (>= 3 chars),
+        // and use its trigrams to narrow the candidate set before running the glob.
+        std::vector<std::wstring> literals = ExtractLiteralSpans(lowerKeyword);
+        std::wstring longestLiteral;
+        for (auto& span : literals)
         {
-            matchScores[ref] = max(matchScores[ref], 100);
+            if (span.length() > longestLiteral.length())
+                longestLiteral = span;
+        }
+
+        const std::vector<ULONGLONG>* trigramCandidates = nullptr;
+        if (longestLiteral.length() >= 3)
+        {
+            // Extract trigrams from the longest literal span
+            std::vector<ULONGLONG> litTrigrams;
+            litTrigrams.reserve(longestLiteral.length() - 2);
+            for (size_t i = 0; i + 2 < longestLiteral.length(); i++)
+            {
+                ULONGLONG key = ((ULONGLONG)(unsigned short)longestLiteral[i]) |
+                                ((ULONGLONG)(unsigned short)longestLiteral[i + 1] << 16) |
+                                ((ULONGLONG)(unsigned short)longestLiteral[i + 2] << 32);
+                litTrigrams.push_back(key);
+            }
+            // Pick the trigram with the smallest posting list
+            const std::vector<ULONGLONG>* smallest = nullptr;
+            for (ULONGLONG tg : litTrigrams)
+            {
+                auto tgIt = trigramIndex.find(tg);
+                if (tgIt == trigramIndex.end())
+                {
+                    smallest = nullptr;
+                    break;
+                }
+                if (!smallest || tgIt->second.size() < smallest->size())
+                    smallest = &tgIt->second;
+            }
+            trigramCandidates = smallest;
+        }
+
+        searchResults.reserve(4096);
+
+        auto processWildcardCandidate = [&](ULONGLONG ref, const FileEntry& entry) {
+            if (scopeRef != 0 && ref != scopeRef && !IsDescendantOf(ref, scopeRef))
+                return;
+            if (!WildcardMatch(entry.lowerFileName.c_str(), lowerKeyword.c_str()))
+                return;
+
+            int score = 90; // wildcard match base score
+            score += GetRecencyBonus(ref, now);
+
+            SearchResult sr;
+            sr.fileRef = ref;
+            sr.fileName = entry.fileName;
+            sr.isDirectory = entry.isDirectory;
+            sr.matchScore = score;
+            searchResults.push_back(sr);
+        };
+
+        if (trigramCandidates)
+        {
+            // Accelerated path: only check trigram candidates
+            for (ULONGLONG ref : *trigramCandidates)
+            {
+                auto fIt = fileMap.find(ref);
+                if (fIt == fileMap.end())
+                    continue;
+                processWildcardCandidate(ref, fIt->second);
+            }
+            // Also check files with names < 3 chars (missed by trigram index)
+            for (auto& pair : fileMap)
+            {
+                if (pair.second.lowerFileName.length() < 3)
+                    processWildcardCandidate(pair.first, pair.second);
+            }
+        }
+        else
+        {
+            // Fallback: scan all files (no usable trigram acceleration)
+            for (auto& pair : fileMap)
+            {
+                if (pair.second.fileName.empty() || pair.second.fileName.length() > 255)
+                    continue;
+                processWildcardCandidate(pair.first, pair.second);
+            }
+        }
+
+        // Sort and cap
+        const size_t MAX_RESULTS = 10000;
+        auto cmpResults = [](const SearchResult& a, const SearchResult& b) {
+            if (a.matchScore != b.matchScore)
+                return a.matchScore > b.matchScore;
+            return _wcsicmp(a.fileName.c_str(), b.fileName.c_str()) < 0;
+        };
+        if (searchResults.size() > MAX_RESULTS)
+        {
+            std::partial_sort(searchResults.begin(),
+                              searchResults.begin() + MAX_RESULTS,
+                              searchResults.end(), cmpResults);
+            searchResults.resize(MAX_RESULTS);
+        }
+        else
+        {
+            std::sort(searchResults.begin(), searchResults.end(), cmpResults);
+        }
+        for (auto& sr : searchResults)
+            sr.fullPath = BuildFullPath(sr.fileRef, currentDriveLetter);
+        return;
+    }
+
+    // --- Normal (non-wildcard) search path ---
+    const size_t kwLen = lowerKeyword.length();
+
+    // Use a flat hash map for collecting scores
+    std::unordered_map<ULONGLONG, int> matchScores;
+    matchScores.reserve(8192);
+
+    // Helper lambda to insert/update a score
+    auto addScore = [&](ULONGLONG ref, int score) {
+        auto res = matchScores.emplace(ref, score);
+        if (!res.second && res.first->second < score)
+            res.first->second = score;
+    };
+
+    // 1) Exact token match (score 100) — O(1) hash lookup
+    {
+        auto exactIt = invertedIndex.find(lowerKeyword);
+        if (exactIt != invertedIndex.end())
+        {
+            for (ULONGLONG ref : exactIt->second)
+                addScore(ref, 100);
         }
     }
 
-    // 2) Scan inverted index for prefix matches (score 75) and substring matches (score 50)
-    for (auto& pair : invertedIndex)
+    // 2) Prefix matches on sorted token list — O(log N + matches)
+    ForEachPrefixMatch(sortedTokens, invertedIndex, lowerKeyword,
+        [&](const std::wstring& token, const std::vector<ULONGLONG>& refs) {
+            if (token == lowerKeyword) return; // already handled as exact
+            for (ULONGLONG ref : refs)
+                addScore(ref, 75);
+        });
+
+    // 3) Substring match via trigram index — eliminates the O(N) fileMap scan.
+    //    For keywords >= 3 chars: extract trigrams from the keyword, find the trigram
+    //    with the smallest posting list, then verify actual substring on those candidates.
+    //    For keywords < 3 chars: fall back to brute-force scan (rare, very fast anyway).
+    if (kwLen >= 3)
     {
-        const std::wstring& token = pair.first;
-
-        if (token == lowerKeyword)
-            continue;
-
-        bool isPrefix = (token.length() >= lowerKeyword.length() &&
-                         token.compare(0, lowerKeyword.length(), lowerKeyword) == 0);
-        bool isSubstring = (!isPrefix && token.find(lowerKeyword) != std::wstring::npos);
-
-        if (isPrefix || isSubstring)
+        // Extract all trigram keys from the keyword
+        std::vector<ULONGLONG> kwTrigrams;
+        kwTrigrams.reserve(kwLen - 2);
+        for (size_t i = 0; i + 2 < kwLen; i++)
         {
-            int score = isPrefix ? 75 : 50;
-            for (ULONGLONG ref : pair.second)
+            ULONGLONG key = ((ULONGLONG)(unsigned short)lowerKeyword[i]) |
+                            ((ULONGLONG)(unsigned short)lowerKeyword[i + 1] << 16) |
+                            ((ULONGLONG)(unsigned short)lowerKeyword[i + 2] << 32);
+            kwTrigrams.push_back(key);
+        }
+
+        // Pick the trigram with the smallest posting list for maximum selectivity
+        const std::vector<ULONGLONG>* smallest = nullptr;
+        for (ULONGLONG tg : kwTrigrams)
+        {
+            auto tgIt = trigramIndex.find(tg);
+            if (tgIt == trigramIndex.end())
             {
-                matchScores[ref] = max(matchScores[ref], score);
+                smallest = nullptr;
+                break; // trigram not in any filename — zero candidates
+            }
+            if (!smallest || tgIt->second.size() < smallest->size())
+                smallest = &tgIt->second;
+        }
+
+        if (smallest)
+        {
+            for (ULONGLONG ref : *smallest)
+            {
+                if (matchScores.count(ref))
+                    continue;
+                auto fIt = fileMap.find(ref);
+                if (fIt == fileMap.end())
+                    continue;
+                const std::wstring& ln = fIt->second.lowerFileName;
+                if (ln.length() >= kwLen && ln.find(lowerKeyword) != std::wstring::npos)
+                {
+                    matchScores[ref] = 40;
+                }
+            }
+        }
+    }
+    else if (kwLen > 0 && kwLen < 3)
+    {
+        // Short keyword fallback — brute-force scan (only for 1-2 char queries)
+        for (auto& pair : fileMap)
+        {
+            if (matchScores.count(pair.first))
+                continue;
+            const std::wstring& ln = pair.second.lowerFileName;
+            if (ln.length() >= kwLen && ln.find(lowerKeyword) != std::wstring::npos)
+            {
+                matchScores[pair.first] = 40;
             }
         }
     }
 
-    // 3) Also scan all filenames for substring match in the full name (score 40)
-    for (auto& pair : fileMap)
-    {
-        if (matchScores.count(pair.first))
-            continue;
-
-        std::wstring lowerName = pair.second.fileName;
-        for (auto& ch : lowerName)
-            ch = towlower(ch);
-
-        if (lowerName.find(lowerKeyword) != std::wstring::npos)
-        {
-            matchScores[pair.first] = 40;
-        }
-    }
-
-    // 4) Stemmed matching: stem the keyword and look up in stemmedIndex (score 30)
+    // 4) Stemmed matching — O(1) hash + O(log N) prefix range
     std::wstring stemmedKeyword = StemWord(lowerKeyword);
     if (!stemmedKeyword.empty())
     {
-        // Exact stem match
         auto stemExact = stemmedIndex.find(stemmedKeyword);
         if (stemExact != stemmedIndex.end())
         {
@@ -742,8 +1508,6 @@ void PerformSearch(const std::wstring& keyword, ULONGLONG scopeRef)
                     matchScores[ref] = 30;
             }
         }
-        // Also check if the stemmed keyword matches unstemmed index entries
-        // (e.g. query "walking" stems to "walk", which matches literal token "walk")
         if (stemmedKeyword != lowerKeyword)
         {
             auto stemInOrig = invertedIndex.find(stemmedKeyword);
@@ -755,26 +1519,25 @@ void PerformSearch(const std::wstring& keyword, ULONGLONG scopeRef)
                         matchScores[ref] = 30;
                 }
             }
-            // Prefix match on stemmed index
-            for (auto& pair : stemmedIndex)
-            {
-                const std::wstring& stemToken = pair.first;
-                if (stemToken == stemmedKeyword)
-                    continue;
-                if (stemToken.length() >= stemmedKeyword.length() &&
-                    stemToken.compare(0, stemmedKeyword.length(), stemmedKeyword) == 0)
-                {
-                    for (ULONGLONG ref : pair.second)
+            // Prefix match on sorted stemmed token list
+            ForEachPrefixMatch(sortedStemTokens, stemmedIndex, stemmedKeyword,
+                [&](const std::wstring& stemToken, const std::vector<ULONGLONG>& refs) {
+                    if (stemToken == stemmedKeyword) return;
+                    for (ULONGLONG ref : refs)
                     {
                         if (!matchScores.count(ref))
                             matchScores[ref] = 25;
                     }
-                }
-            }
+                });
         }
     }
 
-    // Build results with bonus scoring
+    // Get current time once for all recency bonus calculations
+    FILETIME ftNow;
+    GetSystemTimeAsFileTime(&ftNow);
+    ULONGLONG now = ((ULONGLONG)ftNow.dwHighDateTime << 32) | ftNow.dwLowDateTime;
+
+    // Build results with bonus scoring — defer fullPath to after truncation
     searchResults.reserve(matchScores.size());
     for (auto& pair : matchScores)
     {
@@ -783,52 +1546,79 @@ void PerformSearch(const std::wstring& keyword, ULONGLONG scopeRef)
         if (it == fileMap.end())
             continue;
 
-        // Filter by scope: skip files not under the scoped directory
         if (scopeRef != 0 && ref != scopeRef && !IsDescendantOf(ref, scopeRef))
             continue;
 
         int score = pair.second;
 
-        // Bonus: exact case-sensitive match of the keyword in the filename (+15)
         if (HasExactCaseMatch(it->second.fileName, keyword))
             score += 15;
 
-        // Bonus: file recency based on USN timestamp (+10/+7/+3)
-        score += GetRecencyBonus(ref);
+        score += GetRecencyBonus(ref, now);
 
         SearchResult sr;
         sr.fileRef = ref;
         sr.fileName = it->second.fileName;
-        sr.fullPath = BuildFullPath(ref, currentDriveLetter);
+        // fullPath deferred — will be built only for the final top-N results
         sr.isDirectory = it->second.isDirectory;
         sr.matchScore = score;
         searchResults.push_back(sr);
     }
 
-    // Sort: highest score first, then alphabetical
-    std::sort(searchResults.begin(), searchResults.end(),
-        [](const SearchResult& a, const SearchResult& b) {
-            if (a.matchScore != b.matchScore)
-                return a.matchScore > b.matchScore;
-            return _wcsicmp(a.fileName.c_str(), b.fileName.c_str()) < 0;
-        });
-
-    // Cap results for performance
+    // Cap results: use partial_sort to only fully sort the top N
     const size_t MAX_RESULTS = 10000;
+    auto cmpResults = [](const SearchResult& a, const SearchResult& b) {
+        if (a.matchScore != b.matchScore)
+            return a.matchScore > b.matchScore;
+        return _wcsicmp(a.fileName.c_str(), b.fileName.c_str()) < 0;
+    };
+
     if (searchResults.size() > MAX_RESULTS)
+    {
+        std::partial_sort(searchResults.begin(),
+                          searchResults.begin() + MAX_RESULTS,
+                          searchResults.end(), cmpResults);
         searchResults.resize(MAX_RESULTS);
+    }
+    else
+    {
+        std::sort(searchResults.begin(), searchResults.end(), cmpResults);
+    }
+
+    // Now build full paths only for the final result set
+    for (auto& sr : searchResults)
+    {
+        sr.fullPath = BuildFullPath(sr.fileRef, currentDriveLetter);
+    }
 }
 
-// Format a USN timestamp (FILETIME-based LARGE_INTEGER) into a date/time string
-static std::wstring FormatTimestamp(ULONGLONG fileRef)
+// Format a file's last-write time into a date/time string.
+// First tries the USN timestamp cache; falls back to querying the filesystem.
+static std::wstring FormatTimestamp(ULONGLONG fileRef, const std::wstring& fullPath)
 {
-    auto tsIt = timestampCache.find(fileRef);
-    if (tsIt == timestampCache.end() || tsIt->second.QuadPart == 0)
-        return L"";
+    FILETIME ft = {0, 0};
 
-    FILETIME ft;
-    ft.dwLowDateTime = (DWORD)(tsIt->second.QuadPart & 0xFFFFFFFF);
-    ft.dwHighDateTime = (DWORD)(tsIt->second.QuadPart >> 32);
+    auto tsIt = timestampCache.find(fileRef);
+    if (tsIt != timestampCache.end() && tsIt->second.QuadPart != 0)
+    {
+        ft.dwLowDateTime = (DWORD)(tsIt->second.QuadPart & 0xFFFFFFFF);
+        ft.dwHighDateTime = (DWORD)(tsIt->second.QuadPart >> 32);
+    }
+    else if (!fullPath.empty())
+    {
+        WIN32_FILE_ATTRIBUTE_DATA fad = {0};
+        if (GetFileAttributesExW(fullPath.c_str(), GetFileExInfoStandard, &fad))
+        {
+            ft = fad.ftLastWriteTime;
+            LARGE_INTEGER li;
+            li.LowPart = ft.dwLowDateTime;
+            li.HighPart = ft.dwHighDateTime;
+            timestampCache[fileRef] = li;
+        }
+    }
+
+    if (ft.dwLowDateTime == 0 && ft.dwHighDateTime == 0)
+        return L"";
 
     FILETIME ftLocal;
     FileTimeToLocalFileTime(&ft, &ftLocal);
@@ -842,11 +1632,202 @@ static std::wstring FormatTimestamp(ULONGLONG fileRef)
     return std::wstring(buf);
 }
 
+// Get the system icon index for a file, using extension-based caching.
+int GetFileIconIndex(const std::wstring& fileName, bool isDirectory)
+{
+    if (isDirectory)
+    {
+        if (iFolderIcon >= 0)
+            return iFolderIcon;
+        SHFILEINFOW sfi = {0};
+        SHGetFileInfoW(L"C:\\", FILE_ATTRIBUTE_DIRECTORY, &sfi, sizeof(sfi),
+            SHGFI_SYSICONINDEX | SHGFI_SMALLICON | SHGFI_USEFILEATTRIBUTES);
+        iFolderIcon = sfi.iIcon;
+        return iFolderIcon;
+    }
+
+    // Extract extension (lowercased) for cache key
+    std::wstring ext;
+    size_t dot = fileName.rfind(L'.');
+    if (dot != std::wstring::npos)
+    {
+        ext = fileName.substr(dot);
+        for (auto& ch : ext)
+            ch = towlower(ch);
+    }
+    else
+    {
+        ext = L"._no_ext_";
+    }
+
+    auto cacheIt = iconCache.find(ext);
+    if (cacheIt != iconCache.end())
+        return cacheIt->second;
+
+    // Ask the shell for this extension's icon using a fake filename
+    std::wstring fakeName = L"file" + ext;
+    SHFILEINFOW sfi = {0};
+    SHGetFileInfoW(fakeName.c_str(), FILE_ATTRIBUTE_NORMAL, &sfi, sizeof(sfi),
+        SHGFI_SYSICONINDEX | SHGFI_SMALLICON | SHGFI_USEFILEATTRIBUTES);
+    iconCache[ext] = sfi.iIcon;
+    return sfi.iIcon;
+}
+
+// Execute the current search (called from Find button and debounce timer)
+void TriggerSearch(HWND hWnd)
+{
+    wchar_t searchText[512] = {0};
+    GetWindowTextW(hSearchEdit, searchText, 512);
+    std::wstring keyword(searchText);
+    if (keyword.empty() || fileMap.empty())
+        return;
+
+    currentSearchKeyword = keyword;
+    for (auto& ch : currentSearchKeyword)
+        ch = towlower(ch);
+
+    // Determine search scope from selected tree node
+    ULONGLONG scopeRef = 0;
+    currentSearchScope.clear();
+    HTREEITEM hSelItem = TreeView_GetSelection(hTreeView);
+    if (hSelItem)
+    {
+        auto refIt = treeItemToRef.find(hSelItem);
+        if (refIt != treeItemToRef.end())
+        {
+            ULONGLONG selRef = refIt->second;
+            if (selRef != 5)
+            {
+                auto feIt = fileMap.find(selRef);
+                if (feIt != fileMap.end() && feIt->second.isDirectory)
+                {
+                    scopeRef = selRef;
+                    currentSearchScope = BuildFullPath(selRef, currentDriveLetter);
+                }
+            }
+        }
+    }
+
+    LARGE_INTEGER searchFreq, searchT1, searchT2;
+    QueryPerformanceFrequency(&searchFreq);
+    QueryPerformanceCounter(&searchT1);
+
+    PerformSearch(keyword, scopeRef);
+    PopulateSearchResults();
+
+    QueryPerformanceCounter(&searchT2);
+    double searchElapsedMS = (searchT2.QuadPart - searchT1.QuadPart) * 1000.0 / searchFreq.QuadPart;
+
+    // Switch to Search Results tab
+    TabCtrl_SetCurSel(hTabControl, 1);
+    ShowTab(1);
+
+    std::wstring status = L"Found " + std::to_wstring(searchResults.size()) + L" results";
+    if (searchResults.size() >= 10000)
+        status += L" (showing first 10,000)";
+    if (!currentSearchScope.empty())
+        status += L"  |  Scope: " + currentSearchScope;
+    std::wstring stemmed = StemWord(currentSearchKeyword);
+    if (stemmed != currentSearchKeyword)
+        status += L"  |  Stem: \"" + stemmed + L"\"";
+    wchar_t timeBuf[64];
+    swprintf_s(timeBuf, 64, L"  |  %.1f ms", searchElapsedMS);
+    status += timeBuf;
+    SetWindowTextW(hStatusText, status.c_str());
+}
+
+// Format a byte size into a human-readable string.
+static std::wstring FormatFileSize(ULONGLONG size)
+{
+    wchar_t buf[64];
+    if (size < 1024ULL)
+        swprintf_s(buf, 64, L"%llu bytes", size);
+    else if (size < 1024ULL * 1024)
+        swprintf_s(buf, 64, L"%.1f KB", size / 1024.0);
+    else if (size < 1024ULL * 1024 * 1024)
+        swprintf_s(buf, 64, L"%.1f MB", size / (1024.0 * 1024.0));
+    else
+        swprintf_s(buf, 64, L"%.2f GB", size / (1024.0 * 1024.0 * 1024.0));
+    return std::wstring(buf);
+}
+
+// Update the properties panel with details for the selected search result.
+void UpdatePropertiesPanel(int selectedIndex)
+{
+    if (!hPropertiesPanel)
+        return;
+
+    if (selectedIndex < 0 || selectedIndex >= (int)searchResults.size())
+    {
+        SetWindowTextW(hPropertiesPanel, L"");
+        InvalidateRect(hPropertiesPanel, NULL, TRUE);
+        return;
+    }
+
+    const SearchResult& sr = searchResults[selectedIndex];
+
+    std::wstring info;
+    info += L"  Name:\r\n  " + sr.fileName + L"\r\n\r\n";
+    info += L"  Type:  " + std::wstring(sr.isDirectory ? L"Folder" : L"File") + L"\r\n\r\n";
+    info += L"  Path:\r\n  " + sr.fullPath + L"\r\n\r\n";
+
+    WIN32_FILE_ATTRIBUTE_DATA fad = {0};
+    if (GetFileAttributesExW(sr.fullPath.c_str(), GetFileExInfoStandard, &fad))
+    {
+        if (!sr.isDirectory)
+        {
+            ULONGLONG fileSize = ((ULONGLONG)fad.nFileSizeHigh << 32) | fad.nFileSizeLow;
+            info += L"  Size:  " + FormatFileSize(fileSize) + L"\r\n\r\n";
+        }
+
+        auto fmtTime = [](const FILETIME& ft) -> std::wstring {
+            if (ft.dwLowDateTime == 0 && ft.dwHighDateTime == 0)
+                return L"—";
+            FILETIME ftLocal;
+            FileTimeToLocalFileTime(&ft, &ftLocal);
+            SYSTEMTIME st;
+            FileTimeToSystemTime(&ftLocal, &st);
+            wchar_t buf[64];
+            swprintf_s(buf, 64, L"%04d-%02d-%02d %02d:%02d:%02d",
+                st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+            return std::wstring(buf);
+        };
+
+        info += L"  Created:\r\n  " + fmtTime(fad.ftCreationTime) + L"\r\n\r\n";
+        info += L"  Modified:\r\n  " + fmtTime(fad.ftLastWriteTime) + L"\r\n\r\n";
+        info += L"  Accessed:\r\n  " + fmtTime(fad.ftLastAccessTime) + L"\r\n\r\n";
+
+        std::wstring attrs;
+        if (fad.dwFileAttributes & FILE_ATTRIBUTE_READONLY)  attrs += L"R ";
+        if (fad.dwFileAttributes & FILE_ATTRIBUTE_HIDDEN)    attrs += L"H ";
+        if (fad.dwFileAttributes & FILE_ATTRIBUTE_SYSTEM)    attrs += L"S ";
+        if (fad.dwFileAttributes & FILE_ATTRIBUTE_ARCHIVE)   attrs += L"A ";
+        if (fad.dwFileAttributes & FILE_ATTRIBUTE_COMPRESSED) attrs += L"C ";
+        if (fad.dwFileAttributes & FILE_ATTRIBUTE_ENCRYPTED) attrs += L"E ";
+        if (!attrs.empty())
+            info += L"  Attributes:  " + attrs + L"\r\n";
+    }
+    else
+    {
+        info += L"  (File not accessible)\r\n";
+    }
+
+    SetWindowTextW(hPropertiesPanel, info.c_str());
+    InvalidateRect(hPropertiesPanel, NULL, TRUE);
+}
+
 // Populate the ListView with search results
 void PopulateSearchResults()
 {
     if (!hListView)
         return;
+
+    // Clear the properties panel so stale data from a previous search doesn't linger
+    if (hPropertiesPanel)
+    {
+        SetWindowTextW(hPropertiesPanel, L"");
+        InvalidateRect(hPropertiesPanel, NULL, TRUE);
+    }
 
     SendMessage(hListView, WM_SETREDRAW, FALSE, 0);
     ListView_DeleteAllItems(hListView);
@@ -856,11 +1837,12 @@ void PopulateSearchResults()
         const SearchResult& sr = searchResults[i];
 
         LVITEMW lvi = {0};
-        lvi.mask = LVIF_TEXT | LVIF_PARAM;
+        lvi.mask = LVIF_TEXT | LVIF_PARAM | LVIF_IMAGE;
         lvi.iItem = (int)i;
         lvi.iSubItem = 0;
         lvi.pszText = (LPWSTR)sr.fileName.c_str();
         lvi.lParam = (LPARAM)i;
+        lvi.iImage = GetFileIconIndex(sr.fileName, sr.isDirectory);
         ListView_InsertItem(hListView, &lvi);
 
         // Type column
@@ -871,14 +1853,15 @@ void PopulateSearchResults()
         ListView_SetItemText(hListView, (int)i, 2, (LPWSTR)sr.fullPath.c_str());
 
         // Modified date column
-        std::wstring modDate = FormatTimestamp(sr.fileRef);
+        std::wstring modDate = FormatTimestamp(sr.fileRef, sr.fullPath);
         ListView_SetItemText(hListView, (int)i, 3, (LPWSTR)modDate.c_str());
 
         // Match quality column
-        // Base scores: Exact=100, Prefix=75, Token=50, Substring=40, Stem=30/25
+        // Base scores: Exact=100, Wildcard=90, Prefix=75, Token=50, Substring=40, Stem=30/25
         // Bonuses: case match +15, recency +10/+7/+3
         const wchar_t* quality = L"Stem";
-        if (sr.matchScore >= 100) quality = L"Exact";
+        if (bWildcardSearch) quality = L"Wildcard";
+        else if (sr.matchScore >= 100) quality = L"Exact";
         else if (sr.matchScore >= 75) quality = L"Prefix";
         else if (sr.matchScore >= 50) quality = L"Token Match";
         else if (sr.matchScore >= 40) quality = L"Substring";
@@ -914,11 +1897,15 @@ void ShowTab(int tabIndex)
     {
         ShowWindow(hTreeView, SW_SHOW);
         ShowWindow(hListView, SW_HIDE);
+        if (hPropertiesPanel) ShowWindow(hPropertiesPanel, SW_HIDE);
+        if (hPropToggleBtn) ShowWindow(hPropToggleBtn, SW_HIDE);
     }
     else
     {
         ShowWindow(hTreeView, SW_HIDE);
         ShowWindow(hListView, SW_SHOW);
+        if (hPropertiesPanel && !bPropertiesCollapsed) ShowWindow(hPropertiesPanel, SW_SHOW);
+        if (hPropToggleBtn) ShowWindow(hPropToggleBtn, SW_SHOW);
     }
 }
 
@@ -1030,6 +2017,9 @@ bool ReadDriveMFT(HWND hWnd, const std::wstring& drive, int& totalFiles, int& to
                     entry.fileReference = fileRef;
                     entry.parentReference = record->ParentFileReferenceNumber;
                     entry.fileName = std::wstring(fileName, fileNameLength);
+                    entry.lowerFileName = entry.fileName;
+                    for (auto& lch : entry.lowerFileName)
+                        lch = towlower(lch);
                     entry.isDirectory = (record->FileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
                     entry.hasChildren = false;
                     entry.childrenLoaded = false;
@@ -1155,12 +2145,18 @@ void ReadDriveAndBuildTree(HWND hWnd, const std::wstring& drive)
 
         UpdateProgress(0, L"Initializing...");
 
+        // Stop any existing USN monitor
+        StopUsnMonitor();
+
         // Clear previous data
         fileMap.clear();
         childrenMap.clear();
         treeItemToRef.clear();
         invertedIndex.clear();
         stemmedIndex.clear();
+        sortedTokens.clear();
+        sortedStemTokens.clear();
+        trigramIndex.clear();
         fullPathCache.clear();
         timestampCache.clear();
         searchResults.clear();
@@ -1203,6 +2199,16 @@ void ReadDriveAndBuildTree(HWND hWnd, const std::wstring& drive)
             
             UpdateProgress(92, L"Building search index...");
             BuildSearchIndex(drive);
+
+            if (!bTreeRenderedOnce)
+            {
+                bTreeRenderedOnce = true;
+                if (hSearchEdit) EnableWindow(hSearchEdit, TRUE);
+                if (hFindButton) EnableWindow(hFindButton, TRUE);
+            }
+
+            // Start live USN journal monitoring
+            StartUsnMonitor(drive);
         }
         else
         {
@@ -1263,7 +2269,7 @@ void CreateDriveButtons(HWND hWnd)
         
         HWND hBtn = CreateWindowExW(
             0, L"BUTTON", label.c_str(),
-            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+            WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
             startX + (int)(i * (buttonWidth + spacing)), btnY,
             buttonWidth, buttonHeight,
             hWnd,
@@ -1381,15 +2387,78 @@ void LayoutControls(HWND hWnd)
     int contentW = rcTab.right - rcTab.left;
     int contentH = rcTab.bottom - rcTab.top;
     
+    // Toggle button dimensions
+    int toggleBtnW = 36;
+    int toggleBtnH = 36;
+    int toggleBtnPad = 4;
+
     if (hTreeView)
     {
-        SetWindowPos(hTreeView, NULL, contentX, contentY,
-            contentW, contentH, SWP_NOZORDER);
+        SetWindowPos(hTreeView, HWND_TOP, contentX, contentY,
+            contentW, contentH, 0);
     }
     if (hListView)
     {
-        SetWindowPos(hListView, NULL, contentX, contentY,
-            contentW, contentH, SWP_NOZORDER);
+        int listW = contentW;
+        if (hPropertiesPanel && !bPropertiesCollapsed)
+        {
+            // Clamp properties width to valid range
+            if (propertiesPanelW > contentW - MIN_LIST_WIDTH - SPLITTER_WIDTH)
+                propertiesPanelW = contentW - MIN_LIST_WIDTH - SPLITTER_WIDTH;
+            if (propertiesPanelW < MIN_PROP_WIDTH)
+                propertiesPanelW = MIN_PROP_WIDTH;
+            listW = contentW - propertiesPanelW - SPLITTER_WIDTH;
+        }
+        SetWindowPos(hListView, HWND_TOP, contentX, contentY,
+            listW, contentH, 0);
+    }
+    if (hPropertiesPanel)
+    {
+        if (bPropertiesCollapsed)
+        {
+            ShowWindow(hPropertiesPanel, SW_HIDE);
+            // Zero out splitter rect so it won't be drawn or hit-tested
+            splitterRect = {0, 0, 0, 0};
+        }
+        else
+        {
+            int listW = contentW - propertiesPanelW - SPLITTER_WIDTH;
+            int splitterX = contentX + listW;
+            int propX = splitterX + SPLITTER_WIDTH;
+            SetWindowPos(hPropertiesPanel, HWND_TOP, propX, contentY,
+                propertiesPanelW, contentH, 0);
+            // Only show if on the search results tab
+            int curTab = hTabControl ? TabCtrl_GetCurSel(hTabControl) : 0;
+            if (curTab == 1)
+                ShowWindow(hPropertiesPanel, SW_SHOW);
+
+            // Cache the splitter rect in main window client coordinates
+            splitterRect.left = splitterX;
+            splitterRect.top = contentY;
+            splitterRect.right = splitterX + SPLITTER_WIDTH;
+            splitterRect.bottom = contentY + contentH;
+        }
+    }
+    // Position the properties toggle button next to the splitter / properties panel edge
+    if (hPropToggleBtn)
+    {
+        int tbX;
+        if (bPropertiesCollapsed)
+        {
+            // Collapsed: sit at the right edge of the content area
+            tbX = contentX + contentW - toggleBtnW - toggleBtnPad;
+        }
+        else
+        {
+            // Expanded: sit just to the left of the splitter
+            int listW = contentW - propertiesPanelW - SPLITTER_WIDTH;
+            tbX = contentX + listW - toggleBtnW - toggleBtnPad;
+        }
+        int tbY = contentY + (contentH - toggleBtnH) / 2;
+        SetWindowPos(hPropToggleBtn, HWND_TOP, tbX, tbY,
+            toggleBtnW, toggleBtnH, SWP_NOACTIVATE);
+        // Ensure the toggle button stays above the ListView in z-order
+        BringWindowToTop(hPropToggleBtn);
     }
 }
 
@@ -1480,12 +2549,12 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
             // Search box and Find button (placed after drive buttons in the toolbar row)
             hSearchEdit = CreateWindowExW(
                 WS_EX_CLIENTEDGE, L"EDIT", L"",
-                WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
+                WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL | WS_DISABLED,
                 0, 5, 200, 25, hWnd, (HMENU)IDC_SEARCH_EDIT, hInst, NULL);
 
             hFindButton = CreateWindowExW(
                 0, L"BUTTON", L"Find",
-                WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                WS_CHILD | WS_VISIBLE | BS_OWNERDRAW | WS_DISABLED,
                 0, 5, 60, 25, hWnd, (HMENU)IDC_FIND_BUTTON, hInst, NULL);
 
             hStatusText = CreateWindowExW(
@@ -1533,7 +2602,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 
             hListView = CreateWindowExW(
                 0, WC_LISTVIEW, L"",
-                WS_CHILD | WS_BORDER | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
+                WS_CHILD | WS_BORDER | WS_CLIPSIBLINGS | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
                 0, 110, 0, 0, hWnd, (HMENU)IDC_LISTVIEW, hInst, NULL);
 
             if (hListView)
@@ -1568,10 +2637,25 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
                 lvc.pszText = (LPWSTR)L"Match";
                 lvc.cx = 90;
                 ListView_InsertColumn(hListView, 4, &lvc);
+
+                // Attach the system small icon image list to the ListView
+                SHFILEINFOW sfi = {0};
+                hSysImageList = (HIMAGELIST)SHGetFileInfoW(L"C:\\", 0, &sfi, sizeof(sfi),
+                    SHGFI_SYSICONINDEX | SHGFI_SMALLICON);
+                if (hSysImageList)
+                    ListView_SetImageList(hListView, hSysImageList, LVSIL_SMALL);
             }
 
             // Initially show Browse tab, hide Search Results
             ShowTab(0);
+
+            // Properties panel (right side of Search Results tab)
+            hPropertiesPanel = CreateWindowExW(
+                0, L"EDIT", L"",
+                WS_CHILD | WS_BORDER | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL,
+                0, 110, PROPERTIES_PANEL_W, 0, hWnd, (HMENU)IDC_PROPERTIES, hInst, NULL);
+
+            hMainWnd = hWnd;
 
             // Create modern font and apply to all controls
             hUIFont = CreateFontW(
@@ -1593,14 +2677,156 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 
             hDarkModeBtn = CreateWindowExW(
                 0, L"BUTTON", L"\u263D Dark",
-                WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
                 0, 0, 70, 30, hWnd, (HMENU)IDC_DARKMODE_BTN, hInst, NULL);
             if (hUIFont && hDarkModeBtn)
                 SendMessage(hDarkModeBtn, WM_SETFONT, (WPARAM)hUIFont, TRUE);
+
+            // Larger font for the toggle button glyph
+            hToggleFont = CreateFontW(
+                -20, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
+                DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
+
+            // Bold font for ListView column headers
+            hHeaderFont = CreateFontW(
+                -14, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
+                DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
+            if (hHeaderFont && hListView)
+            {
+                HWND hHeader = ListView_GetHeader(hListView);
+                if (hHeader)
+                    SendMessage(hHeader, WM_SETFONT, (WPARAM)hHeaderFont, TRUE);
+            }
+
+            // Properties panel collapse/expand toggle button (hidden until Search Results tab)
+            hPropToggleBtn = CreateWindowExW(
+                0, L"BUTTON", L"\u00BB",
+                WS_CHILD | WS_CLIPSIBLINGS | BS_OWNERDRAW,
+                0, 0, 36, 36, hWnd, (HMENU)IDC_PROP_TOGGLE, hInst, NULL);
+            if (hToggleFont && hPropToggleBtn)
+                SendMessage(hPropToggleBtn, WM_SETFONT, (WPARAM)hToggleFont, TRUE);
+
+            // Tooltip for the toggle button
+            hPropToggleTooltip = CreateWindowExW(
+                0, TOOLTIPS_CLASSW, NULL,
+                WS_POPUP | TTS_ALWAYSTIP | TTS_NOPREFIX,
+                CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT,
+                hWnd, NULL, hInst, NULL);
+            if (hPropToggleTooltip && hPropToggleBtn)
+            {
+                TOOLINFOW ti = {0};
+                ti.cbSize = sizeof(TOOLINFOW);
+                ti.uFlags = TTF_IDISHWND | TTF_SUBCLASS;
+                ti.hwnd = hWnd;
+                ti.uId = (UINT_PTR)hPropToggleBtn;
+                ti.lpszText = (LPWSTR)L"Hide properties panel";
+                SendMessage(hPropToggleTooltip, TTM_ADDTOOLW, 0, (LPARAM)&ti);
+            }
         }
         break;
     case WM_SIZE:
         LayoutControls(hWnd);
+        break;
+    case WM_PAINT:
+        {
+            // Draw the splitter bar between list view and properties panel
+            PAINTSTRUCT ps;
+            HDC hdc = BeginPaint(hWnd, &ps);
+            if (hPropertiesPanel && IsWindowVisible(hPropertiesPanel) &&
+                splitterRect.right > splitterRect.left)
+            {
+                const ColorScheme& cs = CurrentScheme();
+                HBRUSH hSplitBg = CreateSolidBrush(cs.windowBg);
+                FillRect(hdc, &splitterRect, hSplitBg);
+                DeleteObject(hSplitBg);
+
+                // Draw a 1px separator line in the center of the splitter
+                int cx = (splitterRect.left + splitterRect.right) / 2;
+                HPEN hSepPen = CreatePen(PS_SOLID, 1, cs.buttonBorder);
+                HPEN hOldPen = (HPEN)SelectObject(hdc, hSepPen);
+                MoveToEx(hdc, cx, splitterRect.top, NULL);
+                LineTo(hdc, cx, splitterRect.bottom);
+                SelectObject(hdc, hOldPen);
+                DeleteObject(hSepPen);
+            }
+            EndPaint(hWnd, &ps);
+        }
+        break;
+    case WM_SETCURSOR:
+        {
+            // Show horizontal resize cursor when hovering over the splitter
+            if ((HWND)wParam == hWnd && LOWORD(lParam) == HTCLIENT &&
+                hPropertiesPanel && IsWindowVisible(hPropertiesPanel))
+            {
+                POINT pt;
+                GetCursorPos(&pt);
+                ScreenToClient(hWnd, &pt);
+                if (pt.x >= splitterRect.left && pt.x < splitterRect.right &&
+                    pt.y >= splitterRect.top && pt.y < splitterRect.bottom)
+                {
+                    SetCursor(LoadCursor(NULL, IDC_SIZEWE));
+                    return TRUE;
+                }
+            }
+            return DefWindowProc(hWnd, message, wParam, lParam);
+        }
+    case WM_LBUTTONDOWN:
+        {
+            int xPos = (short)LOWORD(lParam);
+            int yPos = (short)HIWORD(lParam);
+            if (hPropertiesPanel && IsWindowVisible(hPropertiesPanel) &&
+                xPos >= splitterRect.left && xPos < splitterRect.right &&
+                yPos >= splitterRect.top && yPos < splitterRect.bottom)
+            {
+                bSplitterDragging = true;
+                splitterDragStartX = xPos;
+                splitterDragStartW = propertiesPanelW;
+                SetCapture(hWnd);
+            }
+        }
+        break;
+    case WM_MOUSEMOVE:
+        if (bSplitterDragging)
+        {
+            int xPos = (short)LOWORD(lParam);
+            int delta = xPos - splitterDragStartX;
+            int newW = splitterDragStartW - delta;
+
+            RECT rcClient;
+            GetClientRect(hWnd, &rcClient);
+            RECT rcTab;
+            if (hTabControl)
+            {
+                GetClientRect(hTabControl, &rcTab);
+                TabCtrl_AdjustRect(hTabControl, FALSE, &rcTab);
+            }
+            else
+            {
+                rcTab.left = 0;
+                rcTab.right = rcClient.right;
+            }
+            int contentW = rcTab.right - rcTab.left;
+            int maxPropW = contentW - MIN_LIST_WIDTH - SPLITTER_WIDTH;
+            if (newW < MIN_PROP_WIDTH) newW = MIN_PROP_WIDTH;
+            if (newW > maxPropW) newW = maxPropW;
+
+            if (newW != propertiesPanelW)
+            {
+                propertiesPanelW = newW;
+                LayoutControls(hWnd);
+                // Repaint the splitter area
+                InvalidateRect(hWnd, &splitterRect, FALSE);
+            }
+        }
+        break;
+    case WM_LBUTTONUP:
+        if (bSplitterDragging)
+        {
+            bSplitterDragging = false;
+            ReleaseCapture();
+        }
         break;
     case WM_NOTIFY:
         {
@@ -1635,6 +2861,16 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
                     LaunchSearchResult(pnmia->iItem);
                 }
             }
+            else if (pnmh->idFrom == IDC_LISTVIEW && pnmh->code == LVN_ITEMCHANGED)
+            {
+                NMLISTVIEW* pnmlv = (NMLISTVIEW*)lParam;
+                if ((pnmlv->uChanged & LVIF_STATE) &&
+                    (pnmlv->uNewState & LVIS_SELECTED) &&
+                    !(pnmlv->uOldState & LVIS_SELECTED))
+                {
+                    UpdatePropertiesPanel(pnmlv->iItem);
+                }
+            }
             else if (pnmh->idFrom == IDC_LISTVIEW && pnmh->code == NM_RCLICK)
             {
                 NMITEMACTIVATE* pnmia = (NMITEMACTIVATE*)lParam;
@@ -1654,7 +2890,8 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
                     }
                 }
             }
-            else if (pnmh->idFrom == IDC_LISTVIEW && pnmh->code == NM_CUSTOMDRAW)
+            else if (pnmh->idFrom == IDC_LISTVIEW && pnmh->code == NM_CUSTOMDRAW
+                     && pnmh->hwndFrom == hListView)
             {
                 NMLVCUSTOMDRAW* pcd = (NMLVCUSTOMDRAW*)lParam;
                 switch (pcd->nmcd.dwDrawStage)
@@ -1676,6 +2913,11 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
                         }
 
                         const SearchResult& sr = searchResults[iItem];
+
+                        // For wildcard searches, skip substring highlighting
+                        if (bWildcardSearch)
+                            return CDRF_DODEFAULT;
+
                         std::wstring lowerName = sr.fileName;
                         for (auto& ch : lowerName)
                             ch = towlower(ch);
@@ -1757,6 +2999,55 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
                     }
                 }
             }
+            // Custom-draw the ListView header for prominent column headers
+            else if (hListView && pnmh->hwndFrom == ListView_GetHeader(hListView)
+                     && pnmh->code == NM_CUSTOMDRAW)
+            {
+                NMCUSTOMDRAW* pcd = (NMCUSTOMDRAW*)lParam;
+                switch (pcd->dwDrawStage)
+                {
+                case CDDS_PREPAINT:
+                    return CDRF_NOTIFYITEMDRAW;
+                case CDDS_ITEMPREPAINT:
+                    {
+                        const ColorScheme& cs = CurrentScheme();
+                        HDC hdc = pcd->hdc;
+                        RECT rc = pcd->rc;
+
+                        HBRUSH hHdrBrush = CreateSolidBrush(cs.headerBg);
+                        FillRect(hdc, &rc, hHdrBrush);
+                        DeleteObject(hHdrBrush);
+
+                        // Draw a bottom border line
+                        HPEN hBorderPen = CreatePen(PS_SOLID, 1, cs.headerBorder);
+                        HPEN hOldPen2 = (HPEN)SelectObject(hdc, hBorderPen);
+                        MoveToEx(hdc, rc.left, rc.bottom - 1, NULL);
+                        LineTo(hdc, rc.right, rc.bottom - 1);
+                        SelectObject(hdc, hOldPen2);
+                        DeleteObject(hBorderPen);
+
+                        // Get the header item text
+                        HWND hHeader = pnmh->hwndFrom;
+                        int iItem = (int)pcd->dwItemSpec;
+                        wchar_t hdrText[128] = {0};
+                        HDITEMW hdi = {0};
+                        hdi.mask = HDI_TEXT;
+                        hdi.pszText = hdrText;
+                        hdi.cchTextMax = 128;
+                        Header_GetItem(hHeader, iItem, &hdi);
+
+                        // Draw text with bold font
+                        SetBkMode(hdc, TRANSPARENT);
+                        SetTextColor(hdc, cs.headerText);
+                        if (hHeaderFont)
+                            SelectObject(hdc, hHeaderFont);
+                        rc.left += 6;
+                        DrawTextW(hdc, hdrText, -1, &rc, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+
+                        return CDRF_SKIPDEFAULT;
+                    }
+                }
+            }
         }
         break;
     case WM_CTLCOLORSTATIC:
@@ -1770,6 +3061,15 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
                 SetTextColor(hdcStatic, cs.statusText);
                 return (LRESULT)hStatusBrush;
             }
+            if (hCtl == hPropertiesPanel)
+            {
+                const ColorScheme& cs = CurrentScheme();
+                SetBkColor(hdcStatic, cs.editBg);
+                SetTextColor(hdcStatic, cs.windowText);
+                if (!hPropertiesBrush)
+                    hPropertiesBrush = CreateSolidBrush(cs.editBg);
+                return (LRESULT)hPropertiesBrush;
+            }
             return DefWindowProc(hWnd, message, wParam, lParam);
         }
     case WM_CTLCOLOREDIT:
@@ -1782,6 +3082,15 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
                 SetBkColor(hdcEdit, cs.editBg);
                 SetTextColor(hdcEdit, cs.editText);
                 return (LRESULT)hEditBrush;
+            }
+            if (hCtl == hPropertiesPanel)
+            {
+                const ColorScheme& cs = CurrentScheme();
+                SetBkColor(hdcEdit, cs.editBg);
+                SetTextColor(hdcEdit, cs.windowText);
+                if (!hPropertiesBrush)
+                    hPropertiesBrush = CreateSolidBrush(cs.editBg);
+                return (LRESULT)hPropertiesBrush;
             }
             return DefWindowProc(hWnd, message, wParam, lParam);
         }
@@ -1804,59 +3113,113 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 
             return 1;
         }
+    case WM_DRAWITEM:
+        {
+            DRAWITEMSTRUCT* pDIS = (DRAWITEMSTRUCT*)lParam;
+            if (pDIS->CtlType == ODT_BUTTON)
+            {
+                const ColorScheme& cs = CurrentScheme();
+                bool isDisabled = (pDIS->itemState & ODS_DISABLED) != 0;
+                bool isPressed = (pDIS->itemState & ODS_SELECTED) != 0;
+                bool isToggle = (pDIS->hwndItem == hPropToggleBtn);
+
+                // Detect hover for the toggle button
+                bool isHovered = false;
+                if (isToggle && !isDisabled)
+                {
+                    POINT ptCur;
+                    GetCursorPos(&ptCur);
+                    ScreenToClient(pDIS->hwndItem, &ptCur);
+                    RECT rcBtn = pDIS->rcItem;
+                    isHovered = (PtInRect(&rcBtn, ptCur) != 0);
+
+                    // Start tracking mouse leave so we repaint when the cursor exits
+                    if (isHovered && !bToggleHovered)
+                    {
+                        TRACKMOUSEEVENT tme = {0};
+                        tme.cbSize = sizeof(tme);
+                        tme.dwFlags = TME_LEAVE;
+                        tme.hwndTrack = pDIS->hwndItem;
+                        TrackMouseEvent(&tme);
+                    }
+                    bToggleHovered = isHovered;
+                }
+
+                COLORREF bgClr = isDisabled ? cs.buttonDisabledBg : cs.buttonBg;
+                COLORREF txtClr = isDisabled ? cs.buttonDisabledText : cs.buttonText;
+                COLORREF brdClr = cs.buttonBorder;
+
+                if (isHovered && !isPressed && !isDisabled)
+                {
+                    // Lighten / brighten background on hover
+                    bgClr = RGB(min(255, GetRValue(bgClr) + 20),
+                                min(255, GetGValue(bgClr) + 20),
+                                min(255, GetBValue(bgClr) + 20));
+                    brdClr = RGB(min(255, GetRValue(brdClr) + 30),
+                                min(255, GetGValue(brdClr) + 30),
+                                min(255, GetBValue(brdClr) + 30));
+                }
+
+                if (isPressed && !isDisabled)
+                {
+                    bgClr = RGB(GetRValue(bgClr) * 85 / 100,
+                                GetGValue(bgClr) * 85 / 100,
+                                GetBValue(bgClr) * 85 / 100);
+                }
+
+                HDC hdc = pDIS->hDC;
+                RECT rc = pDIS->rcItem;
+                int radius = 6;
+
+                HBRUSH hBg = CreateSolidBrush(bgClr);
+                HPEN hPen = CreatePen(PS_SOLID, 1, brdClr);
+                HBRUSH hOldBrush = (HBRUSH)SelectObject(hdc, hBg);
+                HPEN hOldPen = (HPEN)SelectObject(hdc, hPen);
+                RoundRect(hdc, rc.left, rc.top, rc.right, rc.bottom, radius, radius);
+                SelectObject(hdc, hOldBrush);
+                SelectObject(hdc, hOldPen);
+                DeleteObject(hBg);
+                DeleteObject(hPen);
+
+                wchar_t text[128] = {0};
+                GetWindowTextW(pDIS->hwndItem, text, 128);
+                SetBkMode(hdc, TRANSPARENT);
+                SetTextColor(hdc, txtClr);
+                // Use the larger toggle font for the toggle button, normal font for others
+                if (isToggle && hToggleFont)
+                    SelectObject(hdc, hToggleFont);
+                else if (hUIFont)
+                    SelectObject(hdc, hUIFont);
+                DrawTextW(hdc, text, -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+
+                if (pDIS->itemState & ODS_FOCUS)
+                {
+                    RECT rcFocus = {rc.left + 3, rc.top + 3, rc.right - 3, rc.bottom - 3};
+                    DrawFocusRect(hdc, &rcFocus);
+                }
+
+                return TRUE;
+            }
+            return DefWindowProc(hWnd, message, wParam, lParam);
+        }
     case WM_COMMAND:
         {
             int wmId = LOWORD(wParam);
             
             if (wmId == IDC_FIND_BUTTON)
             {
-                wchar_t searchText[512] = {0};
-                GetWindowTextW(hSearchEdit, searchText, 512);
-                std::wstring keyword(searchText);
-                if (!keyword.empty() && !fileMap.empty())
+                KillTimer(hWnd, IDT_SEARCH_DEBOUNCE);
+                TriggerSearch(hWnd);
+                break;
+            }
+
+            // As-you-type: restart debounce timer on edit change
+            if (HIWORD(wParam) == EN_CHANGE && (HWND)lParam == hSearchEdit)
+            {
+                if (bTreeRenderedOnce && !fileMap.empty())
                 {
-                    currentSearchKeyword = keyword;
-                    for (auto& ch : currentSearchKeyword)
-                        ch = towlower(ch);
-
-                    // Determine search scope from selected tree node
-                    ULONGLONG scopeRef = 0;
-                    currentSearchScope.clear();
-                    HTREEITEM hSelItem = TreeView_GetSelection(hTreeView);
-                    if (hSelItem)
-                    {
-                        auto refIt = treeItemToRef.find(hSelItem);
-                        if (refIt != treeItemToRef.end())
-                        {
-                            ULONGLONG selRef = refIt->second;
-                            // Only scope if it's a directory and not the root (5)
-                            if (selRef != 5)
-                            {
-                                auto feIt = fileMap.find(selRef);
-                                if (feIt != fileMap.end() && feIt->second.isDirectory)
-                                {
-                                    scopeRef = selRef;
-                                    currentSearchScope = BuildFullPath(selRef, currentDriveLetter);
-                                }
-                            }
-                        }
-                    }
-
-                    PerformSearch(keyword, scopeRef);
-                    PopulateSearchResults();
-                    // Switch to Search Results tab
-                    TabCtrl_SetCurSel(hTabControl, 1);
-                    ShowTab(1);
-                    // Update status with scope and stem info for transparency
-                    std::wstring status = L"Found " + std::to_wstring(searchResults.size()) + L" results";
-                    if (searchResults.size() >= 10000)
-                        status += L" (showing first 10,000)";
-                    if (!currentSearchScope.empty())
-                        status += L"  |  Scope: " + currentSearchScope;
-                    std::wstring stemmed = StemWord(currentSearchKeyword);
-                    if (stemmed != currentSearchKeyword)
-                        status += L"  |  Stem: \"" + stemmed + L"\"";
-                    SetWindowTextW(hStatusText, status.c_str());
+                    KillTimer(hWnd, IDT_SEARCH_DEBOUNCE);
+                    SetTimer(hWnd, IDT_SEARCH_DEBOUNCE, SEARCH_DEBOUNCE_MS, NULL);
                 }
                 break;
             }
@@ -1918,6 +3281,16 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
                 break;
             }
 
+            if (wmId == IDC_PROP_TOGGLE)
+            {
+                bPropertiesCollapsed = !bPropertiesCollapsed;
+                SetWindowTextW(hPropToggleBtn, bPropertiesCollapsed ? L"\u00AB" : L"\u00BB");
+                UpdateToggleTooltip();
+                LayoutControls(hWnd);
+                InvalidateRect(hWnd, NULL, TRUE);
+                break;
+            }
+
             if (wmId == IDC_DARKMODE_BTN)
             {
                 bDarkMode = !bDarkMode;
@@ -1945,11 +3318,35 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
             }
         }
         break;
+    case WM_TIMER:
+        if (wParam == IDT_SEARCH_DEBOUNCE)
+        {
+            KillTimer(hWnd, IDT_SEARCH_DEBOUNCE);
+            TriggerSearch(hWnd);
+        }
+        break;
+    case WM_USN_UPDATED:
+        ProcessPendingUsnChanges();
+        break;
+    case WM_MOUSELEAVE:
+        // Forwarded from the toggle button's TrackMouseEvent; repaint to clear hover
+        if (bToggleHovered)
+        {
+            bToggleHovered = false;
+            if (hPropToggleBtn)
+                InvalidateRect(hPropToggleBtn, NULL, TRUE);
+        }
+        break;
     case WM_DESTROY:
+        StopUsnMonitor();
+        if (hPropToggleTooltip) { DestroyWindow(hPropToggleTooltip); hPropToggleTooltip = NULL; }
+        if (hToggleFont) { DeleteObject(hToggleFont); hToggleFont = NULL; }
+        if (hHeaderFont) { DeleteObject(hHeaderFont); hHeaderFont = NULL; }
         if (hUIFont) { DeleteObject(hUIFont); hUIFont = NULL; }
         if (hToolbarBrush) { DeleteObject(hToolbarBrush); hToolbarBrush = NULL; }
         if (hStatusBrush) { DeleteObject(hStatusBrush); hStatusBrush = NULL; }
         if (hEditBrush) { DeleteObject(hEditBrush); hEditBrush = NULL; }
+        if (hPropertiesBrush) { DeleteObject(hPropertiesBrush); hPropertiesBrush = NULL; }
         PostQuitMessage(0);
         break;
     default:
