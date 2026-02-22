@@ -6,40 +6,24 @@
 #include <winioctl.h>
 #include <vector>
 #include <string>
-#include <iostream>
-#include <fstream>
 #include <map>
 #include <commctrl.h>
 #include <algorithm>
+#include <unordered_map>
 
 #pragma comment(lib, "comctl32.lib")
 
 #define MAX_LOADSTRING 100
+#define IDC_DRIVE_BUTTON_BASE 2000
 
 // Global Variables:
-HINSTANCE hInst;                                // current instance
-WCHAR szTitle[MAX_LOADSTRING];                  // The title bar text
-WCHAR szWindowClass[MAX_LOADSTRING];            // the main window class name
-HWND hTreeView = NULL;                          // TreeView control handle
-HWND hProgressBar = NULL;                       // Progress bar control handle
-HWND hStatusText = NULL;                        // Status text control handle
-HWND hSummaryText = NULL;                       // Summary text control handle
-
-// Debug logging
-std::wofstream debugLog;
-
-void LogDebug(const std::wstring& message)
-{
-    if (!debugLog.is_open())
-    {
-        debugLog.open(L"C:\\mft_debug.log", std::ios::app);
-    }
-    if (debugLog.is_open())
-    {
-        debugLog << message << std::endl;
-        debugLog.flush();
-    }
-}
+HINSTANCE hInst;
+WCHAR szTitle[MAX_LOADSTRING];
+WCHAR szWindowClass[MAX_LOADSTRING];
+HWND hTreeView = NULL;
+HWND hProgressBar = NULL;
+HWND hStatusText = NULL;
+HWND hSummaryText = NULL;
 
 // Structure to store file information
 struct FileEntry {
@@ -47,79 +31,39 @@ struct FileEntry {
     ULONGLONG parentReference;
     std::wstring fileName;
     bool isDirectory;
-    HTREEITEM hTreeItem;
-    std::wstring driveLetter;  // To distinguish between drives
+    bool hasChildren;       // cached: does this dir have children in childrenMap?
+    bool childrenLoaded;    // have we populated children into the TreeView?
 };
 
-// Separate maps for each drive
-std::map<std::wstring, std::map<ULONGLONG, FileEntry>> driveFileMaps;
-std::map<std::wstring, std::map<ULONGLONG, std::vector<ULONGLONG>>> driveChildrenMaps;
+// Data for the currently loaded drive
+std::unordered_map<ULONGLONG, FileEntry> fileMap;
+std::unordered_map<ULONGLONG, std::vector<ULONGLONG>> childrenMap;
+// Map from HTREEITEM back to file reference for on-demand loading
+std::unordered_map<HTREEITEM, ULONGLONG> treeItemToRef;
 
-// Forward declarations of functions included in this code module:
+// Drive buttons
+struct DriveButton {
+    HWND hButton;
+    std::wstring driveLetter;
+};
+std::vector<DriveButton> driveButtons;
+
+// Forward declarations
 ATOM                MyRegisterClass(HINSTANCE hInstance);
 BOOL                InitInstance(HINSTANCE, int);
 LRESULT CALLBACK    WndProc(HWND, UINT, WPARAM, LPARAM);
 INT_PTR CALLBACK    About(HWND, UINT, WPARAM, LPARAM);
-void                ReadMFTAndListFiles(HWND hWnd);
-void                BuildTreeView();
-HTREEITEM           AddItemToTree(HWND hTreeView, LPWSTR lpszItem, HTREEITEM hParent);
+void                ReadDriveAndBuildTree(HWND hWnd, const std::wstring& drive);
+void                BuildTreeView(const std::wstring& drive);
+HTREEITEM           InsertTreeItem(HWND hTree, HTREEITEM hParent, const std::wstring& text, ULONGLONG fileRef, bool hasChildren);
 void                UpdateProgress(int percentage, const std::wstring& status);
-void                AddChildrenRecursive(const std::wstring& drive, ULONGLONG parentRef, int depth);
+void                PopulateChildren(ULONGLONG parentRef, HTREEITEM hParentItem);
 bool                ReadDriveMFT(HWND hWnd, const std::wstring& drive, int& totalFiles, int& totalDirs);
-std::vector<std::wstring> GetFixedDrives();
+std::vector<std::wstring> GetFixedNtfsDrives();
+void                CreateDriveButtons(HWND hWnd);
+void                LayoutControls(HWND hWnd);
 
-// MFT structures
-#pragma pack(push, 1)
-typedef struct {
-    DWORD Type;
-    WORD UsaOffset;
-    WORD UsaCount;
-    ULONGLONG Lsn;
-    WORD SequenceNumber;
-    WORD LinkCount;
-    WORD AttrsOffset;
-    WORD Flags;
-    DWORD BytesInUse;
-    DWORD BytesAllocated;
-    ULONGLONG BaseFileRecord;
-    WORD NextAttrId;
-} FILE_RECORD_HEADER;
-
-typedef struct {
-    DWORD Type;
-    DWORD Length;
-    BYTE NonResident;
-    BYTE NameLength;
-    WORD NameOffset;
-    WORD Flags;
-    WORD AttributeId;
-} ATTRIBUTE_HEADER;
-
-typedef struct {
-    ATTRIBUTE_HEADER Header;
-    DWORD ValueLength;
-    WORD ValueOffset;
-    BYTE Flags;
-    BYTE Reserved;
-} RESIDENT_ATTRIBUTE;
-
-typedef struct {
-    ULONGLONG ParentDirectory;
-    ULONGLONG CreationTime;
-    ULONGLONG ModificationTime;
-    ULONGLONG MftChangeTime;
-    ULONGLONG LastAccessTime;
-    ULONGLONG AllocatedSize;
-    ULONGLONG RealSize;
-    DWORD FileAttributes;
-    DWORD Reserved;
-    BYTE FileNameLength;
-    BYTE NameType;
-    WCHAR FileName[1];
-} FILE_NAME_ATTRIBUTE;
-#pragma pack(pop)
-
-std::vector<std::wstring> GetFixedDrives()
+std::vector<std::wstring> GetFixedNtfsDrives()
 {
     std::vector<std::wstring> drives;
     DWORD driveMask = GetLogicalDrives();
@@ -133,10 +77,8 @@ std::vector<std::wstring> GetFixedDrives()
             
             UINT driveType = GetDriveTypeW(drivePath.c_str());
             
-            // Only include fixed drives (local hard drives)
             if (driveType == DRIVE_FIXED)
             {
-                // Check if it's NTFS
                 wchar_t fsName[MAX_PATH];
                 if (GetVolumeInformationW(drivePath.c_str(), NULL, 0, NULL, NULL, NULL, fsName, MAX_PATH))
                 {
@@ -164,7 +106,6 @@ void UpdateProgress(int percentage, const std::wstring& status)
         SetWindowTextW(hStatusText, status.c_str());
     }
     
-    // Process messages to keep UI responsive
     MSG msg;
     while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE))
     {
@@ -173,71 +114,69 @@ void UpdateProgress(int percentage, const std::wstring& status)
     }
 }
 
-HTREEITEM AddItemToTree(HWND hTreeView, LPWSTR lpszItem, HTREEITEM hParent)
+// Insert a tree item. If hasChildren is true, adds cChildren=1 so the [+] button appears.
+HTREEITEM InsertTreeItem(HWND hTree, HTREEITEM hParent, const std::wstring& text, ULONGLONG fileRef, bool hasChildren)
 {
-    TVITEM tvi = {0};
     TVINSERTSTRUCT tvins = {0};
-
-    tvi.mask = TVIF_TEXT | TVIF_PARAM;
-    tvi.pszText = lpszItem;
-    tvi.cchTextMax = (UINT)wcslen(lpszItem);
-
-    tvins.item = tvi;
-    tvins.hInsertAfter = TVI_LAST;
     tvins.hParent = hParent;
+    tvins.hInsertAfter = TVI_LAST;
+    tvins.item.mask = TVIF_TEXT | TVIF_CHILDREN | TVIF_PARAM;
+    tvins.item.pszText = (LPWSTR)text.c_str();
+    tvins.item.cchTextMax = (int)text.length();
+    tvins.item.cChildren = hasChildren ? 1 : 0;
+    tvins.item.lParam = (LPARAM)fileRef;
 
-    return (HTREEITEM)SendMessage(hTreeView, TVM_INSERTITEM, 0, (LPARAM)&tvins);
+    HTREEITEM hItem = (HTREEITEM)SendMessage(hTree, TVM_INSERTITEM, 0, (LPARAM)&tvins);
+    if (hItem)
+    {
+        treeItemToRef[hItem] = fileRef;
+    }
+    return hItem;
 }
 
-void AddChildrenRecursive(const std::wstring& drive, ULONGLONG parentRef, int depth)
+// Populate one level of children for a directory node (on-demand)
+void PopulateChildren(ULONGLONG parentRef, HTREEITEM hParentItem)
 {
-    auto& fileMap = driveFileMaps[drive];
-    auto& childrenMap = driveChildrenMaps[drive];
-
-    // Check if this parent has children
-    if (childrenMap.find(parentRef) == childrenMap.end())
+    auto childIt = childrenMap.find(parentRef);
+    if (childIt == childrenMap.end())
         return;
 
-    // Get parent's tree item
-    if (fileMap.find(parentRef) == fileMap.end())
-        return;
+    // Sort children: directories first, then by name
+    std::vector<ULONGLONG>& children = childIt->second;
+    std::sort(children.begin(), children.end(), [](ULONGLONG a, ULONGLONG b) {
+        auto itA = fileMap.find(a);
+        auto itB = fileMap.find(b);
+        if (itA == fileMap.end()) return false;
+        if (itB == fileMap.end()) return true;
+        if (itA->second.isDirectory != itB->second.isDirectory)
+            return itA->second.isDirectory > itB->second.isDirectory;
+        return _wcsicmp(itA->second.fileName.c_str(), itB->second.fileName.c_str()) < 0;
+    });
 
-    FileEntry& parent = fileMap[parentRef];
-    if (parent.hTreeItem == NULL)
-        return;
+    SendMessage(hTreeView, WM_SETREDRAW, FALSE, 0);
 
-    // Add all children
-    std::vector<ULONGLONG>& children = childrenMap[parentRef];
-    
-    // Limit number of direct children to prevent TreeView issues
-    size_t maxChildren = min(children.size(), (size_t)10000);
-    
-    for (size_t i = 0; i < maxChildren; i++)
+    for (ULONGLONG childRef : children)
     {
-        ULONGLONG childRef = children[i];
-        
-        if (fileMap.find(childRef) != fileMap.end())
-        {
-            FileEntry& child = fileMap[childRef];
-            
-            // Add to tree if not already added
-            if (child.hTreeItem == NULL)
-            {
-                // Validate filename
-                if (child.fileName.empty() || child.fileName.length() > 255)
-                    continue;
-                
-                child.hTreeItem = AddItemToTree(hTreeView, 
-                    (LPWSTR)child.fileName.c_str(), parent.hTreeItem);
+        auto it = fileMap.find(childRef);
+        if (it == fileMap.end())
+            continue;
 
-                // Recursively add this child's children if it's a directory
-                if (child.isDirectory && child.hTreeItem != NULL)
-                {
-                    AddChildrenRecursive(drive, childRef, depth + 1);
-                }
-            }
+        FileEntry& child = it->second;
+
+        if (child.fileName.empty() || child.fileName.length() > 255)
+            continue;
+
+        bool childHasChildren = false;
+        if (child.isDirectory)
+        {
+            childHasChildren = child.hasChildren;
         }
+
+        InsertTreeItem(hTreeView, hParentItem, child.fileName, childRef, childHasChildren);
     }
+
+    SendMessage(hTreeView, WM_SETREDRAW, TRUE, 0);
+    InvalidateRect(hTreeView, NULL, TRUE);
 }
 
 bool ReadDriveMFT(HWND hWnd, const std::wstring& drive, int& totalFiles, int& totalDirs)
@@ -246,219 +185,137 @@ bool ReadDriveMFT(HWND hWnd, const std::wstring& drive, int& totalFiles, int& to
     {
         std::wstring volumePath = L"\\\\.\\" + drive + L":";
         
-        HANDLE hVolume = CreateFileW(volumePath.c_str(), GENERIC_READ, 
+        HANDLE hVolume = CreateFileW(volumePath.c_str(), GENERIC_READ,
             FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
         
         if (hVolume == INVALID_HANDLE_VALUE)
         {
+            MessageBoxW(hWnd, L"Failed to open volume. Run as Administrator.",
+                L"Error", MB_OK | MB_ICONERROR);
             return false;
         }
 
-        NTFS_VOLUME_DATA_BUFFER volumeData = {0};
         DWORD bytesReturned = 0;
         
-        if (!DeviceIoControl(hVolume, FSCTL_GET_NTFS_VOLUME_DATA, NULL, 0, 
-            &volumeData, sizeof(volumeData), &bytesReturned, NULL))
+        // Get USN journal data
+        USN_JOURNAL_DATA_V0 journalData = {0};
+        if (!DeviceIoControl(hVolume, FSCTL_QUERY_USN_JOURNAL, NULL, 0,
+            &journalData, sizeof(journalData), &bytesReturned, NULL))
         {
-            CloseHandle(hVolume);
-            return false;
+            // Journal might not exist - try to create it
+            CREATE_USN_JOURNAL_DATA createData = {0};
+            createData.MaximumSize = 0;
+            createData.AllocationDelta = 0;
+            DeviceIoControl(hVolume, FSCTL_CREATE_USN_JOURNAL, &createData,
+                sizeof(createData), NULL, 0, &bytesReturned, NULL);
+            
+            if (!DeviceIoControl(hVolume, FSCTL_QUERY_USN_JOURNAL, NULL, 0,
+                &journalData, sizeof(journalData), &bytesReturned, NULL))
+            {
+                CloseHandle(hVolume);
+                MessageBoxW(hWnd, L"Failed to query USN journal.", L"Error", MB_OK | MB_ICONERROR);
+                return false;
+            }
         }
 
-        ULONGLONG mftStartLcn = volumeData.MftStartLcn.QuadPart;
-        DWORD bytesPerCluster = volumeData.BytesPerCluster;
-        DWORD bytesPerFileRecord = volumeData.BytesPerFileRecordSegment;
-        ULONGLONG totalRecords = volumeData.MftValidDataLength.QuadPart / bytesPerFileRecord;
+        // Buffer for enumeration results
+        const DWORD bufferSize = 128 * 1024; // 128KB buffer for better throughput
+        std::vector<BYTE> buffer(bufferSize);
         
-        if (bytesPerFileRecord == 0 || bytesPerFileRecord > 4096)
-        {
-            CloseHandle(hVolume);
-            return false;
-        }
+        MFT_ENUM_DATA_V0 enumData = {0};
+        enumData.StartFileReferenceNumber = 0;
+        enumData.LowUsn = 0;
+        enumData.HighUsn = journalData.NextUsn;
+        
+        // Pre-reserve capacity for typical drive sizes
+        fileMap.reserve(2000000);
+        childrenMap.reserve(500000);
 
-        std::vector<BYTE> fileRecordBuffer;
-        
-        try
-        {
-            fileRecordBuffer.resize(bytesPerFileRecord);
-        }
-        catch (const std::bad_alloc&)
-        {
-            CloseHandle(hVolume);
-            return false;
-        }
-        
         int fileCount = 0;
         int dirCount = 0;
+        int totalEntries = 0;
         
-        ULONGLONG maxRecordsToRead = totalRecords;
-
-        auto& fileMap = driveFileMaps[drive];
-        auto& childrenMap = driveChildrenMaps[drive];
+        UpdateProgress(15, L"Enumerating drive " + drive + L":...");
         
-        // Storage for debug info
-        std::wstring debugInfo = L"Drive " + drive + L":\n\n";
-        bool foundWindows = false;
-        bool foundUsers = false;
-        
-        // Read MFT entries
-        for (ULONGLONG i = 0; i < maxRecordsToRead; i++)
+        while (true)
         {
-            if (i % 1000 == 0)
+            BOOL result = DeviceIoControl(hVolume, FSCTL_ENUM_USN_DATA,
+                &enumData, sizeof(enumData),
+                buffer.data(), bufferSize,
+                &bytesReturned, NULL);
+            
+            if (!result)
             {
-                std::wstring status = L"Reading drive " + drive + L": " + 
-                    std::to_wstring(i) + L" / " + std::to_wstring(maxRecordsToRead);
-                UpdateProgress(10 + (int)((i * 70) / maxRecordsToRead), status);
+                DWORD err = GetLastError();
+                if (err == ERROR_HANDLE_EOF)
+                    break;
+                // Any other error - stop
+                break;
             }
             
-            ULONGLONG mftOffset = mftStartLcn * bytesPerCluster + (i * bytesPerFileRecord);
+            if (bytesReturned <= sizeof(USN))
+                break;
             
-            LARGE_INTEGER offset;
-            offset.QuadPart = mftOffset;
+            // First 8 bytes are the next start reference number
+            ULONGLONG nextRef = *(ULONGLONG*)buffer.data();
             
-            if (SetFilePointerEx(hVolume, offset, NULL, FILE_BEGIN))
+            // Walk the USN_RECORD entries after the 8-byte header
+            DWORD offset = sizeof(USN);
+            while (offset < bytesReturned)
             {
-                DWORD bytesRead = 0;
-                if (ReadFile(hVolume, fileRecordBuffer.data(), bytesPerFileRecord, 
-                    &bytesRead, NULL) && bytesRead == bytesPerFileRecord)
+                USN_RECORD* record = (USN_RECORD*)(buffer.data() + offset);
+                
+                if (record->RecordLength == 0)
+                    break;
+                
+                if (offset + record->RecordLength > bytesReturned)
+                    break;
+                
+                // Extract file reference and parent reference (lower 48 bits)
+                ULONGLONG fileRef = record->FileReferenceNumber & 0x0000FFFFFFFFFFFF;
+                ULONGLONG parentRef = record->ParentFileReferenceNumber & 0x0000FFFFFFFFFFFF;
+                
+                // Get filename
+                DWORD fileNameLength = record->FileNameLength / sizeof(WCHAR);
+                
+                if (fileNameLength > 0 && fileNameLength <= 255 &&
+                    record->FileNameOffset + record->FileNameLength <= record->RecordLength)
                 {
-                    FILE_RECORD_HEADER* fileRecord = (FILE_RECORD_HEADER*)fileRecordBuffer.data();
-                    
-                    if (fileRecord->Type != 'ELIF')
-                        continue;
-                    
-                    if (!(fileRecord->Flags & 0x01))
-                        continue;
-                    
-                    if (fileRecord->AttrsOffset >= bytesPerFileRecord || 
-                        fileRecord->BytesInUse > bytesPerFileRecord ||
-                        fileRecord->AttrsOffset >= fileRecord->BytesInUse)
-                        continue;
-                    
-                    BYTE* attrPtr = fileRecordBuffer.data() + fileRecord->AttrsOffset;
-                    BYTE* recordEnd = fileRecordBuffer.data() + fileRecord->BytesInUse;
+                    WCHAR* fileName = (WCHAR*)((BYTE*)record + record->FileNameOffset);
                     
                     FileEntry entry;
-                    entry.fileReference = i;
-                    entry.hTreeItem = NULL;
-                    entry.isDirectory = false;
-                    entry.driveLetter = drive;
-                    bool foundFileName = false;
-                    DWORD fileAttributes = 0;
+                    entry.fileReference = fileRef;
+                    entry.parentReference = record->ParentFileReferenceNumber;
+                    entry.fileName = std::wstring(fileName, fileNameLength);
+                    entry.isDirectory = (record->FileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+                    entry.hasChildren = false;
+                    entry.childrenLoaded = false;
                     
-                    while (attrPtr < recordEnd)
-                    {
-                        if (attrPtr + sizeof(ATTRIBUTE_HEADER) > recordEnd)
-                            break;
-                        
-                        ATTRIBUTE_HEADER* attr = (ATTRIBUTE_HEADER*)attrPtr;
-                        
-                        if (attr->Type == 0xFFFFFFFF)
-                            break;
-                        
-                        if (attr->Length == 0 || attr->Length > (DWORD)(recordEnd - attrPtr))
-                            break;
-                        
-                        if (attr->Type == 0x30) // FILE_NAME attribute
-                        {
-                            if (!attr->NonResident)
-                            {
-                                if (attrPtr + sizeof(RESIDENT_ATTRIBUTE) > recordEnd)
-                                    break;
-                                
-                                RESIDENT_ATTRIBUTE* resAttr = (RESIDENT_ATTRIBUTE*)attr;
-                                
-                                if (resAttr->ValueOffset >= attr->Length)
-                                    break;
-                                
-                                BYTE* valuePtr = attrPtr + resAttr->ValueOffset;
-                                
-                                if (valuePtr + offsetof(FILE_NAME_ATTRIBUTE, FileName) > recordEnd)
-                                    break;
-                                
-                                FILE_NAME_ATTRIBUTE* fnAttr = (FILE_NAME_ATTRIBUTE*)valuePtr;
-                                
-                                if (fnAttr->FileNameLength > 255)
-                                    break;
-                                
-                                size_t filenameBytes = fnAttr->FileNameLength * sizeof(WCHAR);
-                                if (valuePtr + offsetof(FILE_NAME_ATTRIBUTE, FileName) + filenameBytes > recordEnd)
-                                    break;
-                                
-                                try
-                                {
-                                    std::wstring candidateName = std::wstring(fnAttr->FileName, fnAttr->FileNameLength);
-                                    ULONGLONG candidateParent = fnAttr->ParentDirectory;
-                                    DWORD candidateAttrs = fnAttr->FileAttributes;
-                                    BYTE nameType = fnAttr->NameType;
-                                    
-                                    if (!foundFileName)
-                                    {
-                                        entry.fileName = candidateName;
-                                        entry.parentReference = candidateParent;
-                                        fileAttributes = candidateAttrs;
-                                        foundFileName = true;
-                                    }
-                                    else if (nameType != 2)
-                                    {
-                                        entry.fileName = candidateName;
-                                        entry.parentReference = candidateParent;
-                                        fileAttributes = candidateAttrs;
-                                    }
-                                    
-                                    entry.isDirectory = ((candidateAttrs & 0x10000000) != 0) || 
-                                                       ((candidateAttrs & 0x10) != 0);
-                                    
-                                    // Collect debug info for specific folders
-                                    if (candidateName == L"Windows" && !foundWindows)
-                                    {
-                                        ULONGLONG parentLower = candidateParent & 0x0000FFFFFFFFFFFF;
-                                        debugInfo += L"Windows: MFT#" + std::to_wstring(i) + 
-                                            L", Parent=" + std::to_wstring(parentLower) +
-                                            L", NameType=" + std::to_wstring(nameType) +
-                                            L", isDir=" + (entry.isDirectory ? L"YES" : L"NO") + L"\n";
-                                        foundWindows = true;
-                                    }
-                                    else if (candidateName == L"Users" && !foundUsers)
-                                    {
-                                        ULONGLONG parentLower = candidateParent & 0x0000FFFFFFFFFFFF;
-                                        debugInfo += L"Users: MFT#" + std::to_wstring(i) + 
-                                            L", Parent=" + std::to_wstring(parentLower) +
-                                            L", NameType=" + std::to_wstring(nameType) +
-                                            L", isDir=" + (entry.isDirectory ? L"YES" : L"NO") + L"\n";
-                                        foundUsers = true;
-                                    }
-                                }
-                                catch (...)
-                                {
-                                    break;
-                                }
-                            }
-                        }
-                        
-                        attrPtr += attr->Length;
-                    }
+                    bool isDir = entry.isDirectory;
+                    fileMap.emplace(fileRef, std::move(entry));
+                    childrenMap[parentRef].push_back(fileRef);
                     
-                    if (foundFileName && !entry.fileName.empty())
-                    {
-                        try
-                        {
-                            fileMap[i] = entry;
-                            if (entry.isDirectory)
-                                dirCount++;
-                            else
-                                fileCount++;
-                            
-                            ULONGLONG parentRef = entry.parentReference & 0x0000FFFFFFFFFFFF;
-                            childrenMap[parentRef].push_back(i);
-                        }
-                        catch (const std::bad_alloc&)
-                        {
-                            CloseHandle(hVolume);
-                            return false;
-                        }
-                    }
+                    if (isDir)
+                        dirCount++;
+                    else
+                        fileCount++;
+                    
+                    totalEntries++;
                 }
+                
+                offset += record->RecordLength;
             }
+            
+            // Update progress periodically
+            if (totalEntries % 50000 == 0)
+            {
+                std::wstring status = L"Reading drive " + drive + L": " +
+                    std::to_wstring(totalEntries) + L" entries...";
+                UpdateProgress(15 + min((int)((totalEntries * 65ULL) / 5000000), 65), status);
+            }
+            
+            // Move to next batch
+            enumData.StartFileReferenceNumber = nextRef;
         }
         
         CloseHandle(hVolume);
@@ -466,29 +323,21 @@ bool ReadDriveMFT(HWND hWnd, const std::wstring& drive, int& totalFiles, int& to
         totalFiles = fileCount;
         totalDirs = dirCount;
         
-        // Add info about root children
-        if (childrenMap.find(5) != childrenMap.end())
+        // Pre-compute hasChildren flag for all directories
+        UpdateProgress(82, L"Indexing directory structure...");
+        for (auto& pair : fileMap)
         {
-            debugInfo += L"\nchildrenMap[5] has " + std::to_wstring(childrenMap[5].size()) + L" children\n";
-            debugInfo += L"First 20 children of root:\n";
-            for (size_t j = 0; j < min(childrenMap[5].size(), (size_t)20); j++)
+            FileEntry& entry = pair.second;
+            if (entry.isDirectory)
             {
-                ULONGLONG childIdx = childrenMap[5][j];
-                if (fileMap.find(childIdx) != fileMap.end())
-                {
-                    debugInfo += L"  [" + std::to_wstring(childIdx) + L"] " + 
-                        fileMap[childIdx].fileName + 
-                        (fileMap[childIdx].isDirectory ? L" [DIR]" : L" [FILE]") + L"\n";
-                }
+                entry.hasChildren = (childrenMap.find(entry.fileReference) != childrenMap.end());
             }
+            else
+            {
+                entry.hasChildren = false;
+            }
+            entry.childrenLoaded = false;
         }
-        else
-        {
-            debugInfo += L"\nERROR: childrenMap[5] NOT FOUND!\n";
-        }
-        
-        // Show the debug info
-        MessageBoxW(hWnd, debugInfo.c_str(), (L"Debug Info - Drive " + drive).c_str(), MB_OK | MB_ICONINFORMATION);
         
         return true;
     }
@@ -498,85 +347,58 @@ bool ReadDriveMFT(HWND hWnd, const std::wstring& drive, int& totalFiles, int& to
     }
 }
 
-void BuildTreeView()
+void BuildTreeView(const std::wstring& drive)
 {
     if (!hTreeView)
         return;
 
-    LogDebug(L"BuildTreeView: Starting");
     UpdateProgress(85, L"Building tree structure...");
 
     try
     {
-        LogDebug(L"BuildTreeView: Clearing existing items");
         TreeView_DeleteAllItems(hTreeView);
+        treeItemToRef.clear();
 
-        // Create tree for each drive
-        for (auto& drivePair : driveFileMaps)
+        std::wstring driveLabel = drive + L":\\";
+        
+        // Root directory is MFT entry 5 - always has children
+        HTREEITEM hDriveRoot = InsertTreeItem(hTreeView, TVI_ROOT, driveLabel, 5, true);
+        
+        if (hDriveRoot == NULL)
+            return;
+
+        UpdateProgress(90, L"Loading root folder contents...");
+
+        // Only populate the first level (direct children of root)
+        PopulateChildren(5, hDriveRoot);
+        
+        // Mark root as loaded so TVN_ITEMEXPANDING won't re-populate
+        auto rootIt = fileMap.find(5);
+        if (rootIt != fileMap.end())
         {
-            const std::wstring& drive = drivePair.first;
-            auto& fileMap = drivePair.second;
-            
-            LogDebug(L"BuildTreeView: Building tree for drive " + drive);
-            
-            // Add drive root item
-            std::wstring driveLabel = drive + L":\\";
-            HTREEITEM hDriveRoot = AddItemToTree(hTreeView, (LPWSTR)driveLabel.c_str(), TVI_ROOT);
-            
-            if (hDriveRoot == NULL)
-            {
-                LogDebug(L"BuildTreeView: ERROR - Failed to create root for drive " + drive);
-                continue;
-            }
-            
-            // Clear tree item pointers for all entries in this drive
-            for (auto& pair : fileMap)
-            {
-                pair.second.hTreeItem = NULL;
-            }
-
-            // Root directory (MFT entry 5)
-            if (fileMap.find(5) != fileMap.end())
-            {
-                fileMap[5].hTreeItem = hDriveRoot;
-                
-                LogDebug(L"BuildTreeView: Building hierarchy for drive " + drive);
-                
-                // Recursively add all children starting from root
-                AddChildrenRecursive(drive, 5, 0);
-                
-                // Expand drive root
-                TreeView_Expand(hTreeView, hDriveRoot, TVE_EXPAND);
-            }
-            else
-            {
-                LogDebug(L"BuildTreeView: ERROR - Root entry 5 not found for drive " + drive);
-            }
+            rootIt->second.childrenLoaded = true;
         }
 
+        TreeView_Expand(hTreeView, hDriveRoot, TVE_EXPAND);
+        
         UpdateProgress(100, L"Complete!");
-        LogDebug(L"BuildTreeView: Complete");
     }
     catch (const std::exception& e)
     {
         std::string error = "Exception in BuildTreeView: ";
         error += e.what();
-        LogDebug(L"BuildTreeView: EXCEPTION - " + std::wstring(error.begin(), error.end()));
         MessageBoxA(NULL, error.c_str(), "Error", MB_OK | MB_ICONERROR);
     }
     catch (...)
     {
-        LogDebug(L"BuildTreeView: UNKNOWN EXCEPTION");
         MessageBoxW(NULL, L"Unknown exception in BuildTreeView", L"Error", MB_OK | MB_ICONERROR);
     }
 }
 
-void ReadMFTAndListFiles(HWND hWnd)
+void ReadDriveAndBuildTree(HWND hWnd, const std::wstring& drive)
 {
     try
     {
-        LogDebug(L"\n\n========== NEW SCAN STARTED ==========");
-        
         // Show progress controls and hide summary
         if (hProgressBar)
             ShowWindow(hProgressBar, SW_SHOW);
@@ -587,21 +409,18 @@ void ReadMFTAndListFiles(HWND hWnd)
 
         UpdateProgress(0, L"Initializing...");
 
-        LogDebug(L"ReadMFT: Clearing previous data");
-        driveFileMaps.clear();
-        driveChildrenMaps.clear();
+        // Clear previous data
+        fileMap.clear();
+        childrenMap.clear();
+        treeItemToRef.clear();
 
-        UpdateProgress(5, L"Detecting drives...");
-        
-        std::vector<std::wstring> drives = GetFixedDrives();
-        
-        if (drives.empty())
+        // Disable drive buttons during scan
+        for (auto& db : driveButtons)
         {
-            MessageBoxW(hWnd, L"No NTFS fixed drives found!", L"Error", MB_OK | MB_ICONERROR);
-            return;
+            EnableWindow(db.hButton, FALSE);
         }
-        
-        LogDebug(L"ReadMFT: Found " + std::to_wstring(drives.size()) + L" NTFS drives");
+
+        UpdateProgress(5, L"Opening drive " + drive + L":...");
 
         LARGE_INTEGER freq, t1, t2;
         QueryPerformanceFrequency(&freq);
@@ -610,77 +429,148 @@ void ReadMFTAndListFiles(HWND hWnd)
         int totalFiles = 0;
         int totalDirs = 0;
         
-        // Read MFT for each drive
-        for (size_t driveIdx = 0; driveIdx < drives.size(); driveIdx++)
+        if (ReadDriveMFT(hWnd, drive, totalFiles, totalDirs))
         {
-            const std::wstring& drive = drives[driveIdx];
-            
-            int progressBase = 10 + (int)((driveIdx * 70) / drives.size());
-            int progressRange = 70 / (int)drives.size();
-            
-            UpdateProgress(progressBase, L"Reading drive " + drive + L":...");
-            
-            int driveFiles = 0;
-            int driveDirs = 0;
-            
-            if (ReadDriveMFT(hWnd, drive, driveFiles, driveDirs))
+            QueryPerformanceCounter(&t2);
+            double elapsedTimeMS = (t2.QuadPart - t1.QuadPart) * 1000.0 / freq.QuadPart;
+
+            // Update summary text
+            if (hSummaryText)
             {
-                totalFiles += driveFiles;
-                totalDirs += driveDirs;
-                LogDebug(L"ReadMFT: Drive " + drive + L" successful");
+                std::wstring summaryText = L"Drive " + drive + L":  |  MFT Read: " +
+                    std::to_wstring((int)elapsedTimeMS) +
+                    L" ms  |  Folders: " + std::to_wstring(totalDirs) +
+                    L"  |  Files: " + std::to_wstring(totalFiles);
+                SetWindowTextW(hSummaryText, summaryText.c_str());
+                ShowWindow(hSummaryText, SW_SHOW);
             }
-            else
-            {
-                LogDebug(L"ReadMFT: Drive " + drive + L" failed");
-            }
+
+            UpdateProgress(85, L"Building tree view...");
+            
+            BuildTreeView(drive);
         }
-        
-        QueryPerformanceCounter(&t2);
-        double elapsedTimeMS = (t2.QuadPart - t1.QuadPart) * 1000.0 / freq.QuadPart;
-
-        LogDebug(L"ReadMFT: Complete - Total Files: " + std::to_wstring(totalFiles) + 
-                 L", Total Dirs: " + std::to_wstring(totalDirs) + 
-                 L", Time: " + std::to_wstring((int)elapsedTimeMS) + L" ms");
-
-        // Update summary text
-        if (hSummaryText)
+        else
         {
-            std::wstring summaryText = L"MFT Read Time: " + std::to_wstring((int)elapsedTimeMS) + 
-                L" ms  |  Drives: " + std::to_wstring(drives.size()) +
-                L"  |  Folders: " + std::to_wstring(totalDirs) + 
-                L"  |  Files: " + std::to_wstring(totalFiles);
-            SetWindowTextW(hSummaryText, summaryText.c_str());
-            ShowWindow(hSummaryText, SW_SHOW);
+            UpdateProgress(0, L"Failed to read drive " + drive + L":");
         }
 
-        UpdateProgress(85, L"MFT reading complete. Building tree...");
-        LogDebug(L"ReadMFT: Starting tree build");
+        // Re-enable drive buttons
+        for (auto& db : driveButtons)
+        {
+            EnableWindow(db.hButton, TRUE);
+        }
 
-        // Build the tree view
-        BuildTreeView();
-
-        LogDebug(L"ReadMFT: Tree build complete");
-
-        // Hide progress controls after completion
-        Sleep(1000);
+        // Hide progress bar after completion
+        Sleep(500);
         if (hProgressBar)
             ShowWindow(hProgressBar, SW_HIDE);
         if (hStatusText)
-            ShowWindow(hStatusText, SW_HIDE);
-            
-        LogDebug(L"ReadMFT: All operations complete\n");
+            SetWindowTextW(hStatusText, L"Select a drive to scan...");
     }
     catch (const std::exception& e)
     {
-        std::string error = "Exception in ReadMFTAndListFiles: ";
+        std::string error = "Exception: ";
         error += e.what();
-        LogDebug(L"ReadMFT: EXCEPTION - " + std::wstring(error.begin(), error.end()));
         MessageBoxA(hWnd, error.c_str(), "Error", MB_OK | MB_ICONERROR);
     }
     catch (...)
     {
-        LogDebug(L"ReadMFT: UNKNOWN EXCEPTION");
-        MessageBoxW(hWnd, L"Unknown exception in ReadMFTAndListFiles", L"Error", MB_OK | MB_ICONERROR);
+        MessageBoxW(hWnd, L"Unknown exception", L"Error", MB_OK | MB_ICONERROR);
+    }
+    
+    // Re-enable drive buttons on error path too
+    for (auto& db : driveButtons)
+    {
+        EnableWindow(db.hButton, TRUE);
+    }
+}
+
+void CreateDriveButtons(HWND hWnd)
+{
+    for (auto& db : driveButtons)
+    {
+        if (db.hButton)
+            DestroyWindow(db.hButton);
+    }
+    driveButtons.clear();
+    
+    std::vector<std::wstring> drives = GetFixedNtfsDrives();
+    
+    int buttonWidth = 80;
+    int buttonHeight = 30;
+    int spacing = 5;
+    int startX = 10;
+    
+    for (size_t i = 0; i < drives.size(); i++)
+    {
+        std::wstring label = L"Scan " + drives[i] + L":";
+        
+        HWND hBtn = CreateWindowExW(
+            0, L"BUTTON", label.c_str(),
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+            startX + (int)(i * (buttonWidth + spacing)), 5,
+            buttonWidth, buttonHeight,
+            hWnd,
+            (HMENU)(INT_PTR)(IDC_DRIVE_BUTTON_BASE + i),
+            hInst, NULL);
+        
+        DriveButton db;
+        db.hButton = hBtn;
+        db.driveLetter = drives[i];
+        driveButtons.push_back(db);
+    }
+}
+
+void LayoutControls(HWND hWnd)
+{
+    RECT rcClient;
+    GetClientRect(hWnd, &rcClient);
+    
+    int buttonRowHeight = 40;
+    int statusHeight = 25;
+    int progressHeight = 20;
+    int summaryHeight = 25;
+    int currentY = 0;
+    
+    int buttonWidth = 80;
+    int spacing = 5;
+    int startX = 10;
+    for (size_t i = 0; i < driveButtons.size(); i++)
+    {
+        if (driveButtons[i].hButton)
+        {
+            SetWindowPos(driveButtons[i].hButton, NULL,
+                startX + (int)(i * (buttonWidth + spacing)), 5,
+                buttonWidth, 30, SWP_NOZORDER);
+        }
+    }
+    currentY += buttonRowHeight;
+    
+    if (hStatusText)
+    {
+        SetWindowPos(hStatusText, NULL, 0, currentY,
+            rcClient.right, statusHeight, SWP_NOZORDER);
+    }
+    currentY += statusHeight;
+    
+    if (hProgressBar)
+    {
+        SetWindowPos(hProgressBar, NULL, 10, currentY,
+            rcClient.right - 20, progressHeight, SWP_NOZORDER);
+    }
+    currentY += progressHeight;
+    
+    if (hSummaryText)
+    {
+        SetWindowPos(hSummaryText, NULL, 0, currentY,
+            rcClient.right, summaryHeight, SWP_NOZORDER);
+    }
+    currentY += summaryHeight;
+    
+    if (hTreeView)
+    {
+        SetWindowPos(hTreeView, NULL, 0, currentY,
+            rcClient.right, rcClient.bottom - currentY, SWP_NOZORDER);
     }
 }
 
@@ -692,19 +582,16 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
     UNREFERENCED_PARAMETER(hPrevInstance);
     UNREFERENCED_PARAMETER(lpCmdLine);
 
-    // Initialize common controls
     INITCOMMONCONTROLSEX icex;
     icex.dwSize = sizeof(INITCOMMONCONTROLSEX);
     icex.dwICC = ICC_TREEVIEW_CLASSES | ICC_PROGRESS_CLASS;
     InitCommonControlsEx(&icex);
 
-    // Initialize global strings
     LoadStringW(hInstance, IDS_APP_TITLE, szTitle, MAX_LOADSTRING);
     LoadStringW(hInstance, IDC_FINDMYFILE, szWindowClass, MAX_LOADSTRING);
     MyRegisterClass(hInstance);
 
-    // Perform application initialization:
-    if (!InitInstance (hInstance, nCmdShow))
+    if (!InitInstance(hInstance, nCmdShow))
     {
         return FALSE;
     }
@@ -713,7 +600,6 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
 
     MSG msg;
 
-    // Main message loop:
     while (GetMessage(&msg, nullptr, 0, 0))
     {
         if (!TranslateAccelerator(msg.hwnd, hAccelTable, &msg))
@@ -723,20 +609,14 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
         }
     }
 
-    return (int) msg.wParam;
+    return (int)msg.wParam;
 }
 
-//
-//  FUNCTION: MyRegisterClass()
-//
-//  PURPOSE: Registers the window class.
-//
 ATOM MyRegisterClass(HINSTANCE hInstance)
 {
     WNDCLASSEXW wcex;
 
     wcex.cbSize = sizeof(WNDCLASSEX);
-
     wcex.style          = CS_HREDRAW | CS_VREDRAW;
     wcex.lpfnWndProc    = WndProc;
     wcex.cbClsExtra     = 0;
@@ -744,7 +624,7 @@ ATOM MyRegisterClass(HINSTANCE hInstance)
     wcex.hInstance      = hInstance;
     wcex.hIcon          = LoadIcon(hInstance, MAKEINTRESOURCE(IDI_FINDMYFILE));
     wcex.hCursor        = LoadCursor(nullptr, IDC_ARROW);
-    wcex.hbrBackground  = (HBRUSH)(COLOR_WINDOW+1);
+    wcex.hbrBackground  = (HBRUSH)(COLOR_WINDOW + 1);
     wcex.lpszMenuName   = MAKEINTRESOURCEW(IDC_FINDMYFILE);
     wcex.lpszClassName  = szWindowClass;
     wcex.hIconSm        = LoadIcon(wcex.hInstance, MAKEINTRESOURCE(IDI_SMALL));
@@ -752,63 +632,41 @@ ATOM MyRegisterClass(HINSTANCE hInstance)
     return RegisterClassExW(&wcex);
 }
 
-//
-//   FUNCTION: InitInstance(HINSTANCE, int)
-//
-//   PURPOSE: Saves instance handle and creates main window
-//
 BOOL InitInstance(HINSTANCE hInstance, int nCmdShow)
 {
-   hInst = hInstance; // Store instance handle in our global variable
+    hInst = hInstance;
 
-   HWND hWnd = CreateWindowW(szWindowClass, szTitle, WS_OVERLAPPEDWINDOW,
-      CW_USEDEFAULT, 0, 800, 600, nullptr, nullptr, hInstance, nullptr);
+    HWND hWnd = CreateWindowW(szWindowClass, szTitle, WS_OVERLAPPEDWINDOW,
+        CW_USEDEFAULT, 0, 900, 650, nullptr, nullptr, hInstance, nullptr);
 
-   if (!hWnd)
-   {
-      return FALSE;
-   }
+    if (!hWnd)
+    {
+        return FALSE;
+    }
 
-   ShowWindow(hWnd, nCmdShow);
-   UpdateWindow(hWnd);
+    ShowWindow(hWnd, nCmdShow);
+    UpdateWindow(hWnd);
 
-   return TRUE;
+    return TRUE;
 }
 
-//
-//  FUNCTION: WndProc(HWND, UINT, WPARAM, LPARAM)
-//
-//  PURPOSE: Processes messages for the main window.
-//
 LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 {
     switch (message)
     {
     case WM_CREATE:
         {
-            // Create status text control
-            hStatusText = CreateWindowExW(
-                0,
-                L"STATIC",
-                L"Click anywhere to scan drives...",
-                WS_CHILD | WS_VISIBLE | SS_CENTER,
-                0, 0, 0, 30,
-                hWnd,
-                (HMENU)1003,
-                hInst,
-                NULL);
+            CreateDriveButtons(hWnd);
 
-            // Create progress bar control
+            hStatusText = CreateWindowExW(
+                0, L"STATIC", L"Select a drive to scan...",
+                WS_CHILD | WS_VISIBLE | SS_CENTER,
+                0, 40, 0, 25, hWnd, (HMENU)1003, hInst, NULL);
+
             hProgressBar = CreateWindowExW(
-                0,
-                PROGRESS_CLASS,
-                NULL,
+                0, PROGRESS_CLASS, NULL,
                 WS_CHILD | PBS_SMOOTH,
-                0, 30, 0, 30,
-                hWnd,
-                (HMENU)1002,
-                hInst,
-                NULL);
+                0, 65, 0, 20, hWnd, (HMENU)1002, hInst, NULL);
 
             if (hProgressBar)
             {
@@ -816,78 +674,57 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
                 SendMessage(hProgressBar, PBM_SETSTEP, 1, 0);
             }
 
-            // Create summary text control (initially hidden)
             hSummaryText = CreateWindowExW(
-                0,
-                L"STATIC",
-                L"",
+                0, L"STATIC", L"",
                 WS_CHILD | SS_CENTER,
-                0, 60, 0, 25,
-                hWnd,
-                (HMENU)1004,
-                hInst,
-                NULL);
+                0, 85, 0, 25, hWnd, (HMENU)1004, hInst, NULL);
 
-            // Create TreeView control
             hTreeView = CreateWindowExW(
-                0,
-                WC_TREEVIEW,
-                L"Tree View",
-                WS_VISIBLE | WS_CHILD | WS_BORDER | TVS_HASLINES | 
+                0, WC_TREEVIEW, L"Tree View",
+                WS_VISIBLE | WS_CHILD | WS_BORDER | TVS_HASLINES |
                 TVS_HASBUTTONS | TVS_LINESATROOT,
-                0, 85, 0, 0,
-                hWnd,
-                (HMENU)1001,
-                hInst,
-                NULL);
-            
-            if (hTreeView)
-            {
-                // Add initial message
-                HTREEITEM hRoot = AddItemToTree(hTreeView, 
-                    (LPWSTR)L"Click anywhere to scan drives...", TVI_ROOT);
-            }
+                0, 110, 0, 0, hWnd, (HMENU)1001, hInst, NULL);
         }
         break;
     case WM_SIZE:
+        LayoutControls(hWnd);
+        break;
+    case WM_NOTIFY:
         {
-            // Resize controls to fill client area
-            RECT rcClient;
-            GetClientRect(hWnd, &rcClient);
-            
-            int statusHeight = 30;
-            int progressHeight = 30;
-            int summaryHeight = 25;
-            int totalHeaderHeight = statusHeight + progressHeight + summaryHeight;
-            
-            if (hStatusText)
+            NMHDR* pnmh = (NMHDR*)lParam;
+            if (pnmh->idFrom == 1001 && pnmh->code == TVN_ITEMEXPANDING)
             {
-                SetWindowPos(hStatusText, NULL, 0, 0, 
-                    rcClient.right, statusHeight, SWP_NOZORDER);
-            }
-            
-            if (hProgressBar)
-            {
-                SetWindowPos(hProgressBar, NULL, 10, statusHeight, 
-                    rcClient.right - 20, progressHeight, SWP_NOZORDER);
-            }
+                NMTREEVIEW* pnmtv = (NMTREEVIEW*)lParam;
+                if (pnmtv->action == TVE_EXPAND)
+                {
+                    HTREEITEM hItem = pnmtv->itemNew.hItem;
+                    ULONGLONG fileRef = (ULONGLONG)pnmtv->itemNew.lParam;
 
-            if (hSummaryText)
-            {
-                SetWindowPos(hSummaryText, NULL, 0, statusHeight + progressHeight, 
-                    rcClient.right, summaryHeight, SWP_NOZORDER);
-            }
-            
-            if (hTreeView)
-            {
-                SetWindowPos(hTreeView, NULL, 0, totalHeaderHeight, 
-                    rcClient.right, rcClient.bottom - totalHeaderHeight, SWP_NOZORDER);
+                    // Check if children are already loaded by looking for a dummy child
+                    HTREEITEM hChild = TreeView_GetChild(hTreeView, hItem);
+                    if (hChild != NULL)
+                    {
+                        // Children already populated - nothing to do
+                        break;
+                    }
+
+                    // Populate children on demand
+                    PopulateChildren(fileRef, hItem);
+                }
             }
         }
         break;
     case WM_COMMAND:
         {
             int wmId = LOWORD(wParam);
+            
+            if (wmId >= IDC_DRIVE_BUTTON_BASE && wmId < IDC_DRIVE_BUTTON_BASE + (int)driveButtons.size())
+            {
+                int driveIdx = wmId - IDC_DRIVE_BUTTON_BASE;
+                ReadDriveAndBuildTree(hWnd, driveButtons[driveIdx].driveLetter);
+                break;
+            }
+            
             switch (wmId)
             {
             case IDM_ABOUT:
@@ -901,10 +738,6 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
             }
         }
         break;
-    case WM_LBUTTONDOWN:
-        // Trigger MFT read on left mouse click
-        ReadMFTAndListFiles(hWnd);
-        break;
     case WM_DESTROY:
         PostQuitMessage(0);
         break;
@@ -914,7 +747,6 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
     return 0;
 }
 
-// Message handler for about box.
 INT_PTR CALLBACK About(HWND hDlg, UINT message, WPARAM wParam, LPARAM lParam)
 {
     UNREFERENCED_PARAMETER(lParam);
