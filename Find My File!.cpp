@@ -22,6 +22,13 @@
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "shlwapi.lib")
 #pragma comment(lib, "uxtheme.lib")
+#pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "oleaut32.lib")
+
+#include <ole2.h>
+#include <oledb.h>
+#include <msdasc.h>
+#include <comdef.h>
 
 // Enable visual styles (Common Controls v6)
 #pragma comment(linker, "/manifestdependency:\"type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"" )
@@ -30,6 +37,7 @@
 #define IDC_DRIVE_BUTTON_BASE 2000
 #define IDC_SEARCH_EDIT     3000
 #define IDC_FIND_BUTTON     3001
+#define IDC_WINSEARCH_BUTTON 3004
 #define IDC_TAB_CONTROL     3002
 #define IDC_LISTVIEW        3003
 #define IDM_CTX_OPEN        4000
@@ -60,6 +68,7 @@ HWND hTabControl = NULL;
 HWND hSearchEdit = NULL;
 HWND hFindButton = NULL;
 HWND hListView = NULL;
+HWND hWinSearchButton = NULL;
 std::wstring currentDriveLetter;
 std::wstring currentSearchKeyword;
 std::wstring currentSearchScope;
@@ -265,6 +274,7 @@ void                StopUsnMonitor();
 void                ProcessPendingUsnChanges();
 void                UpdatePropertiesPanel(int selectedIndex);
 void                RebuildSortedTokens();
+void                TriggerWindowsSearch(HWND hWnd);
 
 // Update the tooltip text for the properties toggle button to reflect its current action.
 static void UpdateToggleTooltip()
@@ -1736,6 +1746,380 @@ void TriggerSearch(HWND hWnd)
     SetWindowTextW(hStatusText, status.c_str());
 }
 
+// Perform a search using the Windows Search Indexer via OLE DB.
+void TriggerWindowsSearch(HWND hWnd)
+{
+    wchar_t searchText[512] = {0};
+    GetWindowTextW(hSearchEdit, searchText, 512);
+    std::wstring keyword(searchText);
+    if (keyword.empty())
+        return;
+
+    currentSearchKeyword = keyword;
+    for (auto& ch : currentSearchKeyword)
+        ch = towlower(ch);
+
+    LARGE_INTEGER searchFreq, searchT1, searchT2;
+    QueryPerformanceFrequency(&searchFreq);
+    QueryPerformanceCounter(&searchT1);
+
+    searchResults.clear();
+    bWildcardSearch = false;
+
+    HRESULT hr = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
+    bool comInited = SUCCEEDED(hr) || hr == S_FALSE || hr == RPC_E_CHANGED_MODE;
+
+    if (!comInited)
+    {
+        SetWindowTextW(hStatusText, L"Failed to initialize COM.");
+        return;
+    }
+
+    // Use the Search OLE DB provider via IDataInitialize
+    IDataInitialize* pDataInit = NULL;
+    hr = CoCreateInstance(
+        CLSID_MSDAINITIALIZE, NULL, CLSCTX_INPROC_SERVER,
+        __uuidof(IDataInitialize), (void**)&pDataInit);
+
+    if (FAILED(hr) || !pDataInit)
+    {
+        SetWindowTextW(hStatusText, L"Failed to create OLE DB data initializer.");
+        if (comInited) CoUninitialize();
+        return;
+    }
+
+    IDBInitialize* pDBInitialize = NULL;
+    hr = pDataInit->GetDataSource(
+        NULL, CLSCTX_INPROC_SERVER,
+        L"provider=Search.CollatorDSO.1;EXTENDED PROPERTIES='Application=Windows';",
+        __uuidof(IDBInitialize), (IUnknown**)&pDBInitialize);
+    pDataInit->Release();
+
+    if (FAILED(hr) || !pDBInitialize)
+    {
+        SetWindowTextW(hStatusText, L"Failed to connect to Windows Search provider.");
+        if (comInited) CoUninitialize();
+        return;
+    }
+
+    hr = pDBInitialize->Initialize();
+    if (FAILED(hr))
+    {
+        pDBInitialize->Release();
+        SetWindowTextW(hStatusText, L"Failed to initialize Windows Search provider.");
+        if (comInited) CoUninitialize();
+        return;
+    }
+
+    IDBCreateSession* pCreateSession = NULL;
+    hr = pDBInitialize->QueryInterface(__uuidof(IDBCreateSession), (void**)&pCreateSession);
+    if (FAILED(hr) || !pCreateSession)
+    {
+        pDBInitialize->Release();
+        SetWindowTextW(hStatusText, L"Failed to create search session.");
+        if (comInited) CoUninitialize();
+        return;
+    }
+
+    IDBCreateCommand* pCreateCommand = NULL;
+    hr = pCreateSession->CreateSession(NULL, __uuidof(IDBCreateCommand), (IUnknown**)&pCreateCommand);
+    pCreateSession->Release();
+    if (FAILED(hr) || !pCreateCommand)
+    {
+        pDBInitialize->Release();
+        SetWindowTextW(hStatusText, L"Failed to create command object.");
+        if (comInited) CoUninitialize();
+        return;
+    }
+
+    ICommandText* pCommandText = NULL;
+    hr = pCreateCommand->CreateCommand(NULL, __uuidof(ICommandText), (IUnknown**)&pCommandText);
+    pCreateCommand->Release();
+    if (FAILED(hr) || !pCommandText)
+    {
+        pDBInitialize->Release();
+        SetWindowTextW(hStatusText, L"Failed to create command text.");
+        if (comInited) CoUninitialize();
+        return;
+    }
+
+    // Determine search scope from selected tree node
+    std::wstring scopePath;
+    currentSearchScope.clear();
+    HTREEITEM hSelItem = TreeView_GetSelection(hTreeView);
+    if (hSelItem)
+    {
+        auto refIt = treeItemToRef.find(hSelItem);
+        if (refIt != treeItemToRef.end())
+        {
+            ULONGLONG selRef = refIt->second;
+            if (selRef != 5)
+            {
+                auto feIt = fileMap.find(selRef);
+                if (feIt != fileMap.end() && feIt->second.isDirectory)
+                {
+                    scopePath = BuildFullPath(selRef, currentDriveLetter);
+                    currentSearchScope = scopePath;
+                }
+            }
+        }
+    }
+
+    // Build the SQL query — search by System.FileName LIKE '%keyword%'
+    // Escape single quotes in the keyword
+    std::wstring escapedKw;
+    for (wchar_t c : keyword)
+    {
+        if (c == L'\'')
+            escapedKw += L"''";
+        else
+            escapedKw += c;
+    }
+
+    // Build scope — use the selected folder if available, otherwise fall back to drive
+    std::wstring scopeClause;
+    if (!scopePath.empty())
+    {
+        // Ensure trailing backslash for folder scope
+        std::wstring scopeDir = scopePath;
+        if (!scopeDir.empty() && scopeDir.back() != L'\\')
+            scopeDir += L'\\';
+        scopeClause = L" AND SCOPE='file:///" + scopeDir + L"'";
+    }
+    else if (!currentDriveLetter.empty())
+    {
+        scopeClause = L" AND SCOPE='file:///" + currentDriveLetter + L":\\'";
+    }
+
+    std::wstring sql = L"SELECT System.ItemName, System.ItemPathDisplay, "
+                       L"System.ItemType "
+                       L"FROM SystemIndex WHERE System.FileName LIKE '%"
+                       + escapedKw + L"%'" + scopeClause;
+
+    hr = pCommandText->SetCommandText(DBGUID_DEFAULT, sql.c_str());
+    if (FAILED(hr))
+    {
+        pCommandText->Release();
+        pDBInitialize->Release();
+        SetWindowTextW(hStatusText, L"Failed to set query text.");
+        if (comInited) CoUninitialize();
+        return;
+    }
+
+    IRowset* pRowset = NULL;
+    DBROWCOUNT rowsAffected = 0;
+    hr = pCommandText->Execute(NULL, __uuidof(IRowset), NULL, &rowsAffected, (IUnknown**)&pRowset);
+    pCommandText->Release();
+    if (FAILED(hr) || !pRowset)
+    {
+        pDBInitialize->Release();
+        SetWindowTextW(hStatusText, L"Windows Search query failed.");
+        if (comInited) CoUninitialize();
+        return;
+    }
+
+    // Get column accessor
+    IAccessor* pAccessor = NULL;
+    hr = pRowset->QueryInterface(__uuidof(IAccessor), (void**)&pAccessor);
+    if (FAILED(hr) || !pAccessor)
+    {
+        pRowset->Release();
+        pDBInitialize->Release();
+        SetWindowTextW(hStatusText, L"Failed to get row accessor.");
+        if (comInited) CoUninitialize();
+        return;
+    }
+
+    // We have 3 columns: ItemName, ItemPathDisplay, ItemType
+    // The Windows Search OLE DB provider only reliably supports DBTYPE_VARIANT
+    // bindings. We bind each column as a VARIANT and extract strings afterwards.
+    // VARIANT requires 8-byte alignment; use #pragma pack or careful layout.
+    struct RowData {
+        DBSTATUS dwNameStatus;
+        DBLENGTH dwNameLen;
+        DBSTATUS dwPathStatus;
+        DBLENGTH dwPathLen;
+        DBSTATUS dwTypeStatus;
+        DBLENGTH dwTypeLen;
+        // Place all VARIANTs together at the end for natural alignment
+        VARIANT vName;
+        VARIANT vPath;
+        VARIANT vType;
+    };
+
+    DBBINDING rgBindings[3];
+    memset(rgBindings, 0, sizeof(rgBindings));
+
+    // Column 1: System.ItemName (ordinal 1)
+    rgBindings[0].iOrdinal  = 1;
+    rgBindings[0].obStatus  = offsetof(RowData, dwNameStatus);
+    rgBindings[0].obLength  = offsetof(RowData, dwNameLen);
+    rgBindings[0].obValue   = offsetof(RowData, vName);
+    rgBindings[0].dwPart    = DBPART_VALUE | DBPART_STATUS | DBPART_LENGTH;
+    rgBindings[0].dwMemOwner = DBMEMOWNER_CLIENTOWNED;
+    rgBindings[0].cbMaxLen  = sizeof(VARIANT);
+    rgBindings[0].wType     = DBTYPE_VARIANT;
+
+    // Column 2: System.ItemPathDisplay (ordinal 2)
+    rgBindings[1].iOrdinal  = 2;
+    rgBindings[1].obStatus  = offsetof(RowData, dwPathStatus);
+    rgBindings[1].obLength  = offsetof(RowData, dwPathLen);
+    rgBindings[1].obValue   = offsetof(RowData, vPath);
+    rgBindings[1].dwPart    = DBPART_VALUE | DBPART_STATUS | DBPART_LENGTH;
+    rgBindings[1].dwMemOwner = DBMEMOWNER_CLIENTOWNED;
+    rgBindings[1].cbMaxLen  = sizeof(VARIANT);
+    rgBindings[1].wType     = DBTYPE_VARIANT;
+
+    // Column 3: System.ItemType (ordinal 3)
+    rgBindings[2].iOrdinal  = 3;
+    rgBindings[2].obStatus  = offsetof(RowData, dwTypeStatus);
+    rgBindings[2].obLength  = offsetof(RowData, dwTypeLen);
+    rgBindings[2].obValue   = offsetof(RowData, vType);
+    rgBindings[2].dwPart    = DBPART_VALUE | DBPART_STATUS | DBPART_LENGTH;
+    rgBindings[2].dwMemOwner = DBMEMOWNER_CLIENTOWNED;
+    rgBindings[2].cbMaxLen  = sizeof(VARIANT);
+    rgBindings[2].wType     = DBTYPE_VARIANT;
+
+    HACCESSOR hAcc = 0;
+    DBBINDSTATUS rgStatus[3];
+    hr = pAccessor->CreateAccessor(DBACCESSOR_ROWDATA, 3, rgBindings, sizeof(RowData),
+                                   &hAcc, rgStatus);
+    if (FAILED(hr))
+    {
+        // Build a diagnostic message with the HRESULT and per-binding status
+        wchar_t diagBuf[256];
+        swprintf_s(diagBuf, 256,
+            L"Failed to create accessor. hr=0x%08X  status[0]=%u status[1]=%u status[2]=%u",
+            (unsigned)hr, (unsigned)rgStatus[0], (unsigned)rgStatus[1], (unsigned)rgStatus[2]);
+        pAccessor->Release();
+        pRowset->Release();
+        pDBInitialize->Release();
+        SetWindowTextW(hStatusText, diagBuf);
+        if (comInited) CoUninitialize();
+        return;
+    }
+
+    // Fetch rows
+    const size_t MAX_RESULTS = 10000;
+    searchResults.reserve(4096);
+
+    // Helper: extract a wstring from a VARIANT (handles VT_BSTR and VT_LPWSTR)
+    auto VariantToWString = [](VARIANT& v) -> std::wstring {
+        if (v.vt == VT_BSTR && v.bstrVal)
+            return std::wstring(v.bstrVal, SysStringLen(v.bstrVal));
+        if (v.vt == VT_LPWSTR && v.bstrVal)
+            return std::wstring((LPCWSTR)v.bstrVal);
+        // Try coercing to BSTR
+        VARIANT vStr;
+        VariantInit(&vStr);
+        if (SUCCEEDED(VariantChangeType(&vStr, &v, 0, VT_BSTR)) && vStr.bstrVal)
+        {
+            std::wstring result(vStr.bstrVal, SysStringLen(vStr.bstrVal));
+            VariantClear(&vStr);
+            return result;
+        }
+        VariantClear(&vStr);
+        return std::wstring();
+    };
+
+    HROW hRows[50];
+    HROW* pRows = hRows;
+    DBCOUNTITEM cRowsObtained = 0;
+    int score = 50; // Windows Search results get a flat score
+
+    while (searchResults.size() < MAX_RESULTS)
+    {
+        hr = pRowset->GetNextRows(DB_NULL_HCHAPTER, 0, 50, &cRowsObtained, &pRows);
+        if (FAILED(hr) || cRowsObtained == 0)
+            break;
+
+        for (DBCOUNTITEM i = 0; i < cRowsObtained; i++)
+        {
+            RowData rd;
+            memset(&rd, 0, sizeof(rd));
+            VariantInit(&rd.vName);
+            VariantInit(&rd.vPath);
+            VariantInit(&rd.vType);
+
+            hr = pRowset->GetData(hRows[i], hAcc, &rd);
+            if (FAILED(hr))
+            {
+                VariantClear(&rd.vName);
+                VariantClear(&rd.vPath);
+                VariantClear(&rd.vType);
+                continue;
+            }
+
+            if (rd.dwNameStatus != DBSTATUS_S_OK || rd.dwPathStatus != DBSTATUS_S_OK)
+            {
+                VariantClear(&rd.vName);
+                VariantClear(&rd.vPath);
+                VariantClear(&rd.vType);
+                continue;
+            }
+
+            SearchResult sr;
+            sr.fileRef = 0;
+            sr.fileName = VariantToWString(rd.vName);
+            sr.fullPath = VariantToWString(rd.vPath);
+
+            // Determine if it's a directory based on ItemType
+            if (rd.dwTypeStatus == DBSTATUS_S_OK)
+            {
+                std::wstring itemType = VariantToWString(rd.vType);
+                sr.isDirectory = (itemType == L"Directory" || itemType == L"Folder" ||
+                                  itemType == L"File folder" || itemType.empty());
+            }
+            else
+            {
+                // Fallback: check file attributes
+                DWORD attrs = GetFileAttributesW(sr.fullPath.c_str());
+                sr.isDirectory = (attrs != INVALID_FILE_ATTRIBUTES &&
+                                  (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0);
+            }
+
+            VariantClear(&rd.vName);
+            VariantClear(&rd.vPath);
+            VariantClear(&rd.vType);
+
+            sr.matchScore = score;
+            searchResults.push_back(std::move(sr));
+
+            if (searchResults.size() >= MAX_RESULTS)
+                break;
+        }
+
+        pRowset->ReleaseRows(cRowsObtained, hRows, NULL, NULL, NULL);
+        pRows = hRows;
+    }
+
+    pAccessor->ReleaseAccessor(hAcc, NULL);
+    pAccessor->Release();
+    pRowset->Release();
+    pDBInitialize->Uninitialize();
+    pDBInitialize->Release();
+    if (comInited) CoUninitialize();
+
+    PopulateSearchResults();
+
+    QueryPerformanceCounter(&searchT2);
+    double searchElapsedMS = (searchT2.QuadPart - searchT1.QuadPart) * 1000.0 / searchFreq.QuadPart;
+
+    // Switch to Search Results tab
+    TabCtrl_SetCurSel(hTabControl, 1);
+    ShowTab(1);
+
+    std::wstring status = L"Windows Search: " + std::to_wstring(searchResults.size()) + L" results";
+    if (searchResults.size() >= MAX_RESULTS)
+        status += L" (showing first 10,000)";
+    if (!currentSearchScope.empty())
+        status += L"  |  Scope: " + currentSearchScope;
+    wchar_t timeBuf[64];
+    swprintf_s(timeBuf, 64, L"  |  %.1f ms", searchElapsedMS);
+    status += timeBuf;
+    SetWindowTextW(hStatusText, status.c_str());
+}
+
 // Format a byte size into a human-readable string.
 static std::wstring FormatFileSize(ULONGLONG size)
 {
@@ -2205,6 +2589,7 @@ void ReadDriveAndBuildTree(HWND hWnd, const std::wstring& drive)
                 bTreeRenderedOnce = true;
                 if (hSearchEdit) EnableWindow(hSearchEdit, TRUE);
                 if (hFindButton) EnableWindow(hFindButton, TRUE);
+                if (hWinSearchButton) EnableWindow(hWinSearchButton, TRUE);
             }
 
             // Start live USN journal monitoring
@@ -2327,6 +2712,13 @@ void LayoutControls(HWND hWnd)
     {
         SetWindowPos(hFindButton, NULL, searchX + searchEditWidth + 6, btnY,
             findBtnWidth, buttonHeight, SWP_NOZORDER);
+    }
+    int winSearchBtnWidth = 175;
+    if (hWinSearchButton)
+    {
+        SetWindowPos(hWinSearchButton, NULL,
+            searchX + searchEditWidth + 6 + findBtnWidth + 6, btnY,
+            winSearchBtnWidth, buttonHeight, SWP_NOZORDER);
     }
     int darkBtnWidth = 75;
     if (hDarkModeBtn)
@@ -2556,6 +2948,11 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
                 0, L"BUTTON", L"Find",
                 WS_CHILD | WS_VISIBLE | BS_OWNERDRAW | WS_DISABLED,
                 0, 5, 60, 25, hWnd, (HMENU)IDC_FIND_BUTTON, hInst, NULL);
+
+            hWinSearchButton = CreateWindowExW(
+                0, L"BUTTON", L"Find with Windows Search",
+                WS_CHILD | WS_VISIBLE | BS_OWNERDRAW | WS_DISABLED,
+                0, 5, 160, 25, hWnd, (HMENU)IDC_WINSEARCH_BUTTON, hInst, NULL);
 
             hStatusText = CreateWindowExW(
                 0, L"STATIC", L"Select a drive to scan...",
@@ -3210,6 +3607,13 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
             {
                 KillTimer(hWnd, IDT_SEARCH_DEBOUNCE);
                 TriggerSearch(hWnd);
+                break;
+            }
+
+            if (wmId == IDC_WINSEARCH_BUTTON)
+            {
+                KillTimer(hWnd, IDT_SEARCH_DEBOUNCE);
+                TriggerWindowsSearch(hWnd);
                 break;
             }
 
