@@ -73,6 +73,7 @@ std::wstring currentDriveLetter;
 std::wstring currentSearchKeyword;
 std::wstring currentSearchScope;
 bool bWildcardSearch = false;  // true when current search uses wildcard/glob pattern
+bool bWindowsSearch = false;   // true when results came from Windows Search indexer
 HFONT hUIFont = NULL;
 HBRUSH hToolbarBrush = NULL;
 HBRUSH hStatusBrush = NULL;
@@ -232,6 +233,7 @@ struct SearchResult {
     ULONGLONG fileRef;
     std::wstring fileName;
     std::wstring fullPath;
+    std::wstring contentSnippet;  // content match preview from Windows Search
     bool isDirectory;
     int matchScore;  // higher = better match
 };
@@ -1695,6 +1697,7 @@ void TriggerSearch(HWND hWnd)
     currentSearchKeyword = keyword;
     for (auto& ch : currentSearchKeyword)
         ch = towlower(ch);
+    bWindowsSearch = false;
 
     // Determine search scope from selected tree node
     ULONGLONG scopeRef = 0;
@@ -1765,6 +1768,7 @@ void TriggerWindowsSearch(HWND hWnd)
 
     searchResults.clear();
     bWildcardSearch = false;
+    bWindowsSearch = true;
 
     HRESULT hr = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
     bool comInited = SUCCEEDED(hr) || hr == S_FALSE || hr == RPC_E_CHANGED_MODE;
@@ -1891,10 +1895,27 @@ void TriggerWindowsSearch(HWND hWnd)
         scopeClause = L" AND SCOPE='file:///" + currentDriveLetter + L":\\'";
     }
 
+    // Build escaped keyword for CONTAINS predicate (double any single quotes)
+    // CONTAINS uses a different escaping: wrap the term in double quotes for exact phrase
+    std::wstring containsKw;
+    for (wchar_t c : keyword)
+    {
+        if (c == L'\'')
+            containsKw += L"''";
+        else if (c == L'"')
+            containsKw += L"\"\"";
+        else
+            containsKw += c;
+    }
+
+    // Search both filename (LIKE) and file contents (CONTAINS).
+    // CONTAINS searches the full-text index which covers file content for
+    // supported file types (documents, source code, text files, etc.).
     std::wstring sql = L"SELECT System.ItemName, System.ItemPathDisplay, "
-                       L"System.ItemType "
-                       L"FROM SystemIndex WHERE System.FileName LIKE '%"
-                       + escapedKw + L"%'" + scopeClause;
+                       L"System.ItemType, System.Search.AutoSummary "
+                       L"FROM SystemIndex WHERE "
+                       L"(System.FileName LIKE '%" + escapedKw + L"%'"
+                       L" OR CONTAINS('\"" + containsKw + L"\"'))" + scopeClause;
 
     hr = pCommandText->SetCommandText(DBGUID_DEFAULT, sql.c_str());
     if (FAILED(hr))
@@ -1930,7 +1951,7 @@ void TriggerWindowsSearch(HWND hWnd)
         return;
     }
 
-    // We have 3 columns: ItemName, ItemPathDisplay, ItemType
+    // We have 4 columns: ItemName, ItemPathDisplay, ItemType, AutoSummary
     // The Windows Search OLE DB provider only reliably supports DBTYPE_VARIANT
     // bindings. We bind each column as a VARIANT and extract strings afterwards.
     // VARIANT requires 8-byte alignment; use #pragma pack or careful layout.
@@ -1941,13 +1962,16 @@ void TriggerWindowsSearch(HWND hWnd)
         DBLENGTH dwPathLen;
         DBSTATUS dwTypeStatus;
         DBLENGTH dwTypeLen;
+        DBSTATUS dwSummaryStatus;
+        DBLENGTH dwSummaryLen;
         // Place all VARIANTs together at the end for natural alignment
         VARIANT vName;
         VARIANT vPath;
         VARIANT vType;
+        VARIANT vSummary;
     };
 
-    DBBINDING rgBindings[3];
+    DBBINDING rgBindings[4];
     memset(rgBindings, 0, sizeof(rgBindings));
 
     // Column 1: System.ItemName (ordinal 1)
@@ -1980,17 +2004,27 @@ void TriggerWindowsSearch(HWND hWnd)
     rgBindings[2].cbMaxLen  = sizeof(VARIANT);
     rgBindings[2].wType     = DBTYPE_VARIANT;
 
+    // Column 4: System.Search.AutoSummary (ordinal 4)
+    rgBindings[3].iOrdinal  = 4;
+    rgBindings[3].obStatus  = offsetof(RowData, dwSummaryStatus);
+    rgBindings[3].obLength  = offsetof(RowData, dwSummaryLen);
+    rgBindings[3].obValue   = offsetof(RowData, vSummary);
+    rgBindings[3].dwPart    = DBPART_VALUE | DBPART_STATUS | DBPART_LENGTH;
+    rgBindings[3].dwMemOwner = DBMEMOWNER_CLIENTOWNED;
+    rgBindings[3].cbMaxLen  = sizeof(VARIANT);
+    rgBindings[3].wType     = DBTYPE_VARIANT;
+
     HACCESSOR hAcc = 0;
-    DBBINDSTATUS rgStatus[3];
-    hr = pAccessor->CreateAccessor(DBACCESSOR_ROWDATA, 3, rgBindings, sizeof(RowData),
+    DBBINDSTATUS rgStatus[4];
+    hr = pAccessor->CreateAccessor(DBACCESSOR_ROWDATA, 4, rgBindings, sizeof(RowData),
                                    &hAcc, rgStatus);
     if (FAILED(hr))
     {
         // Build a diagnostic message with the HRESULT and per-binding status
         wchar_t diagBuf[256];
         swprintf_s(diagBuf, 256,
-            L"Failed to create accessor. hr=0x%08X  status[0]=%u status[1]=%u status[2]=%u",
-            (unsigned)hr, (unsigned)rgStatus[0], (unsigned)rgStatus[1], (unsigned)rgStatus[2]);
+            L"Failed to create accessor. hr=0x%08X  status[0]=%u status[1]=%u status[2]=%u status[3]=%u",
+            (unsigned)hr, (unsigned)rgStatus[0], (unsigned)rgStatus[1], (unsigned)rgStatus[2], (unsigned)rgStatus[3]);
         pAccessor->Release();
         pRowset->Release();
         pDBInitialize->Release();
@@ -2022,10 +2056,14 @@ void TriggerWindowsSearch(HWND hWnd)
         return std::wstring();
     };
 
+    // Build a lowercased keyword for filename-match detection
+    std::wstring lowerKw = keyword;
+    for (auto& ch2 : lowerKw)
+        ch2 = towlower(ch2);
+
     HROW hRows[50];
     HROW* pRows = hRows;
     DBCOUNTITEM cRowsObtained = 0;
-    int score = 50; // Windows Search results get a flat score
 
     while (searchResults.size() < MAX_RESULTS)
     {
@@ -2040,6 +2078,7 @@ void TriggerWindowsSearch(HWND hWnd)
             VariantInit(&rd.vName);
             VariantInit(&rd.vPath);
             VariantInit(&rd.vType);
+            VariantInit(&rd.vSummary);
 
             hr = pRowset->GetData(hRows[i], hAcc, &rd);
             if (FAILED(hr))
@@ -2047,6 +2086,7 @@ void TriggerWindowsSearch(HWND hWnd)
                 VariantClear(&rd.vName);
                 VariantClear(&rd.vPath);
                 VariantClear(&rd.vType);
+                VariantClear(&rd.vSummary);
                 continue;
             }
 
@@ -2055,6 +2095,7 @@ void TriggerWindowsSearch(HWND hWnd)
                 VariantClear(&rd.vName);
                 VariantClear(&rd.vPath);
                 VariantClear(&rd.vType);
+                VariantClear(&rd.vSummary);
                 continue;
             }
 
@@ -2062,6 +2103,15 @@ void TriggerWindowsSearch(HWND hWnd)
             sr.fileRef = 0;
             sr.fileName = VariantToWString(rd.vName);
             sr.fullPath = VariantToWString(rd.vPath);
+
+            if (sr.fileName.empty() || sr.fullPath.empty())
+            {
+                VariantClear(&rd.vName);
+                VariantClear(&rd.vPath);
+                VariantClear(&rd.vType);
+                VariantClear(&rd.vSummary);
+                continue;
+            }
 
             // Determine if it's a directory based on ItemType
             if (rd.dwTypeStatus == DBSTATUS_S_OK)
@@ -2078,11 +2128,104 @@ void TriggerWindowsSearch(HWND hWnd)
                                   (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0);
             }
 
+            // Extract content snippet from AutoSummary
+            if (rd.dwSummaryStatus == DBSTATUS_S_OK)
+            {
+                sr.contentSnippet = VariantToWString(rd.vSummary);
+                // Collapse whitespace for display: replace newlines/tabs with spaces
+                for (auto& sc : sr.contentSnippet)
+                {
+                    if (sc == L'\r' || sc == L'\n' || sc == L'\t')
+                        sc = L' ';
+                }
+                // Trim to a reasonable display length
+                if (sr.contentSnippet.length() > 300)
+                    sr.contentSnippet = sr.contentSnippet.substr(0, 297) + L"...";
+            }
+
             VariantClear(&rd.vName);
             VariantClear(&rd.vPath);
             VariantClear(&rd.vType);
+            VariantClear(&rd.vSummary);
 
-            sr.matchScore = score;
+            // Determine whether the keyword matched the filename or only content
+            std::wstring lowerName = sr.fileName;
+            for (auto& ch2 : lowerName)
+                ch2 = towlower(ch2);
+            bool filenameMatch = (lowerName.find(lowerKw) != std::wstring::npos);
+
+            // For content-only matches, ensure the snippet actually contains the keyword.
+            // AutoSummary is a generic file summary that often omits the search term.
+            // Try to read a snippet directly from the file content.
+            if (!filenameMatch)
+            {
+                std::wstring lowerSnip = sr.contentSnippet;
+                for (auto& sc2 : lowerSnip)
+                    sc2 = towlower(sc2);
+                if (sr.contentSnippet.empty() || lowerSnip.find(lowerKw) == std::wstring::npos)
+                {
+                    // Try reading a small portion of the file to find the keyword
+                    HANDLE hFile = CreateFileW(sr.fullPath.c_str(), GENERIC_READ,
+                        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                        NULL, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, NULL);
+                    if (hFile != INVALID_HANDLE_VALUE)
+                    {
+                        // Read up to 64KB to search for the keyword
+                        const DWORD readSize = 64 * 1024;
+                        std::vector<char> buf(readSize + 2, 0);
+                        DWORD bytesRead = 0;
+                        if (ReadFile(hFile, buf.data(), readSize, &bytesRead, NULL) && bytesRead > 0)
+                        {
+                            // Try as UTF-16 first (BOM check)
+                            std::wstring fileText;
+                            if (bytesRead >= 2 && (unsigned char)buf[0] == 0xFF && (unsigned char)buf[1] == 0xFE)
+                            {
+                                fileText = std::wstring((wchar_t*)(buf.data() + 2), (bytesRead - 2) / sizeof(wchar_t));
+                            }
+                            else
+                            {
+                                // Treat as ANSI/UTF-8 and widen
+                                int wlen = MultiByteToWideChar(CP_UTF8, 0, buf.data(), (int)bytesRead, NULL, 0);
+                                if (wlen > 0)
+                                {
+                                    fileText.resize(wlen);
+                                    MultiByteToWideChar(CP_UTF8, 0, buf.data(), (int)bytesRead, &fileText[0], wlen);
+                                }
+                            }
+                            if (!fileText.empty())
+                            {
+                                std::wstring lowerFile = fileText;
+                                for (auto& fc : lowerFile)
+                                    fc = towlower(fc);
+                                size_t kwPos = lowerFile.find(lowerKw);
+                                if (kwPos != std::wstring::npos)
+                                {
+                                    // Extract ~40 chars before and ~200 chars after the match
+                                    size_t snippetStart = (kwPos > 40) ? kwPos - 40 : 0;
+                                    size_t snippetLen = 280;
+                                    if (snippetStart + snippetLen > fileText.length())
+                                        snippetLen = fileText.length() - snippetStart;
+                                    sr.contentSnippet = fileText.substr(snippetStart, snippetLen);
+                                    // Collapse whitespace
+                                    for (auto& sc3 : sr.contentSnippet)
+                                    {
+                                        if (sc3 == L'\r' || sc3 == L'\n' || sc3 == L'\t')
+                                            sc3 = L' ';
+                                    }
+                                    if (snippetStart > 0)
+                                        sr.contentSnippet = L"..." + sr.contentSnippet;
+                                    if (snippetStart + snippetLen < fileText.length())
+                                        sr.contentSnippet += L"...";
+                                }
+                            }
+                        }
+                        CloseHandle(hFile);
+                    }
+                }
+            }
+
+            // Filename matches rank higher than content-only matches
+            sr.matchScore = filenameMatch ? 60 : 20;
             searchResults.push_back(std::move(sr));
 
             if (searchResults.size() >= MAX_RESULTS)
@@ -2100,6 +2243,14 @@ void TriggerWindowsSearch(HWND hWnd)
     pDBInitialize->Release();
     if (comInited) CoUninitialize();
 
+    // Sort: filename matches first, then content matches, alphabetical within
+    std::sort(searchResults.begin(), searchResults.end(),
+        [](const SearchResult& a, const SearchResult& b) {
+            if (a.matchScore != b.matchScore)
+                return a.matchScore > b.matchScore;
+            return _wcsicmp(a.fileName.c_str(), b.fileName.c_str()) < 0;
+        });
+
     PopulateSearchResults();
 
     QueryPerformanceCounter(&searchT2);
@@ -2109,9 +2260,19 @@ void TriggerWindowsSearch(HWND hWnd)
     TabCtrl_SetCurSel(hTabControl, 1);
     ShowTab(1);
 
+    // Count filename vs content matches for the status line
+    int filenameHits = 0, contentHits = 0;
+    for (auto& sr2 : searchResults)
+    {
+        if (sr2.matchScore >= 60) filenameHits++;
+        else contentHits++;
+    }
+
     std::wstring status = L"Windows Search: " + std::to_wstring(searchResults.size()) + L" results";
     if (searchResults.size() >= MAX_RESULTS)
         status += L" (showing first 10,000)";
+    status += L"  |  " + std::to_wstring(filenameHits) + L" filename, "
+              + std::to_wstring(contentHits) + L" content";
     if (!currentSearchScope.empty())
         status += L"  |  Scope: " + currentSearchScope;
     wchar_t timeBuf[64];
@@ -2154,6 +2315,33 @@ void UpdatePropertiesPanel(int selectedIndex)
     info += L"  Name:\r\n  " + sr.fileName + L"\r\n\r\n";
     info += L"  Type:  " + std::wstring(sr.isDirectory ? L"Folder" : L"File") + L"\r\n\r\n";
     info += L"  Path:\r\n  " + sr.fullPath + L"\r\n\r\n";
+
+    if (!sr.contentSnippet.empty())
+    {
+        // Build snippet text with «keyword» markers around each match
+        std::wstring snippet = sr.contentSnippet;
+        std::wstring lowerSnippet = snippet;
+        for (auto& sc : lowerSnippet)
+            sc = towlower(sc);
+        std::wstring marked;
+        size_t kwLen = currentSearchKeyword.length();
+        size_t spos = 0;
+        while (spos < snippet.length())
+        {
+            size_t found = (kwLen > 0) ? lowerSnippet.find(currentSearchKeyword, spos) : std::wstring::npos;
+            if (found == std::wstring::npos)
+            {
+                marked += snippet.substr(spos);
+                break;
+            }
+            marked += snippet.substr(spos, found - spos);
+            marked += L"\u00AB";
+            marked += snippet.substr(found, kwLen);
+            marked += L"\u00BB";
+            spos = found + kwLen;
+        }
+        info += L"  Content Match:\r\n  " + marked + L"\r\n\r\n";
+    }
 
     WIN32_FILE_ATTRIBUTE_DATA fad = {0};
     if (GetFileAttributesExW(sr.fullPath.c_str(), GetFileExInfoStandard, &fad))
@@ -2241,15 +2429,24 @@ void PopulateSearchResults()
         ListView_SetItemText(hListView, (int)i, 3, (LPWSTR)modDate.c_str());
 
         // Match quality column
-        // Base scores: Exact=100, Wildcard=90, Prefix=75, Token=50, Substring=40, Stem=30/25
+        // MFT scores: Exact=100, Wildcard=90, Prefix=75, Token=50, Substring=40, Stem=30/25
         // Bonuses: case match +15, recency +10/+7/+3
+        // Windows Search scores: Filename=60, Content=20
         const wchar_t* quality = L"Stem";
-        if (bWildcardSearch) quality = L"Wildcard";
+        if (bWindowsSearch)
+        {
+            quality = (sr.matchScore >= 60) ? L"Filename" : L"Content";
+        }
+        else if (bWildcardSearch) quality = L"Wildcard";
         else if (sr.matchScore >= 100) quality = L"Exact";
         else if (sr.matchScore >= 75) quality = L"Prefix";
         else if (sr.matchScore >= 50) quality = L"Token Match";
         else if (sr.matchScore >= 40) quality = L"Substring";
         ListView_SetItemText(hListView, (int)i, 4, (LPWSTR)quality);
+
+        // Snippet column — show content preview for Windows Search content matches
+        if (!sr.contentSnippet.empty())
+            ListView_SetItemText(hListView, (int)i, 5, (LPWSTR)sr.contentSnippet.c_str());
     }
 
     SendMessage(hListView, WM_SETREDRAW, TRUE, 0);
@@ -3005,7 +3202,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
             if (hListView)
             {
                 ListView_SetExtendedListViewStyle(hListView,
-                    LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES | LVS_EX_DOUBLEBUFFER);
+                    LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES | LVS_EX_DOUBLEBUFFER | LVS_EX_INFOTIP);
 
                 LVCOLUMNW lvc = {0};
                 lvc.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_SUBITEM;
@@ -3034,6 +3231,11 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
                 lvc.pszText = (LPWSTR)L"Match";
                 lvc.cx = 90;
                 ListView_InsertColumn(hListView, 4, &lvc);
+
+                lvc.iSubItem = 5;
+                lvc.pszText = (LPWSTR)L"Snippet";
+                lvc.cx = 300;
+                ListView_InsertColumn(hListView, 5, &lvc);
 
                 // Attach the system small icon image list to the ListView
                 SHFILEINFOW sfi = {0};
@@ -3287,6 +3489,25 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
                     }
                 }
             }
+            else if (pnmh->idFrom == IDC_LISTVIEW && pnmh->code == LVN_GETINFOTIP)
+            {
+                NMLVGETINFOTIPW* pTip = (NMLVGETINFOTIPW*)lParam;
+                int idx = pTip->iItem;
+                int sub = pTip->iSubItem;
+                if (idx >= 0 && idx < (int)searchResults.size())
+                {
+                    const SearchResult& sr = searchResults[idx];
+                    const wchar_t* tipText = NULL;
+                    if (sub == 5 && !sr.contentSnippet.empty())
+                        tipText = sr.contentSnippet.c_str();
+                    else if (sub == 2 && !sr.fullPath.empty())
+                        tipText = sr.fullPath.c_str();
+                    else if (sub == 0 && !sr.fileName.empty())
+                        tipText = sr.fileName.c_str();
+                    if (tipText)
+                        wcsncpy_s(pTip->pszText, pTip->cchTextMax, tipText, _TRUNCATE);
+                }
+            }
             else if (pnmh->idFrom == IDC_LISTVIEW && pnmh->code == NM_CUSTOMDRAW
                      && pnmh->hwndFrom == hListView)
             {
@@ -3302,12 +3523,15 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
                         int iItem = (int)pcd->nmcd.dwItemSpec;
                         int iSubItem = pcd->iSubItem;
 
-                        // Only custom-draw the Name column (subitem 0)
-                        if (iSubItem != 0 || currentSearchKeyword.empty() ||
+                        if (currentSearchKeyword.empty() ||
                             iItem < 0 || iItem >= (int)searchResults.size())
                         {
                             return CDRF_DODEFAULT;
                         }
+
+                        // Custom-draw the Name column (subitem 0) and Snippet column (subitem 5)
+                        if (iSubItem != 0 && iSubItem != 5)
+                            return CDRF_DODEFAULT;
 
                         const SearchResult& sr = searchResults[iItem];
 
@@ -3315,25 +3539,39 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
                         if (bWildcardSearch)
                             return CDRF_DODEFAULT;
 
-                        std::wstring lowerName = sr.fileName;
-                        for (auto& ch : lowerName)
+                        // Choose the text to highlight in
+                        std::wstring cellText;
+                        if (iSubItem == 0)
+                            cellText = sr.fileName;
+                        else
+                            cellText = sr.contentSnippet;
+
+                        if (cellText.empty())
+                            return CDRF_DODEFAULT;
+
+                        std::wstring lowerText = cellText;
+                        for (auto& ch : lowerText)
                             ch = towlower(ch);
 
-                        size_t matchPos = lowerName.find(currentSearchKeyword);
+                        size_t matchPos = lowerText.find(currentSearchKeyword);
                         if (matchPos == std::wstring::npos)
-                        {
                             return CDRF_DODEFAULT;
-                        }
 
                         // We'll draw the entire cell ourselves
                         HDC hdc = pcd->nmcd.hdc;
                         RECT rcItem;
-                        ListView_GetSubItemRect(hListView, iItem, 0, LVIR_BOUNDS, &rcItem);
-
-                        // Adjust for column 0 which includes the whole row in report mode
-                        RECT rcCol0;
-                        Header_GetItemRect(ListView_GetHeader(hListView), 0, &rcCol0);
-                        rcItem.right = rcItem.left + (rcCol0.right - rcCol0.left);
+                        if (iSubItem == 0)
+                        {
+                            ListView_GetSubItemRect(hListView, iItem, 0, LVIR_BOUNDS, &rcItem);
+                            // Adjust for column 0 which includes the whole row in report mode
+                            RECT rcCol0;
+                            Header_GetItemRect(ListView_GetHeader(hListView), 0, &rcCol0);
+                            rcItem.right = rcItem.left + (rcCol0.right - rcCol0.left);
+                        }
+                        else
+                        {
+                            ListView_GetSubItemRect(hListView, iItem, iSubItem, LVIR_BOUNDS, &rcItem);
+                        }
 
                         // Fill background (selected or normal)
                         const ColorScheme& cs = CurrentScheme();
@@ -3347,49 +3585,52 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
                         // Small left padding
                         rcItem.left += 4;
 
-                        const std::wstring& name = sr.fileName;
                         size_t matchLen = currentSearchKeyword.length();
-
-                        // Split into: before | match | after
-                        std::wstring before = name.substr(0, matchPos);
-                        std::wstring match = name.substr(matchPos, matchLen);
-                        std::wstring after = name.substr(matchPos + matchLen);
 
                         SetBkMode(hdc, TRANSPARENT);
                         int x = rcItem.left;
+                        int rightEdge = rcItem.right;
 
-                        // Draw text before match
-                        if (!before.empty())
+                        // Walk through the text, highlighting all occurrences
+                        size_t pos = 0;
+                        while (pos < cellText.length() && x < rightEdge)
                         {
-                            SetTextColor(hdc, textColor);
-                            SIZE sz;
-                            GetTextExtentPoint32W(hdc, before.c_str(), (int)before.length(), &sz);
-                            RECT rc = {x, rcItem.top, x + sz.cx, rcItem.bottom};
-                            DrawTextW(hdc, before.c_str(), (int)before.length(), &rc, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
-                            x += sz.cx;
-                        }
+                            size_t found = lowerText.find(currentSearchKeyword, pos);
+                            if (found == std::wstring::npos)
+                                found = cellText.length(); // no more matches
 
-                        // Draw matched portion with highlight background
-                        if (!match.empty())
-                        {
-                            SIZE sz;
-                            GetTextExtentPoint32W(hdc, match.c_str(), (int)match.length(), &sz);
-                            RECT rcHighlight = {x, rcItem.top + 1, x + sz.cx, rcItem.bottom - 1};
-                            HBRUSH hHighlight = CreateSolidBrush(cs.matchHighlight);
-                            FillRect(hdc, &rcHighlight, hHighlight);
-                            DeleteObject(hHighlight);
-                            SetTextColor(hdc, RGB(0, 0, 0));
-                            RECT rc = {x, rcItem.top, x + sz.cx, rcItem.bottom};
-                            DrawTextW(hdc, match.c_str(), (int)match.length(), &rc, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
-                            x += sz.cx;
-                        }
+                            // Draw text before this match (or remaining text)
+                            if (found > pos)
+                            {
+                                std::wstring seg = cellText.substr(pos, found - pos);
+                                SetTextColor(hdc, textColor);
+                                SIZE sz;
+                                GetTextExtentPoint32W(hdc, seg.c_str(), (int)seg.length(), &sz);
+                                RECT rc = {x, rcItem.top, min((long)(x + sz.cx), (long)rightEdge), rcItem.bottom};
+                                DrawTextW(hdc, seg.c_str(), (int)seg.length(), &rc, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+                                x += sz.cx;
+                            }
 
-                        // Draw text after match
-                        if (!after.empty())
-                        {
-                            SetTextColor(hdc, textColor);
-                            RECT rc = {x, rcItem.top, rcItem.right, rcItem.bottom};
-                            DrawTextW(hdc, after.c_str(), (int)after.length(), &rc, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+                            // Draw highlighted match
+                            if (found < cellText.length() && x < rightEdge)
+                            {
+                                std::wstring seg = cellText.substr(found, matchLen);
+                                SIZE sz;
+                                GetTextExtentPoint32W(hdc, seg.c_str(), (int)seg.length(), &sz);
+                                RECT rcHighlight = {x, rcItem.top + 1, min((long)(x + sz.cx), (long)rightEdge), rcItem.bottom - 1};
+                                HBRUSH hHighlight = CreateSolidBrush(cs.matchHighlight);
+                                FillRect(hdc, &rcHighlight, hHighlight);
+                                DeleteObject(hHighlight);
+                                SetTextColor(hdc, RGB(0, 0, 0));
+                                RECT rc = {x, rcItem.top, min((long)(x + sz.cx), (long)rightEdge), rcItem.bottom};
+                                DrawTextW(hdc, seg.c_str(), (int)seg.length(), &rc, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+                                x += sz.cx;
+                                pos = found + matchLen;
+                            }
+                            else
+                            {
+                                break;
+                            }
                         }
 
                         return CDRF_SKIPDEFAULT;
