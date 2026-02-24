@@ -18,12 +18,17 @@
 #include <thread>
 #include <atomic>
 #include <mutex>
+#include <fstream>
+#include <shlobj.h>
+#include <winhttp.h>
+#include <functional>
 
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "shlwapi.lib")
 #pragma comment(lib, "uxtheme.lib")
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "oleaut32.lib")
+#pragma comment(lib, "winhttp.lib")
 
 #include <ole2.h>
 #include <oledb.h>
@@ -49,12 +54,14 @@
 #define IDT_USN_POLL        6001
 #define USN_POLL_MS         2000
 #define WM_USN_UPDATED      (WM_USER + 1)
+#define WM_OAUTH_COMPLETE   (WM_USER + 2)
 #define IDC_PROPERTIES      7000
 #define IDC_PROP_TOGGLE     7001
 #define PROPERTIES_PANEL_W  420
 #define SPLITTER_WIDTH      5
 #define MIN_LIST_WIDTH      200
 #define MIN_PROP_WIDTH      150
+#define IDC_CLOUD_BTN       8000
 
 // Global Variables:
 HINSTANCE hInst;
@@ -111,6 +118,32 @@ bool bPropertiesCollapsed = false;
 HFONT hToggleFont = NULL;       // larger font for the toggle button glyph
 HFONT hHeaderFont = NULL;       // bold font for ListView column headers
 bool bToggleHovered = false;    // mouse is hovering over the toggle button
+
+// Cloud storage providers — OAuth2-based API access (no local sync required)
+HWND hCloudBtn = NULL;
+enum CloudProviderId { CP_ONEDRIVE = 0, CP_GOOGLEDRIVE = 1, CP_ICLOUD = 2, CP_COUNT = 3 };
+struct CloudProvider {
+    CloudProviderId id;
+    std::wstring name;
+    std::wstring clientId;
+    std::wstring clientSecret;
+    std::wstring accessToken;
+    std::wstring refreshToken;
+    bool loggedIn;
+};
+CloudProvider cloudProviders[CP_COUNT] = {
+    { CP_ONEDRIVE,    L"OneDrive",      L"", L"", L"", L"", false },
+    { CP_GOOGLEDRIVE, L"Google Drive",   L"", L"", L"", L"", false },
+    { CP_ICLOUD,      L"iCloud Drive",   L"", L"", L"", L"", false },
+};
+
+// OAuth background login state
+static SOCKET oauthListenSock = INVALID_SOCKET;  // listen socket; closeable to cancel
+static std::thread oauthThread;                   // background thread running OAuth flow
+static std::atomic<bool> bOAuthInProgress{false};  // true while an OAuth login is running
+static CloudProviderId oauthActiveProvider;         // which provider is being logged in
+static HWND hOAuthDlg = NULL;                      // dialog to notify on completion
+static bool oauthSuccess = false;                  // result of the background OAuth flow
 
 // Splitter between list view and properties panel
 int propertiesPanelW = PROPERTIES_PANEL_W;  // current width (resizable)
@@ -234,6 +267,7 @@ struct SearchResult {
     std::wstring fileName;
     std::wstring fullPath;
     std::wstring contentSnippet;  // content match preview from Windows Search
+    std::wstring cloudSource;     // provider name for cloud results (e.g. L"OneDrive")
     bool isDirectory;
     int matchScore;  // higher = better match
 };
@@ -277,6 +311,21 @@ void                ProcessPendingUsnChanges();
 void                UpdatePropertiesPanel(int selectedIndex);
 void                RebuildSortedTokens();
 void                TriggerWindowsSearch(HWND hWnd);
+void                LoadCloudConfig();
+void                SaveCloudConfig();
+void                UpdateCloudButtonLabel();
+INT_PTR CALLBACK    CloudConfigDlgProc(HWND, UINT, WPARAM, LPARAM);
+bool                CloudOAuth2Login(HWND hParent, CloudProviderId id);
+void                CloudLogout(CloudProviderId id);
+std::vector<SearchResult> CloudSearchFiles(CloudProviderId id, const std::wstring& keyword);
+static std::string  WinHttpGet(const std::wstring& host, const std::wstring& path, const std::wstring& authHeader);
+static std::string  WinHttpPost(const std::wstring& host, const std::wstring& path, const std::string& body, const std::wstring& contentType);
+static std::wstring Utf8ToWide(const std::string& s);
+static std::string  WideToUtf8(const std::wstring& s);
+static std::wstring UrlEncode(const std::wstring& s);
+static std::string  JsonGetString(const std::string& json, const std::string& key);
+static std::vector<SearchResult> JsonParseOneDriveResults(const std::string& json);
+static std::vector<SearchResult> JsonParseGoogleDriveResults(const std::string& json);
 
 // Update the tooltip text for the properties toggle button to reflect its current action.
 static void UpdateToggleTooltip()
@@ -1749,6 +1798,974 @@ void TriggerSearch(HWND hWnd)
     SetWindowTextW(hStatusText, status.c_str());
 }
 
+// --- Cloud storage provider configuration (OAuth2 + REST API) ---
+
+// Cloud providers require OAuth2 client credentials to authenticate.
+// Users enter their Client ID (and Client Secret for Google/iCloud) directly
+// in the Cloud Configuration dialog. Credentials are persisted locally in
+// %APPDATA%\FindMyFile\cloud_tokens.ini.
+//
+// To obtain credentials, register an application at:
+//   OneDrive  — Azure App Registration  (https://portal.azure.com)
+//   Google    — Google Cloud Console     (https://console.cloud.google.com)
+//   iCloud    — Apple Developer account  (https://developer.apple.com)
+// Each registration must add http://localhost:5483/callback as a redirect URI.
+
+static const int  OAUTH_PORT = 5483;
+static const wchar_t* OAUTH_REDIRECT = L"http://localhost:5483/callback";
+
+// Return the path to the cloud tokens file.
+static std::wstring GetCloudConfigPath()
+{
+    wchar_t appData[MAX_PATH] = {0};
+    if (SUCCEEDED(SHGetFolderPathW(NULL, CSIDL_APPDATA, NULL, 0, appData)))
+    {
+        std::wstring dir = std::wstring(appData) + L"\\FindMyFile";
+        CreateDirectoryW(dir.c_str(), NULL);
+        return dir + L"\\cloud_tokens.ini";
+    }
+    return L"";
+}
+
+static std::wstring Utf8ToWide(const std::string& s)
+{
+    if (s.empty()) return L"";
+    int len = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), NULL, 0);
+    if (len <= 0) return L"";
+    std::wstring w(len, 0);
+    MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), &w[0], len);
+    return w;
+}
+
+static std::string WideToUtf8(const std::wstring& s)
+{
+    if (s.empty()) return "";
+    int len = WideCharToMultiByte(CP_UTF8, 0, s.c_str(), (int)s.size(), NULL, 0, NULL, NULL);
+    if (len <= 0) return "";
+    std::string u(len, 0);
+    WideCharToMultiByte(CP_UTF8, 0, s.c_str(), (int)s.size(), &u[0], len, NULL, NULL);
+    return u;
+}
+
+static std::wstring UrlEncode(const std::wstring& s)
+{
+    std::string utf8 = WideToUtf8(s);
+    std::wstring out;
+    for (unsigned char c : utf8)
+    {
+        if (isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~')
+            out += (wchar_t)c;
+        else
+        {
+            wchar_t buf[8];
+            swprintf_s(buf, 8, L"%%%02X", c);
+            out += buf;
+        }
+    }
+    return out;
+}
+
+// Minimal JSON string extractor: find "key":"value" or "key": "value"
+static std::string JsonGetString(const std::string& json, const std::string& key)
+{
+    std::string needle = "\"" + key + "\"";
+    size_t pos = json.find(needle);
+    if (pos == std::string::npos) return "";
+    pos += needle.size();
+    // Skip whitespace and colon
+    while (pos < json.size() && (json[pos] == ' ' || json[pos] == ':' || json[pos] == '\t' || json[pos] == '\n' || json[pos] == '\r'))
+        pos++;
+    if (pos >= json.size() || json[pos] != '"') return "";
+    pos++; // skip opening quote
+    std::string val;
+    while (pos < json.size() && json[pos] != '"')
+    {
+        if (json[pos] == '\\' && pos + 1 < json.size())
+        {
+            pos++;
+            if (json[pos] == '"') val += '"';
+            else if (json[pos] == '\\') val += '\\';
+            else if (json[pos] == '/') val += '/';
+            else if (json[pos] == 'n') val += '\n';
+            else if (json[pos] == 't') val += '\t';
+            else val += json[pos];
+        }
+        else
+        {
+            val += json[pos];
+        }
+        pos++;
+    }
+    return val;
+}
+
+// WinHTTP GET request returning body as UTF-8 string.
+static std::string WinHttpGet(const std::wstring& host, const std::wstring& path, const std::wstring& authHeader)
+{
+    std::string result;
+    HINTERNET hSession = WinHttpOpen(L"FindMyFile/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+        WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!hSession) return result;
+
+    HINTERNET hConnect = WinHttpConnect(hSession, host.c_str(), INTERNET_DEFAULT_HTTPS_PORT, 0);
+    if (!hConnect) { WinHttpCloseHandle(hSession); return result; }
+
+    HINTERNET hRequest = WinHttpOpenRequest(hConnect, L"GET", path.c_str(),
+        NULL, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
+    if (!hRequest) { WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession); return result; }
+
+    if (!authHeader.empty())
+        WinHttpAddRequestHeaders(hRequest, authHeader.c_str(), (DWORD)-1, WINHTTP_ADDREQ_FLAG_ADD);
+
+    if (WinHttpSendRequest(hRequest, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0) &&
+        WinHttpReceiveResponse(hRequest, NULL))
+    {
+        DWORD dwSize = 0;
+        do {
+            dwSize = 0;
+            WinHttpQueryDataAvailable(hRequest, &dwSize);
+            if (dwSize > 0)
+            {
+                std::vector<char> buf(dwSize);
+                DWORD dwRead = 0;
+                WinHttpReadData(hRequest, buf.data(), dwSize, &dwRead);
+                result.append(buf.data(), dwRead);
+            }
+        } while (dwSize > 0);
+    }
+
+    WinHttpCloseHandle(hRequest);
+    WinHttpCloseHandle(hConnect);
+    WinHttpCloseHandle(hSession);
+    return result;
+}
+
+// WinHTTP POST request returning body as UTF-8 string.
+static std::string WinHttpPost(const std::wstring& host, const std::wstring& path,
+                               const std::string& body, const std::wstring& contentType)
+{
+    std::string result;
+    HINTERNET hSession = WinHttpOpen(L"FindMyFile/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+        WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!hSession) return result;
+
+    HINTERNET hConnect = WinHttpConnect(hSession, host.c_str(), INTERNET_DEFAULT_HTTPS_PORT, 0);
+    if (!hConnect) { WinHttpCloseHandle(hSession); return result; }
+
+    HINTERNET hRequest = WinHttpOpenRequest(hConnect, L"POST", path.c_str(),
+        NULL, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
+    if (!hRequest) { WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession); return result; }
+
+    std::wstring headers = L"Content-Type: " + contentType;
+
+    if (WinHttpSendRequest(hRequest, headers.c_str(), (DWORD)-1,
+            (LPVOID)body.c_str(), (DWORD)body.size(), (DWORD)body.size(), 0) &&
+        WinHttpReceiveResponse(hRequest, NULL))
+    {
+        DWORD dwSize = 0;
+        do {
+            dwSize = 0;
+            WinHttpQueryDataAvailable(hRequest, &dwSize);
+            if (dwSize > 0)
+            {
+                std::vector<char> buf(dwSize);
+                DWORD dwRead = 0;
+                WinHttpReadData(hRequest, buf.data(), dwSize, &dwRead);
+                result.append(buf.data(), dwRead);
+            }
+        } while (dwSize > 0);
+    }
+
+    WinHttpCloseHandle(hRequest);
+    WinHttpCloseHandle(hConnect);
+    WinHttpCloseHandle(hSession);
+    return result;
+}
+
+// OAuth2 loopback redirect: start a temporary HTTP server on localhost,
+// wait for the browser callback carrying the authorization code.
+// The listen socket handle is stored in oauthListenSock so the UI thread
+// can close it to cancel a pending accept() without waiting for the timeout.
+static std::string ListenForOAuthCallback()
+{
+    // Create a simple TCP listener on OAUTH_PORT
+    WSADATA wsaData;
+    WSAStartup(MAKEWORD(2, 2), &wsaData);
+
+    SOCKET listenSock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (listenSock == INVALID_SOCKET) { WSACleanup(); return ""; }
+
+    // Publish the socket so the UI thread can close it for cancellation
+    oauthListenSock = listenSock;
+
+    sockaddr_in addr = {};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = htons(OAUTH_PORT);
+
+    // Allow port reuse so rapid re-logins work
+    int yes = 1;
+    setsockopt(listenSock, SOL_SOCKET, SO_REUSEADDR, (char*)&yes, sizeof(yes));
+
+    if (bind(listenSock, (sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR)
+    {
+        oauthListenSock = INVALID_SOCKET;
+        closesocket(listenSock);
+        WSACleanup();
+        return "";
+    }
+    listen(listenSock, 1);
+
+    // Set a 120-second timeout so we don't block forever
+    DWORD timeout = 120000;
+    setsockopt(listenSock, SOL_SOCKET, SO_RCVTIMEO, (char*)&timeout, sizeof(timeout));
+
+    SOCKET clientSock = accept(listenSock, NULL, NULL);
+    std::string code;
+    if (clientSock != INVALID_SOCKET)
+    {
+        char buf[4096] = {0};
+        int n = recv(clientSock, buf, sizeof(buf) - 1, 0);
+        if (n > 0)
+        {
+            std::string req(buf, n);
+            // Extract ?code=... from GET /callback?code=XXX&...
+            size_t codePos = req.find("code=");
+            if (codePos != std::string::npos)
+            {
+                codePos += 5;
+                size_t end = req.find_first_of("& \r\n", codePos);
+                if (end == std::string::npos) end = req.size();
+                code = req.substr(codePos, end - codePos);
+            }
+
+            // Send a user-friendly response page
+            const char* response =
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n"
+                "<html><body style='font-family:Segoe UI;text-align:center;padding:40px'>"
+                "<h2>Signed in successfully!</h2>"
+                "<p>You can close this tab and return to Find My File!</p>"
+                "</body></html>";
+            send(clientSock, response, (int)strlen(response), 0);
+        }
+        closesocket(clientSock);
+    }
+
+    // Only close if not already closed by cancellation
+    if (oauthListenSock != INVALID_SOCKET)
+    {
+        closesocket(listenSock);
+        oauthListenSock = INVALID_SOCKET;
+    }
+    WSACleanup();
+    return code;
+}
+
+// Cancel a pending OAuth listen by closing the socket from the UI thread.
+static void CancelOAuthListen()
+{
+    SOCKET s = oauthListenSock;
+    if (s != INVALID_SOCKET)
+    {
+        oauthListenSock = INVALID_SOCKET;
+        closesocket(s);  // unblocks accept() on the background thread
+    }
+}
+
+// Perform OAuth2 login for a given provider. Opens the browser, waits for callback.
+// This function blocks until the OAuth flow completes — call from a background thread.
+bool CloudOAuth2Login(HWND hParent, CloudProviderId id)
+{
+    CloudProvider& cp = cloudProviders[id];
+
+    if (cp.clientId.empty())
+        return false;
+
+    std::wstring authUrl;
+    std::wstring redirectUri = OAUTH_REDIRECT;
+
+    if (id == CP_ONEDRIVE)
+    {
+        authUrl = L"https://login.microsoftonline.com/consumers/oauth2/v2.0/authorize"
+                  L"?client_id=" + cp.clientId +
+                  L"&response_type=code"
+                  L"&redirect_uri=" + UrlEncode(redirectUri) +
+                  L"&scope=" + UrlEncode(L"Files.Read Files.Read.All offline_access") +
+                  L"&response_mode=query";
+    }
+    else if (id == CP_GOOGLEDRIVE)
+    {
+        if (cp.clientSecret.empty())
+            return false;
+        authUrl = L"https://accounts.google.com/o/oauth2/v2/auth"
+                  L"?client_id=" + cp.clientId +
+                  L"&response_type=code"
+                  L"&redirect_uri=" + UrlEncode(redirectUri) +
+                  L"&scope=" + UrlEncode(L"https://www.googleapis.com/auth/drive.readonly") +
+                  L"&access_type=offline&prompt=consent";
+    }
+    else if (id == CP_ICLOUD)
+    {
+        authUrl = L"https://appleid.apple.com/auth/authorize"
+                  L"?client_id=" + UrlEncode(cp.clientId) +
+                  L"&response_type=code"
+                  L"&redirect_uri=" + UrlEncode(redirectUri) +
+                  L"&scope=" + UrlEncode(L"name email") +
+                  L"&response_mode=query";
+    }
+    else
+    {
+        return false;
+    }
+
+    // Open browser
+    ShellExecuteW(hParent, L"open", authUrl.c_str(), NULL, NULL, SW_SHOWNORMAL);
+
+    // Wait for the callback (blocks until redirect, timeout, or cancellation)
+    std::string code = ListenForOAuthCallback();
+    if (code.empty())
+        return false;
+
+    // Exchange the authorization code for access + refresh tokens
+    std::string tokenBody;
+    std::wstring tokenHost;
+    std::wstring tokenPath;
+
+    if (id == CP_ONEDRIVE)
+    {
+        tokenHost = L"login.microsoftonline.com";
+        tokenPath = L"/consumers/oauth2/v2.0/token";
+        tokenBody = "client_id=" + WideToUtf8(cp.clientId) +
+                    "&grant_type=authorization_code"
+                    "&code=" + code +
+                    "&redirect_uri=" + WideToUtf8(redirectUri) +
+                    "&scope=" + WideToUtf8(L"Files.Read Files.Read.All offline_access");
+    }
+    else if (id == CP_GOOGLEDRIVE)
+    {
+        tokenHost = L"oauth2.googleapis.com";
+        tokenPath = L"/token";
+        tokenBody = "client_id=" + WideToUtf8(cp.clientId) +
+                    "&client_secret=" + WideToUtf8(cp.clientSecret) +
+                    "&grant_type=authorization_code"
+                    "&code=" + code +
+                    "&redirect_uri=" + WideToUtf8(redirectUri);
+    }
+    else if (id == CP_ICLOUD)
+    {
+        tokenHost = L"appleid.apple.com";
+        tokenPath = L"/auth/token";
+        tokenBody = "client_id=" + WideToUtf8(cp.clientId) +
+                    "&grant_type=authorization_code"
+                    "&code=" + code +
+                    "&redirect_uri=" + WideToUtf8(redirectUri);
+    }
+
+    std::string tokenResp = WinHttpPost(tokenHost, tokenPath, tokenBody,
+                                        L"application/x-www-form-urlencoded");
+    if (tokenResp.empty())
+        return false;
+
+    std::string at = JsonGetString(tokenResp, "access_token");
+    std::string rt = JsonGetString(tokenResp, "refresh_token");
+    if (at.empty())
+        return false;
+
+    cp.accessToken = Utf8ToWide(at);
+    cp.refreshToken = Utf8ToWide(rt);
+    cp.loggedIn = true;
+
+    SaveCloudConfig();
+    return true;
+}
+
+// Background thread function for OAuth login. Runs CloudOAuth2Login and
+// posts WM_OAUTH_COMPLETE to the dialog when done.
+static void OAuthLoginThreadFunc(HWND hParent, CloudProviderId id)
+{
+    bool ok = CloudOAuth2Login(hParent, id);
+    oauthSuccess = ok;
+    bOAuthInProgress.store(false);
+    // Notify the dialog (if still alive) that the flow is complete
+    if (hOAuthDlg && IsWindow(hOAuthDlg))
+        PostMessage(hOAuthDlg, WM_OAUTH_COMPLETE, (WPARAM)ok, 0);
+}
+
+// Start an OAuth login on a background thread so the UI remains responsive.
+static void StartOAuthLoginAsync(HWND hDlg, CloudProviderId id)
+{
+    // Join any previous thread
+    if (oauthThread.joinable())
+        oauthThread.join();
+
+    hOAuthDlg = hDlg;
+    oauthActiveProvider = id;
+    bOAuthInProgress.store(true);
+    oauthSuccess = false;
+    oauthThread = std::thread(OAuthLoginThreadFunc, hDlg, id);
+}
+
+// Cancel any in-progress OAuth login and clean up.
+static void CancelOAuthLogin()
+{
+    if (!bOAuthInProgress.load())
+        return;
+    CancelOAuthListen();  // unblocks the accept() call
+    if (oauthThread.joinable())
+        oauthThread.join();
+    bOAuthInProgress.store(false);
+}
+
+// Try to refresh an expired access token using the stored refresh token.
+static bool CloudRefreshToken(CloudProviderId id)
+{
+    CloudProvider& cp = cloudProviders[id];
+    if (cp.refreshToken.empty()) return false;
+
+    std::string body;
+    std::wstring host, path;
+
+    if (id == CP_ONEDRIVE)
+    {
+        host = L"login.microsoftonline.com";
+        path = L"/consumers/oauth2/v2.0/token";
+        body = "client_id=" + WideToUtf8(cp.clientId) +
+               "&grant_type=refresh_token"
+               "&refresh_token=" + WideToUtf8(cp.refreshToken) +
+               "&scope=" + WideToUtf8(L"Files.Read Files.Read.All offline_access");
+    }
+    else if (id == CP_GOOGLEDRIVE)
+    {
+        host = L"oauth2.googleapis.com";
+        path = L"/token";
+        body = "client_id=" + WideToUtf8(cp.clientId) +
+               "&client_secret=" + WideToUtf8(cp.clientSecret) +
+               "&grant_type=refresh_token"
+               "&refresh_token=" + WideToUtf8(cp.refreshToken);
+    }
+    else
+    {
+        return false;
+    }
+
+    std::string resp = WinHttpPost(host, path, body, L"application/x-www-form-urlencoded");
+    if (resp.empty()) return false;
+
+    std::string at = JsonGetString(resp, "access_token");
+    if (at.empty()) return false;
+
+    cp.accessToken = Utf8ToWide(at);
+    // Some providers rotate refresh tokens
+    std::string newRt = JsonGetString(resp, "refresh_token");
+    if (!newRt.empty())
+        cp.refreshToken = Utf8ToWide(newRt);
+
+    SaveCloudConfig();
+    return true;
+}
+
+void CloudLogout(CloudProviderId id)
+{
+    CloudProvider& cp = cloudProviders[id];
+    cp.accessToken.clear();
+    cp.refreshToken.clear();
+    cp.loggedIn = false;
+    SaveCloudConfig();
+    UpdateCloudButtonLabel();
+}
+
+// Parse OneDrive search results from Microsoft Graph JSON response.
+static std::vector<SearchResult> JsonParseOneDriveResults(const std::string& json)
+{
+    std::vector<SearchResult> results;
+    // Look for each "hitsContainers"[0]."hits"[] entry, or simpler:
+    // The /search/query endpoint returns nested JSON. We use the simpler
+    // /me/drive/root/search(q='...') endpoint which returns {"value":[...]}.
+    // Each item has "name", "webUrl", "parentReference":{"path":"..."}, "folder" or "file".
+    size_t pos = 0;
+    while (pos < json.size())
+    {
+        size_t itemStart = json.find("\"name\"", pos);
+        if (itemStart == std::string::npos) break;
+
+        // Find the enclosing object boundaries (search backward for '{')
+        size_t objStart = json.rfind('{', itemStart);
+        if (objStart == std::string::npos) { pos = itemStart + 6; continue; }
+
+        // Find matching '}' — simple brace counting
+        int depth = 0;
+        size_t objEnd = objStart;
+        for (size_t i = objStart; i < json.size(); i++)
+        {
+            if (json[i] == '{') depth++;
+            else if (json[i] == '}') { depth--; if (depth == 0) { objEnd = i + 1; break; } }
+        }
+        std::string obj = json.substr(objStart, objEnd - objStart);
+
+        std::string name = JsonGetString(obj, "name");
+        std::string webUrl = JsonGetString(obj, "webUrl");
+        bool isFolder = (obj.find("\"folder\"") != std::string::npos &&
+                         obj.find("\"folder\":null") == std::string::npos);
+
+        if (!name.empty())
+        {
+            // Build a cloud path from parentReference.path + name
+            std::string parentPath = JsonGetString(obj, "path");
+            std::wstring displayPath;
+            if (!parentPath.empty())
+            {
+                // parentReference.path is like "/drive/root:/Documents"
+                size_t colonPos = parentPath.find(':');
+                if (colonPos != std::string::npos)
+                    displayPath = L"OneDrive:" + Utf8ToWide(parentPath.substr(colonPos + 1)) + L"/" + Utf8ToWide(name);
+                else
+                    displayPath = L"OneDrive:/" + Utf8ToWide(name);
+            }
+            else
+            {
+                displayPath = L"OneDrive:/" + Utf8ToWide(name);
+            }
+            // Use webUrl as the "full path" so double-click opens in browser
+            if (!webUrl.empty())
+                displayPath = Utf8ToWide(webUrl);
+
+            SearchResult sr;
+            sr.fileRef = 0;
+            sr.fileName = Utf8ToWide(name);
+            sr.fullPath = displayPath;
+            sr.cloudSource = L"OneDrive";
+            sr.isDirectory = isFolder;
+            sr.matchScore = 51; // cloud filename match tier
+            results.push_back(std::move(sr));
+        }
+
+        pos = objEnd;
+    }
+    return results;
+}
+
+// Parse Google Drive search results from the files.list JSON response.
+static std::vector<SearchResult> JsonParseGoogleDriveResults(const std::string& json)
+{
+    std::vector<SearchResult> results;
+    size_t pos = 0;
+    while (pos < json.size())
+    {
+        size_t namePos = json.find("\"name\"", pos);
+        if (namePos == std::string::npos) break;
+
+        size_t objStart = json.rfind('{', namePos);
+        if (objStart == std::string::npos) { pos = namePos + 6; continue; }
+
+        int depth = 0;
+        size_t objEnd = objStart;
+        for (size_t i = objStart; i < json.size(); i++)
+        {
+            if (json[i] == '{') depth++;
+            else if (json[i] == '}') { depth--; if (depth == 0) { objEnd = i + 1; break; } }
+        }
+        std::string obj = json.substr(objStart, objEnd - objStart);
+
+        std::string name = JsonGetString(obj, "name");
+        std::string mimeType = JsonGetString(obj, "mimeType");
+        std::string webLink = JsonGetString(obj, "webViewLink");
+        bool isFolder = (mimeType == "application/vnd.google-apps.folder");
+
+        if (!name.empty())
+        {
+            SearchResult sr;
+            sr.fileRef = 0;
+            sr.fileName = Utf8ToWide(name);
+            sr.fullPath = webLink.empty() ? (L"GoogleDrive:/" + sr.fileName) : Utf8ToWide(webLink);
+            sr.cloudSource = L"Google Drive";
+            sr.isDirectory = isFolder;
+            sr.matchScore = 51;
+            results.push_back(std::move(sr));
+        }
+
+        pos = objEnd;
+    }
+    return results;
+}
+
+// Search a single cloud provider via its REST API.
+std::vector<SearchResult> CloudSearchFiles(CloudProviderId id, const std::wstring& keyword)
+{
+    std::vector<SearchResult> results;
+    CloudProvider& cp = cloudProviders[id];
+    if (!cp.loggedIn || cp.accessToken.empty())
+        return results;
+
+    std::wstring authHeader = L"Authorization: Bearer " + cp.accessToken;
+
+    if (id == CP_ONEDRIVE)
+    {
+        // Microsoft Graph: GET /me/drive/root/search(q='{keyword}')
+        std::wstring path = L"/v1.0/me/drive/root/search(q='" + UrlEncode(keyword) + L"')?$top=200";
+        std::string resp = WinHttpGet(L"graph.microsoft.com", path, authHeader);
+
+        // Check for 401 and try refresh
+        if (resp.find("\"code\"") != std::string::npos &&
+            (resp.find("InvalidAuthenticationToken") != std::string::npos ||
+             resp.find("ExpiredToken") != std::string::npos ||
+             resp.find("401") != std::string::npos))
+        {
+            if (CloudRefreshToken(id))
+            {
+                authHeader = L"Authorization: Bearer " + cp.accessToken;
+                resp = WinHttpGet(L"graph.microsoft.com", path, authHeader);
+            }
+            else
+            {
+                cp.loggedIn = false;
+                return results;
+            }
+        }
+
+        results = JsonParseOneDriveResults(resp);
+    }
+    else if (id == CP_GOOGLEDRIVE)
+    {
+        // Google Drive API: GET /drive/v3/files?q=name contains '{keyword}'
+        std::wstring query = L"name contains '" + keyword + L"'";
+        std::wstring path = L"/drive/v3/files?q=" + UrlEncode(query) +
+                            L"&fields=files(name,mimeType,webViewLink)&pageSize=200";
+        std::string resp = WinHttpGet(L"www.googleapis.com", path, authHeader);
+
+        // Check for 401 and try refresh
+        if (resp.find("\"code\": 401") != std::string::npos ||
+            resp.find("\"status\": \"UNAUTHENTICATED\"") != std::string::npos)
+        {
+            if (CloudRefreshToken(id))
+            {
+                authHeader = L"Authorization: Bearer " + cp.accessToken;
+                resp = WinHttpGet(L"www.googleapis.com", path, authHeader);
+            }
+            else
+            {
+                cp.loggedIn = false;
+                return results;
+            }
+        }
+
+        results = JsonParseGoogleDriveResults(resp);
+    }
+    // iCloud: Apple does not provide a public REST search API for iCloud Drive
+    // on Windows. Results would require the Apple CloudKit JS/REST API with
+    // a registered container, which is beyond typical desktop app scope.
+    // Users will see "Not available" in the dialog for iCloud.
+
+    return results;
+}
+
+// Load tokens and credentials from persistent config file.
+void LoadCloudConfig()
+{
+    std::wstring path = GetCloudConfigPath();
+    if (path.empty()) return;
+
+    FILE* f = nullptr;
+    _wfopen_s(&f, path.c_str(), L"r, ccs=UTF-8");
+    if (!f) return;
+
+    wchar_t line[4096];
+    while (fgetws(line, 4096, f))
+    {
+        std::wstring s(line);
+        while (!s.empty() && (s.back() == L'\n' || s.back() == L'\r' || s.back() == L' '))
+            s.pop_back();
+        if (s.empty()) continue;
+
+        // Format: id|clientId|clientSecret|accessToken|refreshToken
+        size_t sep1 = s.find(L'|');
+        if (sep1 == std::wstring::npos) continue;
+        size_t sep2 = s.find(L'|', sep1 + 1);
+        if (sep2 == std::wstring::npos) continue;
+        size_t sep3 = s.find(L'|', sep2 + 1);
+        if (sep3 == std::wstring::npos) continue;
+        size_t sep4 = s.find(L'|', sep3 + 1);
+        if (sep4 == std::wstring::npos) continue;
+
+        int id = _wtoi(s.substr(0, sep1).c_str());
+        if (id < 0 || id >= CP_COUNT) continue;
+
+        cloudProviders[id].clientId = s.substr(sep1 + 1, sep2 - sep1 - 1);
+        cloudProviders[id].clientSecret = s.substr(sep2 + 1, sep3 - sep2 - 1);
+        cloudProviders[id].accessToken = s.substr(sep3 + 1, sep4 - sep3 - 1);
+        cloudProviders[id].refreshToken = s.substr(sep4 + 1);
+        cloudProviders[id].loggedIn = !cloudProviders[id].accessToken.empty();
+    }
+    fclose(f);
+}
+
+// Save tokens and credentials to persistent config file.
+void SaveCloudConfig()
+{
+    std::wstring path = GetCloudConfigPath();
+    if (path.empty()) return;
+
+    FILE* f = nullptr;
+    _wfopen_s(&f, path.c_str(), L"w, ccs=UTF-8");
+    if (!f) return;
+
+    for (int i = 0; i < CP_COUNT; i++)
+    {
+        auto& cp = cloudProviders[i];
+        if (!cp.clientId.empty() || !cp.accessToken.empty() || !cp.refreshToken.empty())
+        {
+            fwprintf(f, L"%d|%s|%s|%s|%s\n", i,
+                     cp.clientId.c_str(),
+                     cp.clientSecret.c_str(),
+                     cp.accessToken.c_str(),
+                     cp.refreshToken.c_str());
+        }
+    }
+    fclose(f);
+}
+
+void UpdateCloudButtonLabel()
+{
+    if (!hCloudBtn) return;
+    int online = 0;
+    for (int i = 0; i < CP_COUNT; i++)
+        if (cloudProviders[i].loggedIn) online++;
+
+    std::wstring label;
+    if (online == 0)
+        label = L"\u2601 Cloud";
+    else
+        label = L"\u2601 Cloud (" + std::to_wstring(online) + L"/" +
+                std::to_wstring(CP_COUNT) + L")";
+    SetWindowTextW(hCloudBtn, label.c_str());
+}
+
+// Update the status labels and button enabled state in the cloud config dialog.
+// Sign In is only enabled when the required credentials are filled in.
+static void RefreshCloudDialogStatus(HWND hDlg)
+{
+    // Helper: check if a provider has required credentials filled in
+    auto hasCredentials = [](CloudProviderId id) -> bool {
+        CloudProvider& cp = cloudProviders[id];
+        if (cp.clientId.empty()) return false;
+        // Google Drive and iCloud require a client secret too
+        if ((id == CP_GOOGLEDRIVE || id == CP_ICLOUD) && cp.clientSecret.empty())
+            return false;
+        return true;
+    };
+
+    auto setProviderUI = [&](CloudProviderId id, int statusId, int loginId, int logoutId) {
+        CloudProvider& cp = cloudProviders[id];
+        bool hasCreds = hasCredentials(id);
+        if (cp.loggedIn)
+        {
+            SetDlgItemTextW(hDlg, statusId, L"\u2714 Signed in");
+            EnableWindow(GetDlgItem(hDlg, loginId), FALSE);
+            EnableWindow(GetDlgItem(hDlg, logoutId), TRUE);
+        }
+        else
+        {
+            if (hasCreds)
+                SetDlgItemTextW(hDlg, statusId, L"Ready to sign in");
+            else
+                SetDlgItemTextW(hDlg, statusId, L"Enter credentials above");
+            EnableWindow(GetDlgItem(hDlg, loginId), hasCreds ? TRUE : FALSE);
+            EnableWindow(GetDlgItem(hDlg, logoutId), FALSE);
+        }
+    };
+    setProviderUI(CP_ONEDRIVE,    IDC_OD_STATUS, IDC_OD_LOGIN, IDC_OD_LOGOUT);
+    setProviderUI(CP_GOOGLEDRIVE, IDC_GD_STATUS, IDC_GD_LOGIN, IDC_GD_LOGOUT);
+    setProviderUI(CP_ICLOUD,      IDC_IC_STATUS, IDC_IC_LOGIN, IDC_IC_LOGOUT);
+
+    // iCloud note: no public API — override status
+    if (!cloudProviders[CP_ICLOUD].loggedIn)
+    {
+        if (hasCredentials(CP_ICLOUD))
+            SetDlgItemTextW(hDlg, IDC_IC_STATUS, L"Ready (limited — no public search API)");
+        else
+            SetDlgItemTextW(hDlg, IDC_IC_STATUS, L"Enter credentials (limited — no public search API)");
+    }
+
+    int online = 0;
+    for (int i = 0; i < CP_COUNT; i++)
+        if (cloudProviders[i].loggedIn) online++;
+    wchar_t buf[128];
+    swprintf_s(buf, 128, L"%d of %d providers connected", online, CP_COUNT);
+    SetDlgItemTextW(hDlg, IDC_CLOUD_STATUS, buf);
+}
+
+// Helper: read text from a dialog edit control into a wstring.
+static std::wstring GetDlgItemWString(HWND hDlg, int id)
+{
+    wchar_t buf[1024] = {0};
+    GetDlgItemTextW(hDlg, id, buf, 1024);
+    std::wstring s(buf);
+    // Trim whitespace
+    while (!s.empty() && (s.front() == L' ' || s.front() == L'\t')) s.erase(s.begin());
+    while (!s.empty() && (s.back() == L' ' || s.back() == L'\t')) s.pop_back();
+    return s;
+}
+
+// Read all credential edit boxes into the cloudProviders array.
+static void ReadCredentialsFromDialog(HWND hDlg)
+{
+    cloudProviders[CP_ONEDRIVE].clientId = GetDlgItemWString(hDlg, IDC_OD_CLIENTID);
+    cloudProviders[CP_GOOGLEDRIVE].clientId = GetDlgItemWString(hDlg, IDC_GD_CLIENTID);
+    cloudProviders[CP_GOOGLEDRIVE].clientSecret = GetDlgItemWString(hDlg, IDC_GD_SECRET);
+    cloudProviders[CP_ICLOUD].clientId = GetDlgItemWString(hDlg, IDC_IC_CLIENTID);
+    cloudProviders[CP_ICLOUD].clientSecret = GetDlgItemWString(hDlg, IDC_IC_SECRET);
+}
+
+// Helper: disable all login/logout buttons and credential fields while OAuth is in progress.
+static void SetCloudDialogBusy(HWND hDlg, bool busy)
+{
+    EnableWindow(GetDlgItem(hDlg, IDC_OD_LOGIN),    !busy ? TRUE : FALSE);
+    EnableWindow(GetDlgItem(hDlg, IDC_OD_LOGOUT),   !busy ? TRUE : FALSE);
+    EnableWindow(GetDlgItem(hDlg, IDC_GD_LOGIN),    !busy ? TRUE : FALSE);
+    EnableWindow(GetDlgItem(hDlg, IDC_GD_LOGOUT),   !busy ? TRUE : FALSE);
+    EnableWindow(GetDlgItem(hDlg, IDC_IC_LOGIN),    !busy ? TRUE : FALSE);
+    EnableWindow(GetDlgItem(hDlg, IDC_IC_LOGOUT),   !busy ? TRUE : FALSE);
+    EnableWindow(GetDlgItem(hDlg, IDC_OD_CLIENTID), !busy ? TRUE : FALSE);
+    EnableWindow(GetDlgItem(hDlg, IDC_GD_CLIENTID), !busy ? TRUE : FALSE);
+    EnableWindow(GetDlgItem(hDlg, IDC_GD_SECRET),   !busy ? TRUE : FALSE);
+    EnableWindow(GetDlgItem(hDlg, IDC_IC_CLIENTID), !busy ? TRUE : FALSE);
+    EnableWindow(GetDlgItem(hDlg, IDC_IC_SECRET),   !busy ? TRUE : FALSE);
+    // Repurpose Close button as Cancel while busy
+    SetDlgItemTextW(hDlg, IDOK, busy ? L"Cancel" : L"Close");
+}
+
+// Dialog procedure for the Cloud Configuration dialog.
+INT_PTR CALLBACK CloudConfigDlgProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lParam)
+{
+    switch (message)
+    {
+    case WM_INITDIALOG:
+        // Populate edit boxes with stored credentials
+        SetDlgItemTextW(hDlg, IDC_OD_CLIENTID, cloudProviders[CP_ONEDRIVE].clientId.c_str());
+        SetDlgItemTextW(hDlg, IDC_GD_CLIENTID, cloudProviders[CP_GOOGLEDRIVE].clientId.c_str());
+        SetDlgItemTextW(hDlg, IDC_GD_SECRET,   cloudProviders[CP_GOOGLEDRIVE].clientSecret.c_str());
+        SetDlgItemTextW(hDlg, IDC_IC_CLIENTID, cloudProviders[CP_ICLOUD].clientId.c_str());
+        SetDlgItemTextW(hDlg, IDC_IC_SECRET,   cloudProviders[CP_ICLOUD].clientSecret.c_str());
+        RefreshCloudDialogStatus(hDlg);
+        return (INT_PTR)TRUE;
+
+    case WM_OAUTH_COMPLETE:
+        {
+            // Background OAuth thread finished — update UI
+            bool ok = (wParam != 0);
+            CloudProvider& cp = cloudProviders[oauthActiveProvider];
+            if (ok)
+            {
+                std::wstring msg = cp.name + L": signed in successfully.";
+                SetDlgItemTextW(hDlg, IDC_CLOUD_STATUS, msg.c_str());
+            }
+            else
+            {
+                std::wstring msg = cp.name + L": sign-in failed or cancelled.";
+                SetDlgItemTextW(hDlg, IDC_CLOUD_STATUS, msg.c_str());
+            }
+            if (oauthThread.joinable())
+                oauthThread.join();
+            SetCloudDialogBusy(hDlg, false);
+            UpdateCloudButtonLabel();
+            RefreshCloudDialogStatus(hDlg);
+            return (INT_PTR)TRUE;
+        }
+
+    case WM_COMMAND:
+        {
+            int wmId2 = LOWORD(wParam);
+            int notif = HIWORD(wParam);
+
+            // When any credential edit box changes, re-read all credentials
+            // and refresh button enabled states
+            if (notif == EN_CHANGE)
+            {
+                if (wmId2 == IDC_OD_CLIENTID || wmId2 == IDC_GD_CLIENTID ||
+                    wmId2 == IDC_GD_SECRET || wmId2 == IDC_IC_CLIENTID ||
+                    wmId2 == IDC_IC_SECRET)
+                {
+                    ReadCredentialsFromDialog(hDlg);
+                    RefreshCloudDialogStatus(hDlg);
+                    return (INT_PTR)TRUE;
+                }
+            }
+
+            // Block login actions while an OAuth flow is in progress
+            if (bOAuthInProgress.load())
+            {
+                if (wmId2 == IDOK || wmId2 == IDCANCEL)
+                {
+                    // "Cancel" button pressed — abort the OAuth flow
+                    CancelOAuthLogin();
+                    SetDlgItemTextW(hDlg, IDC_CLOUD_STATUS, L"Sign-in cancelled.");
+                    SetCloudDialogBusy(hDlg, false);
+                    RefreshCloudDialogStatus(hDlg);
+                    return (INT_PTR)TRUE;
+                }
+                return (INT_PTR)TRUE;
+            }
+
+            if (wmId2 == IDC_OD_LOGIN)
+            {
+                ReadCredentialsFromDialog(hDlg);
+                SaveCloudConfig();
+                SetDlgItemTextW(hDlg, IDC_CLOUD_STATUS, L"Signing in to OneDrive... (waiting for browser)");
+                SetCloudDialogBusy(hDlg, true);
+                StartOAuthLoginAsync(hDlg, CP_ONEDRIVE);
+                return (INT_PTR)TRUE;
+            }
+            if (wmId2 == IDC_OD_LOGOUT)
+            {
+                CloudLogout(CP_ONEDRIVE);
+                RefreshCloudDialogStatus(hDlg);
+                return (INT_PTR)TRUE;
+            }
+            if (wmId2 == IDC_GD_LOGIN)
+            {
+                ReadCredentialsFromDialog(hDlg);
+                SaveCloudConfig();
+                SetDlgItemTextW(hDlg, IDC_CLOUD_STATUS, L"Signing in to Google Drive... (waiting for browser)");
+                SetCloudDialogBusy(hDlg, true);
+                StartOAuthLoginAsync(hDlg, CP_GOOGLEDRIVE);
+                return (INT_PTR)TRUE;
+            }
+            if (wmId2 == IDC_GD_LOGOUT)
+            {
+                CloudLogout(CP_GOOGLEDRIVE);
+                RefreshCloudDialogStatus(hDlg);
+                return (INT_PTR)TRUE;
+            }
+            if (wmId2 == IDC_IC_LOGIN)
+            {
+                ReadCredentialsFromDialog(hDlg);
+                SaveCloudConfig();
+                SetDlgItemTextW(hDlg, IDC_CLOUD_STATUS, L"Signing in to iCloud... (waiting for browser)");
+                SetCloudDialogBusy(hDlg, true);
+                StartOAuthLoginAsync(hDlg, CP_ICLOUD);
+                return (INT_PTR)TRUE;
+            }
+            if (wmId2 == IDC_IC_LOGOUT)
+            {
+                CloudLogout(CP_ICLOUD);
+                RefreshCloudDialogStatus(hDlg);
+                return (INT_PTR)TRUE;
+            }
+            if (wmId2 == IDOK || wmId2 == IDCANCEL)
+            {
+                // Always save credentials on close
+                ReadCredentialsFromDialog(hDlg);
+                SaveCloudConfig();
+                UpdateCloudButtonLabel();
+                hOAuthDlg = NULL;
+                EndDialog(hDlg, wmId2);
+                return (INT_PTR)TRUE;
+            }
+        }
+        break;
+    }
+    return (INT_PTR)FALSE;
+}
+
 // Perform a search using the Windows Search Indexer via OLE DB.
 void TriggerWindowsSearch(HWND hWnd)
 {
@@ -2243,7 +3260,22 @@ void TriggerWindowsSearch(HWND hWnd)
     pDBInitialize->Release();
     if (comInited) CoUninitialize();
 
-    // Sort: filename matches first, then content matches, alphabetical within
+    // --- Query logged-in cloud providers via REST API and merge results ---
+    int cloudHits = 0;
+    for (int ci = 0; ci < CP_COUNT; ci++)
+    {
+        if (!cloudProviders[ci].loggedIn)
+            continue;
+        std::vector<SearchResult> cloudResults = CloudSearchFiles((CloudProviderId)ci, keyword);
+        for (auto& cr : cloudResults)
+        {
+            cr.matchScore = 51; // cloud results ranked between local filename(60) and content(20)
+            searchResults.push_back(std::move(cr));
+            cloudHits++;
+        }
+    }
+
+    // Sort: filename matches first, then cloud, then content matches, alphabetical within
     std::sort(searchResults.begin(), searchResults.end(),
         [](const SearchResult& a, const SearchResult& b) {
             if (a.matchScore != b.matchScore)
@@ -2262,9 +3294,15 @@ void TriggerWindowsSearch(HWND hWnd)
 
     // Count filename vs content matches for the status line
     int filenameHits = 0, contentHits = 0;
+    std::map<std::wstring, int> cloudHitsByProvider;
     for (auto& sr2 : searchResults)
     {
         if (sr2.matchScore >= 60) filenameHits++;
+        else if (sr2.matchScore == 51)
+        {
+            std::wstring src = sr2.cloudSource.empty() ? L"Cloud" : sr2.cloudSource;
+            cloudHitsByProvider[src]++;
+        }
         else contentHits++;
     }
 
@@ -2273,6 +3311,8 @@ void TriggerWindowsSearch(HWND hWnd)
         status += L" (showing first 10,000)";
     status += L"  |  " + std::to_wstring(filenameHits) + L" filename, "
               + std::to_wstring(contentHits) + L" content";
+    for (auto& kv : cloudHitsByProvider)
+        status += L", " + std::to_wstring(kv.second) + L" " + kv.first;
     if (!currentSearchScope.empty())
         status += L"  |  Scope: " + currentSearchScope;
     wchar_t timeBuf[64];
@@ -2435,7 +3475,10 @@ void PopulateSearchResults()
         const wchar_t* quality = L"Stem";
         if (bWindowsSearch)
         {
-            quality = (sr.matchScore >= 60) ? L"Filename" : L"Content";
+            if (sr.matchScore == 51)
+                quality = sr.cloudSource.empty() ? L"Cloud" : sr.cloudSource.c_str();
+            else
+                quality = (sr.matchScore >= 60) ? L"Filename" : L"Content";
         }
         else if (bWildcardSearch) quality = L"Wildcard";
         else if (sr.matchScore >= 100) quality = L"Exact";
@@ -2460,6 +3503,13 @@ void LaunchSearchResult(int index)
         return;
 
     const SearchResult& sr = searchResults[index];
+
+    // Cloud results have URLs — open in browser
+    if (sr.fullPath.find(L"http://") == 0 || sr.fullPath.find(L"https://") == 0)
+    {
+        ShellExecuteW(NULL, L"open", sr.fullPath.c_str(), NULL, NULL, SW_SHOWNORMAL);
+        return;
+    }
 
     if (sr.isDirectory)
     {
@@ -2918,6 +3968,13 @@ void LayoutControls(HWND hWnd)
             winSearchBtnWidth, buttonHeight, SWP_NOZORDER);
     }
     int darkBtnWidth = 75;
+    int cloudBtnWidth = 120;
+    if (hCloudBtn)
+    {
+        SetWindowPos(hCloudBtn, NULL,
+            rcClient.right - darkBtnWidth - 12 - cloudBtnWidth - 6, btnY,
+            cloudBtnWidth, buttonHeight, SWP_NOZORDER);
+    }
     if (hDarkModeBtn)
     {
         SetWindowPos(hDarkModeBtn, NULL,
@@ -3280,6 +4337,18 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
                 0, 0, 70, 30, hWnd, (HMENU)IDC_DARKMODE_BTN, hInst, NULL);
             if (hUIFont && hDarkModeBtn)
                 SendMessage(hDarkModeBtn, WM_SETFONT, (WPARAM)hUIFont, TRUE);
+
+            // Cloud storage providers button
+            hCloudBtn = CreateWindowExW(
+                0, L"BUTTON", L"\u2601 Cloud",
+                WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
+                0, 0, 120, 30, hWnd, (HMENU)IDC_CLOUD_BTN, hInst, NULL);
+            if (hUIFont && hCloudBtn)
+                SendMessage(hCloudBtn, WM_SETFONT, (WPARAM)hUIFont, TRUE);
+
+            // Load saved cloud configuration
+            LoadCloudConfig();
+            UpdateCloudButtonLabel();
 
             // Larger font for the toggle button glyph
             hToggleFont = CreateFontW(
@@ -3943,6 +5012,12 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
                 break;
             }
 
+            if (wmId == IDC_CLOUD_BTN)
+            {
+                DialogBoxW(hInst, MAKEINTRESOURCE(IDD_CLOUD_CONFIG), hWnd, CloudConfigDlgProc);
+                break;
+            }
+
             if (wmId >= IDC_DRIVE_BUTTON_BASE && wmId < IDC_DRIVE_BUTTON_BASE + (int)driveButtons.size())
             {
                 int driveIdx = wmId - IDC_DRIVE_BUTTON_BASE;
@@ -3983,6 +5058,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
         }
         break;
     case WM_DESTROY:
+        CancelOAuthLogin();
         StopUsnMonitor();
         if (hPropToggleTooltip) { DestroyWindow(hPropToggleTooltip); hPropToggleTooltip = NULL; }
         if (hToggleFont) { DeleteObject(hToggleFont); hToggleFont = NULL; }
