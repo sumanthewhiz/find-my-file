@@ -1,6 +1,6 @@
-# Find My File!
+ï»¿# Find My File!
 
-A high-performance Windows desktop application that reads the NTFS Master File Table (MFT) directly to index millions of files in seconds, then provides instant search across your entire file system — including cloud storage providers — with a modern, themeable UI.
+A high-performance Windows desktop application that reads the NTFS Master File Table (MFT) directly to index millions of files in seconds, then provides instant search across your entire file system â€” including cloud storage providers â€” with a modern, themeable UI.
 
 ![Windows](https://img.shields.io/badge/platform-Windows%2010%2F11-blue) ![C++14](https://img.shields.io/badge/language-C%2B%2B14-orange) ![Win32 API](https://img.shields.io/badge/framework-Win32%20API-lightgrey)
 
@@ -9,40 +9,41 @@ A high-performance Windows desktop application that reads the NTFS Master File T
 ## Features
 
 ### Core Search & Indexing
-- **Lightning-fast MFT scanning** — Reads the NTFS Master File Table directly via `FSCTL_ENUM_USN_DATA`, indexing 4–5 million files in 2–5 seconds
-- **Multi-drive support** — Automatically detects and lists all fixed NTFS drives (C:, D:, E:, etc.) with per-drive scan buttons
+- **Lightning-fast MFT scanning** â€” Reads the NTFS Master File Table directly via `FSCTL_ENUM_USN_DATA`, indexing 4â€“5 million files in 2â€“5 seconds
+- **Multi-drive support** â€” Automatically detects and lists all fixed NTFS drives (C:, D:, E:, etc.) with per-drive scan buttons
 - **Rich search modes**:
-  - **Exact token match** — Instant O(1) hash lookup for full filename/token matches
-  - **Prefix match** — O(log N) binary search on sorted token lists
-  - **Substring match** — Trigram index eliminates brute-force scans for 3+ character queries
-  - **Stemmed/morphological match** — A built-in Porter-style stemmer maps variants like *walking*, *walked*, *walker* ? *walk*
-  - **Wildcard/glob patterns** — Supports `*` and `?` with trigram-accelerated pre-filtering
-- **Scoped searches** — Select any folder in the tree view to restrict search results to that subtree
-- **Live filesystem monitoring** — Background USN journal polling detects file creates, deletes, and renames in real time and updates the index incrementally
+  - **Exact token match** â€” Instant O(1) hash lookup for full filename/token matches
+  - **Prefix match** â€” O(log N) binary search on sorted token lists
+  - **Substring match** â€” Trigram index eliminates brute-force scans for 3+ character queries
+  - **Stemmed/morphological match** â€” A built-in Porter-style stemmer maps variants like *walking*, *walked*, *walker* ? *walk*
+  - **Wildcard/glob patterns** â€” Supports `*` and `?` with trigram-accelerated pre-filtering
+  - **Fuzzy/typo-tolerant match** â€” Levenshtein edit distance matching (max distance 1 for keywords 4â€“6 chars, max distance 2 for 7+ chars) catches common misspellings; exact matches always rank higher
+- **Scoped searches** â€” Select any folder in the tree view to restrict search results to that subtree
+- **Live filesystem monitoring** â€” Background USN journal polling detects file creates, deletes, and renames in real time and updates the index incrementally
 
 ### Windows Search Integration
-- **Full-text content search** — The "Find with Windows Search" button queries the Windows Search Indexer via OLE DB, searching both filenames (`LIKE`) and file contents (`CONTAINS`)
-- **Content snippet extraction** — For content-only matches, reads up to 64 KB of each file to extract a contextual snippet around the keyword
-- **Combined results** — Merges local filename hits, content hits, and cloud results into a single ranked list
+- **Full-text content search** â€” The "Find with Windows Search" button queries the Windows Search Indexer via OLE DB, searching both filenames (`LIKE`) and file contents (`CONTAINS`)
+- **Content snippet extraction** â€” For content-only matches, reads up to 64 KB of each file to extract a contextual snippet around the keyword
+- **Combined results** â€” Merges local filename hits, content hits, and cloud results into a single ranked list
 
 ### Cloud Storage Integration
-- **OneDrive** — Search files via the Microsoft Graph API (`/me/drive/root/search`)
-- **Google Drive** — Search files via the Google Drive API v3 (`files.list` with `name contains` query)
-- **iCloud Drive** — OAuth sign-in supported; search is limited due to the lack of a public REST search API on Windows
-- **OAuth2 loopback flow** — Opens the system browser for authentication, listens on `localhost:5483/callback` for the redirect, and exchanges the authorization code for access/refresh tokens — all on a background thread so the UI stays responsive
-- **Token persistence** — Credentials and tokens are saved to `%APPDATA%\FindMyFile\cloud_tokens.ini` and automatically refreshed on expiry
-- **Provider-specific result labeling** — Cloud results are tagged as "OneDrive" or "Google Drive" in the Match column, not a generic "Cloud"
+- **OneDrive** â€” Search files via the Microsoft Graph API (`/me/drive/root/search`)
+- **Google Drive** â€” Search files via the Google Drive API v3 (`files.list` with `name contains` query)
+- **iCloud Drive** â€” OAuth sign-in supported; search is limited due to the lack of a public REST search API on Windows
+- **OAuth2 loopback flow** â€” Opens the system browser for authentication, listens on `localhost:5483/callback` for the redirect, and exchanges the authorization code for access/refresh tokens â€” all on a background thread so the UI stays responsive
+- **Token persistence** â€” Credentials and tokens are saved to `%APPDATA%\FindMyFile\cloud_tokens.ini` and automatically refreshed on expiry
+- **Provider-specific result labeling** â€” Cloud results are tagged as "OneDrive" or "Google Drive" in the Match column, not a generic "Cloud"
 
 ### User Interface
-- **Tabbed layout** — Browse tab (tree view) and Search Results tab (list view + properties panel)
-- **Hierarchical tree view** — On-demand lazy loading: only one level of children is populated per expansion, keeping memory and startup time low
-- **Search results list** — Six columns: Name, Type, Full Path, Modified, Match quality, and Snippet — with system file icons from the shell image list
-- **Keyword highlighting** — Custom-drawn cells highlight every occurrence of the search keyword in the Name and Snippet columns
-- **Properties panel** — A resizable right-hand panel shows file name, type, path, size, timestamps (created/modified/accessed), attributes, and content match previews with `«keyword»` markers
-- **Splitter** — Drag the vertical splitter between the list view and properties panel to resize; a collapse/expand toggle button (» / «) hides or shows the panel entirely
-- **Dark mode** — A single click toggles between a light and dark color scheme, applied consistently to all controls including tree view, list view, headers, buttons, and edit boxes
-- **Owner-drawn buttons** — All buttons use rounded rectangles with hover/press visual feedback, matching the active color scheme
-- **As-you-type search** — A 300 ms debounce timer triggers a search automatically after typing stops; no need to press Enter or click Find
+- **Tabbed layout** â€” Browse tab (tree view) and Search Results tab (list view + properties panel)
+- **Hierarchical tree view** â€” On-demand lazy loading: only one level of children is populated per expansion, keeping memory and startup time low
+- **Search results list** â€” Six columns: Name, Type, Full Path, Modified, Match quality, and Snippet â€” with system file icons from the shell image list
+- **Keyword highlighting** â€” Custom-drawn cells highlight every occurrence of the search keyword in the Name and Snippet columns
+- **Properties panel** â€” A resizable right-hand panel shows file name, type, path, size, timestamps (created/modified/accessed), attributes, and content match previews with `Â«keywordÂ»` markers
+- **Splitter** â€” Drag the vertical splitter between the list view and properties panel to resize; a collapse/expand toggle button (Â» / Â«) hides or shows the panel entirely
+- **Dark mode** â€” A single click toggles between a light and dark color scheme, applied consistently to all controls including tree view, list view, headers, buttons, and edit boxes
+- **Owner-drawn buttons** â€” All buttons use rounded rectangles with hover/press visual feedback, matching the active color scheme
+- **As-you-type search** â€” A 300 ms debounce timer triggers a search automatically after typing stops; no need to press Enter or click Find
 
 ### Search Ranking
 Results are scored and sorted by match quality:
@@ -58,11 +59,13 @@ Results are scored and sorted by match quality:
 | 40 | Substring | Keyword found inside filename |
 | 30 | Stem (exact) | Stemmed form matches exactly |
 | 25 | Stem (prefix) | Stemmed form is a prefix |
+| 18 | Fuzzy (dist 1) | Levenshtein distance 1 from a token |
+| 15 | Fuzzy (dist 2) | Levenshtein distance 2 from a token |
 | 20 | Content (Win Search) | Windows Search content-only hit |
 
 Bonus points are added for:
-- **Case-sensitive match** (+15) — The keyword appears with exact casing in the filename
-- **Recency** (+10 / +7 / +3) — File modified within the last 7 days, 30 days, or 1 year
+- **Case-sensitive match** (+15) â€” The keyword appears with exact casing in the filename
+- **Recency** (+10 / +7 / +3) â€” File modified within the last 7 days, 30 days, or 1 year
 
 ---
 
@@ -91,13 +94,13 @@ The project links against: `comctl32.lib`, `shlwapi.lib`, `uxtheme.lib`, `ole32.
 
 1. **Launch** the application as Administrator
 2. **Click a drive button** (e.g., "Scan C:") to read the MFT and build the file tree
-3. **Browse** using the tree view (Browse tab) — nodes expand on demand
+3. **Browse** using the tree view (Browse tab) â€” nodes expand on demand
 4. **Search** by typing in the search box:
    - The **Find** button uses the MFT-based inverted index (fastest, filename only)
    - The **Find with Windows Search** button also searches file contents and cloud providers
-5. **View results** in the Search Results tab — click a row to see properties; double-click to open
+5. **View results** in the Search Results tab â€” click a row to see properties; double-click to open
 6. **Right-click** a result for options: Open, Copy Path, Open Containing Folder
-7. **Scope searches** by selecting a folder in the tree before searching — only descendants of that folder are returned
+7. **Scope searches** by selecting a folder in the tree before searching â€” only descendants of that folder are returned
 8. **Use wildcards**: `*.pdf`, `report_202?.*`, `*budget*`
 
 ### Cloud Setup
@@ -107,7 +110,7 @@ The project links against: `comctl32.lib`, `shlwapi.lib`, `uxtheme.lib`, `ole32.
    - **OneDrive**: Register an app at [Azure Portal](https://portal.azure.com) ? App registrations. Add `http://localhost:5483/callback` as a **Mobile and desktop applications** redirect URI.
    - **Google Drive**: Create credentials at [Google Cloud Console](https://console.cloud.google.com) ? APIs & Services ? Credentials. Add `http://localhost:5483/callback` as an authorized redirect URI and enable the Google Drive API.
    - **iCloud**: Register at [Apple Developer](https://developer.apple.com). Note: iCloud search is limited on Windows due to no public REST search API.
-3. Click **Sign In** — a browser tab opens for authentication; the app listens locally for the OAuth callback
+3. Click **Sign In** â€” a browser tab opens for authentication; the app listens locally for the OAuth callback
 4. After signing in, cloud results automatically appear when using "Find with Windows Search"
 
 ---
@@ -190,16 +193,17 @@ The project links against: `comctl32.lib`, `shlwapi.lib`, `uxtheme.lib`, `ole32.
 
 ### Live Monitoring
 
-After the initial scan, a background thread (`UsnMonitorThreadFunc`) polls the USN journal every 2 seconds using `FSCTL_READ_USN_JOURNAL`. New creates, deletes, and renames are batched and posted to the UI thread via `WM_USN_UPDATED`. The UI thread then incrementally updates `fileMap`, `childrenMap`, all three search indexes, and the sorted token vectors — no full rescan needed.
+After the initial scan, a background thread (`UsnMonitorThreadFunc`) polls the USN journal every 2 seconds using `FSCTL_READ_USN_JOURNAL`. New creates, deletes, and renames are batched and posted to the UI thread via `WM_USN_UPDATED`. The UI thread then incrementally updates `fileMap`, `childrenMap`, all three search indexes, and the sorted token vectors â€” no full rescan needed.
 
 ### Search Algorithm
 
-**Normal search** runs four index lookups in order, collecting the best score per file:
+**Normal search** runs five index lookups in order, collecting the best score per file:
 
-1. **Exact token** (score 100) — O(1) hash lookup in `invertedIndex`
-2. **Prefix** (score 75) — `std::lower_bound` on `sortedTokens`, walk forward while prefix matches
-3. **Substring** (score 40) — Extract trigrams from the keyword, find the trigram posting list with the fewest entries, verify actual substring match on those candidates only
-4. **Stemmed** (score 30/25) — Same hash + prefix strategy on `stemmedIndex`
+1. **Exact token** (score 100) â€” O(1) hash lookup in `invertedIndex`
+2. **Prefix** (score 75) â€” `std::lower_bound` on `sortedTokens`, walk forward while prefix matches
+3. **Substring** (score 40) â€” Extract trigrams from the keyword, find the trigram posting list with the fewest entries, verify actual substring match on those candidates only
+4. **Stemmed** (score 30/25) â€” Same hash + prefix strategy on `stemmedIndex`
+5. **Fuzzy** (score 18/15) â€” For keywords â‰¥ 4 characters, iterates all tokens whose length is within Â±`maxDist` of the keyword and computes the Levenshtein edit distance with early-exit pruning. `maxDist` is 1 for short keywords (4â€“6 chars) and 2 for longer ones (7+ chars). Only files not already matched by earlier stages receive the fuzzy score.
 
 Results are capped at 10,000 via `std::partial_sort` and full paths are built only for the final set.
 
@@ -224,8 +228,8 @@ Two complete `ColorScheme` structs (22 colors each) define the light and dark pa
 
 | Metric | Typical Value |
 |--------|---------------|
-| MFT scan time (C: drive, ~4M files) | 2–5 seconds |
-| Search index build time | 1–3 seconds |
+| MFT scan time (C: drive, ~4M files) | 2â€“5 seconds |
+| Search index build time | 1â€“3 seconds |
 | Search latency (inverted index) | < 50 ms |
 | Search latency (trigram substring) | < 200 ms |
 | Memory usage (~5M file entries) | ~500 MB |
@@ -257,8 +261,8 @@ The entire application is implemented in a single `.cpp` file with no external d
 
 ## License
 
-MIT License — See LICENSE file for details.
+MIT License â€” See LICENSE file for details.
 
 ## Author
 
-Suman Ghosh — [@sumanthewhiz](https://github.com/sumanthewhiz)
+Suman Ghosh â€” [@sumanthewhiz](https://github.com/sumanthewhiz)

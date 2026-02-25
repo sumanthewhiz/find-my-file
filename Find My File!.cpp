@@ -1205,6 +1205,51 @@ static bool HasExactCaseMatch(const std::wstring& fileName, const std::wstring& 
     return false;
 }
 
+// Compute the Levenshtein edit distance between two wide strings.
+// Returns early if the distance exceeds maxDist, returning maxDist+1.
+static int LevenshteinDistance(const std::wstring& a, const std::wstring& b, int maxDist)
+{
+    int m = (int)a.length();
+    int n = (int)b.length();
+    if (abs(m - n) > maxDist)
+        return maxDist + 1;
+    if (m == 0) return n;
+    if (n == 0) return m;
+
+    // Use a single-row DP with O(min(m,n)) space
+    // Ensure 'b' is the shorter string for the row
+    const std::wstring& s1 = (m >= n) ? a : b;
+    const std::wstring& s2 = (m >= n) ? b : a;
+    int len1 = (int)s1.length();
+    int len2 = (int)s2.length();
+
+    std::vector<int> prev(len2 + 1);
+    std::vector<int> curr(len2 + 1);
+
+    for (int j = 0; j <= len2; j++)
+        prev[j] = j;
+
+    for (int i = 1; i <= len1; i++)
+    {
+        curr[0] = i;
+        int rowMin = curr[0];
+        for (int j = 1; j <= len2; j++)
+        {
+            int cost = (towlower(s1[i - 1]) == towlower(s2[j - 1])) ? 0 : 1;
+            int del = prev[j] + 1;
+            int ins = curr[j - 1] + 1;
+            int sub = prev[j - 1] + cost;
+            curr[j] = min(del, min(ins, sub));
+            if (curr[j] < rowMin)
+                rowMin = curr[j];
+        }
+        if (rowMin > maxDist)
+            return maxDist + 1;
+        std::swap(prev, curr);
+    }
+    return prev[len2];
+}
+
 // Check if a search keyword contains wildcard characters (* or ?)
 static bool IsWildcardPattern(const std::wstring& s)
 {
@@ -1590,6 +1635,44 @@ void PerformSearch(const std::wstring& keyword, ULONGLONG scopeRef)
                             matchScores[ref] = 25;
                     }
                 });
+        }
+    }
+
+    // 5) Fuzzy matching via Levenshtein distance (max distance 2).
+    //    Only check tokens whose length is within ±2 of the keyword length,
+    //    since edit distance ? 2 can change length by at most 2.
+    //    Skip very short keywords (< 4 chars) to avoid noisy false positives.
+    if (kwLen >= 4)
+    {
+        int maxDist = (kwLen >= 7) ? 2 : 1; // stricter for shorter words
+        int minLen = (int)kwLen - maxDist;
+        int maxLen = (int)kwLen + maxDist;
+        if (minLen < 1) minLen = 1;
+
+        // Use sortedTokens for efficient iteration; binary-search is not helpful
+        // for fuzzy matching, but length filtering eliminates most candidates.
+        for (const std::wstring& token : sortedTokens)
+        {
+            int tLen = (int)token.length();
+            if (tLen < minLen || tLen > maxLen)
+                continue;
+            // Skip tokens already matched by earlier stages
+            // (check a representative ref from the posting list)
+            auto idxIt = invertedIndex.find(token);
+            if (idxIt == invertedIndex.end())
+                continue;
+
+            int dist = LevenshteinDistance(lowerKeyword, token, maxDist);
+            if (dist > 0 && dist <= maxDist)
+            {
+                // Score: 18 for distance 1, 15 for distance 2
+                int fuzzyScore = (dist == 1) ? 18 : 15;
+                for (ULONGLONG ref : idxIt->second)
+                {
+                    if (!matchScores.count(ref))
+                        matchScores[ref] = fuzzyScore;
+                }
+            }
         }
     }
 
@@ -3472,7 +3555,7 @@ void PopulateSearchResults()
         // MFT scores: Exact=100, Wildcard=90, Prefix=75, Token=50, Substring=40, Stem=30/25
         // Bonuses: case match +15, recency +10/+7/+3
         // Windows Search scores: Filename=60, Content=20
-        const wchar_t* quality = L"Stem";
+        const wchar_t* quality = L"";
         if (bWindowsSearch)
         {
             if (sr.matchScore == 51)
@@ -3485,6 +3568,8 @@ void PopulateSearchResults()
         else if (sr.matchScore >= 75) quality = L"Prefix";
         else if (sr.matchScore >= 50) quality = L"Token Match";
         else if (sr.matchScore >= 40) quality = L"Substring";
+        else if (sr.matchScore >= 25) quality = L"Stem";
+        else if (sr.matchScore >= 15) quality = L"Fuzzy";
         ListView_SetItemText(hListView, (int)i, 4, (LPWSTR)quality);
 
         // Snippet column — show content preview for Windows Search content matches
