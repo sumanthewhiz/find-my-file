@@ -20,6 +20,7 @@ A high-performance Windows desktop application that reads the NTFS Master File T
   - **Fuzzy/typo-tolerant match** — Levenshtein edit distance matching (max distance 1 for keywords 4–6 chars, max distance 2 for 7+ chars) catches common misspellings; exact matches always rank higher
 - **Scoped searches** — Select any folder in the tree view to restrict search results to that subtree
 - **Live filesystem monitoring** — Background USN journal polling detects file creates, deletes, and renames in real time and updates the index incrementally
+- **WARP-powered recency ranking** — Integrates with [WARP](https://github.com/sumanthewhiz/WARP) (Windows Activity Recency Pipe) to obtain real file-interaction signals (opens, edits, creates) from the last 30 days. Files with recent WARP activity are strongly promoted in search ranking; files with no recency information are ranked lowest. Gracefully degrades when WARP is not running.
 
 ### Windows Search Integration
 - **Full-text content search** — The "Find with Windows Search" button queries the Windows Search Indexer via OLE DB, searching both filenames (`LIKE`) and file contents (`CONTAINS`)
@@ -65,7 +66,20 @@ Results are scored and sorted by match quality:
 
 Bonus points are added for:
 - **Case-sensitive match** (+15) — The keyword appears with exact casing in the filename
-- **Recency** (+10 / +7 / +3) — File modified within the last 7 days, 30 days, or 1 year
+- **WARP recency** (up to +25) — If [WARP](https://github.com/sumanthewhiz/WARP) is running, real user interaction data provides the strongest recency signal:
+
+  | WARP Activity Age | Bonus |
+  |-------------------|-------|
+  | Today | +25 |
+  | Yesterday | +22 |
+  | Last 3 days | +20 |
+  | Last 7 days | +17 |
+  | Last 14 days | +14 |
+  | Last 30 days | +10 |
+  | Older than 30 days | +5 |
+
+- **USN timestamp recency** (fallback, up to +10) — When WARP data is unavailable for a file, the MFT timestamp provides a weaker signal: +10 (last 7 days), +7 (last 30 days), +3 (last year), +0 (older or unknown)
+- **No recency info** (+0) — Files with neither WARP activity nor a USN timestamp receive no recency bonus and are ranked lowest
 
 ---
 
@@ -75,6 +89,7 @@ Bonus points are added for:
 - **Privileges**: Must run as **Administrator** (required for direct MFT access via `DeviceIoControl`)
 - **File system**: NTFS (the app auto-detects and skips non-NTFS volumes)
 - **Build tools**: Visual Studio 2022 with the C++ Desktop workload
+- **WARP** *(optional)*: Install [WARP](https://github.com/sumanthewhiz/WARP) for enhanced recency-based ranking. When running, WARP provides real file-interaction signals. Without it, ranking falls back to USN timestamps.
 
 ---
 
@@ -180,6 +195,7 @@ The project links against: `comctl32.lib`, `shlwapi.lib`, `uxtheme.lib`, `ole32.
 | `sortedTokens` / `sortedStemTokens` | Sorted vectors of all index keys, enabling O(log N) prefix range queries via `std::lower_bound`. |
 | `fullPathCache` / `timestampCache` | Memoize expensive path-building walks and filesystem timestamp queries. |
 | `treeItemToRef` (`unordered_map<HTREEITEM, ULONGLONG>`) | Reverse map from Win32 tree items back to MFT references for on-demand expansion. |
+| `warpRecencyByPath` (`unordered_map<wstring, ULONGLONG>`) | Maps lowercased full paths to their most recent WARP activity timestamp (Unix epoch seconds). Populated once per drive scan via the WARP named pipe. |
 
 ### MFT Reading Pipeline
 
@@ -190,6 +206,8 @@ The project links against: `comctl32.lib`, `shlwapi.lib`, `uxtheme.lib`, `ole32.
 5. Build `fileMap` and `childrenMap` in a single pass
 6. Pre-compute `hasChildren` flags for all directories
 7. Build the search indexes (inverted, stemmed, trigram) with progress reporting
+8. Pre-populate `fullPathCache` for all files
+9. Query WARP for 30 days of file activity via the `\\\\\\.\\.\\pipe\\WarpFileActivityAPI` named pipe, populating `warpRecencyByPath`
 
 ### Live Monitoring
 
@@ -217,6 +235,21 @@ Results are capped at 10,000 via `std::partial_sort` and full paths are built on
 4. JSON responses are parsed with a lightweight hand-rolled extractor (`JsonGetString`, `JsonParseOneDriveResults`, `JsonParseGoogleDriveResults`)
 5. Cloud results are merged into the main results list with score 51 and tagged with their provider name
 6. Double-clicking a cloud result opens its `webUrl` / `webViewLink` in the default browser
+
+### WARP Recency Integration
+
+[WARP](https://github.com/sumanthewhiz/WARP) (Windows Activity Recency Pipe) is an optional local service that records real file-interaction events (opens, edits, creates, deletes, renames) via ETW kernel tracing and exposes them through a named pipe API.
+
+**How it works:**
+
+1. After building the search index, `QueryWarpActivity()` connects to `\\.\pipe\WarpFileActivityAPI`
+2. Sends `{"window":"30d"}` to request the last 30 days of activity
+3. Parses the JSON response and populates `warpRecencyByPath` — a map from lowercased file path to the most recent Unix timestamp
+4. During search scoring, `GetRecencyBonus()` first checks `warpRecencyByPath` for the file's full path. If found, the WARP timestamp provides a strong bonus (up to +25 for files accessed today)
+5. If no WARP data exists for a file, the function falls back to the USN journal timestamp (weaker signal, up to +10)
+6. Files with no recency information at all receive +0, ensuring they sort below any file that has activity data
+
+**Graceful degradation:** If WARP is not running (the named pipe doesn't exist), the connection simply fails and the app falls back entirely to USN timestamp-based recency — no error dialogs, no user action required. The status bar shows "WARP ✔" when WARP data is active.
 
 ### Theming
 

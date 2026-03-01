@@ -261,6 +261,10 @@ std::unordered_map<ULONGLONG, std::wstring> fullPathCache;
 // Cached timestamps (USN timestamp) for each file reference
 std::unordered_map<ULONGLONG, LARGE_INTEGER> timestampCache;
 
+// WARP file activity recency: lowercased full path -> most recent Unix timestamp (UTC)
+std::unordered_map<std::wstring, ULONGLONG> warpRecencyByPath;
+bool bWarpAvailable = false;  // true if WARP service responded on last query
+
 // Search result for display
 struct SearchResult {
     ULONGLONG fileRef;
@@ -326,6 +330,7 @@ static std::wstring UrlEncode(const std::wstring& s);
 static std::string  JsonGetString(const std::string& json, const std::string& key);
 static std::vector<SearchResult> JsonParseOneDriveResults(const std::string& json);
 static std::vector<SearchResult> JsonParseGoogleDriveResults(const std::string& json);
+static void QueryWarpActivity();
 
 // Update the tooltip text for the properties toggle button to reflect its current action.
 static void UpdateToggleTooltip()
@@ -1167,22 +1172,163 @@ void StopUsnMonitor()
     pendingUsnChanges.clear();
 }
 
-// Compute a recency bonus (0-10) based on USN timestamp age.
-// 'now' is the current time as a 64-bit FILETIME value, passed in to avoid repeated syscalls.
+// Query the WARP file activity service for the last 30 days via named pipe.
+// Populates warpRecencyByPath with lowercased full path -> most recent Unix timestamp.
+static void QueryWarpActivity()
+{
+    warpRecencyByPath.clear();
+    bWarpAvailable = false;
+
+    HANDLE hPipe = CreateFileW(
+        L"\\\\.\\pipe\\WarpFileActivityAPI",
+        GENERIC_READ | GENERIC_WRITE,
+        0, NULL, OPEN_EXISTING, 0, NULL);
+    if (hPipe == INVALID_HANDLE_VALUE)
+        return;
+
+    DWORD mode = PIPE_READMODE_MESSAGE;
+    SetNamedPipeHandleState(hPipe, &mode, NULL, NULL);
+
+    // Request 30 days of activity
+    const char* request = "{\"window\":\"30d\"}";
+    DWORD bytesWritten = 0;
+    if (!WriteFile(hPipe, request, (DWORD)strlen(request), &bytesWritten, NULL))
+    {
+        CloseHandle(hPipe);
+        return;
+    }
+
+    // Read response (up to 64 KB)
+    std::vector<char> buf(65536, 0);
+    DWORD bytesRead = 0;
+    if (!ReadFile(hPipe, buf.data(), (DWORD)buf.size() - 1, &bytesRead, NULL))
+    {
+        CloseHandle(hPipe);
+        return;
+    }
+    CloseHandle(hPipe);
+
+    if (bytesRead == 0)
+        return;
+
+    bWarpAvailable = true;
+    std::string json(buf.data(), bytesRead);
+
+    // Parse the activities array: extract "path" and "timestamp" from each object.
+    // Keep only the most recent timestamp per lowercased path.
+    size_t pos = 0;
+    while (pos < json.size())
+    {
+        // Find next "timestamp" key
+        size_t tsPos = json.find("\"timestamp\"", pos);
+        if (tsPos == std::string::npos) break;
+
+        // Find the enclosing object start
+        size_t objStart = json.rfind('{', tsPos);
+        if (objStart == std::string::npos) { pos = tsPos + 11; continue; }
+
+        // Find matching '}'
+        int depth = 0;
+        size_t objEnd = objStart;
+        for (size_t i = objStart; i < json.size(); i++)
+        {
+            if (json[i] == '{') depth++;
+            else if (json[i] == '}') { depth--; if (depth == 0) { objEnd = i + 1; break; } }
+        }
+        std::string obj = json.substr(objStart, objEnd - objStart);
+
+        // Extract timestamp (integer value after "timestamp":)
+        ULONGLONG ts = 0;
+        {
+            std::string tsKey = "\"timestamp\"";
+            size_t kp = obj.find(tsKey);
+            if (kp != std::string::npos)
+            {
+                kp += tsKey.size();
+                while (kp < obj.size() && (obj[kp] == ' ' || obj[kp] == ':' || obj[kp] == '\t'))
+                    kp++;
+                while (kp < obj.size() && obj[kp] >= '0' && obj[kp] <= '9')
+                {
+                    ts = ts * 10 + (obj[kp] - '0');
+                    kp++;
+                }
+            }
+        }
+
+        // Extract path
+        std::string pathStr = JsonGetString(obj, "path");
+
+        if (!pathStr.empty() && ts > 0)
+        {
+            std::wstring wpath = Utf8ToWide(pathStr);
+            for (auto& ch : wpath)
+                ch = towlower(ch);
+            auto it = warpRecencyByPath.find(wpath);
+            if (it == warpRecencyByPath.end() || ts > it->second)
+                warpRecencyByPath[wpath] = ts;
+        }
+
+        pos = objEnd;
+    }
+}
+
+// Compute a recency bonus based on WARP activity signals and USN timestamp.
+// WARP provides real user interaction data (open, modify, create) and is the
+// primary signal. Files with WARP activity get a strong bonus (up to 25).
+// Files with only USN timestamps get a smaller bonus (up to 10).
+// Files with no recency information at all get 0 (ranked lowest).
+// 'now' is the current time as a 64-bit FILETIME value.
 static int GetRecencyBonus(ULONGLONG fileRef, ULONGLONG now)
 {
+    // 1) Try WARP activity signal (strongest weight — real user interaction data)
+    if (bWarpAvailable && !warpRecencyByPath.empty())
+    {
+        // Build or fetch the full path for this file to look up in WARP data
+        auto pathIt = fullPathCache.find(fileRef);
+        if (pathIt != fullPathCache.end())
+        {
+            std::wstring lowerPath = pathIt->second;
+            for (auto& ch : lowerPath)
+                ch = towlower(ch);
+            auto warpIt = warpRecencyByPath.find(lowerPath);
+            if (warpIt != warpRecencyByPath.end())
+            {
+                // Convert current FILETIME to Unix epoch for comparison
+                // FILETIME epoch is Jan 1 1601; Unix epoch is Jan 1 1970
+                // Difference: 11644473600 seconds = 116444736000000000 100-ns ticks
+                const ULONGLONG EPOCH_DIFF = 116444736000000000ULL;
+                ULONGLONG nowUnix = (now > EPOCH_DIFF) ? (now - EPOCH_DIFF) / 10000000ULL : 0;
+                ULONGLONG warpTs = warpIt->second;
+
+                if (warpTs > 0 && nowUnix >= warpTs)
+                {
+                    ULONGLONG ageSec = nowUnix - warpTs;
+                    const ULONGLONG SECS_PER_DAY = 86400ULL;
+                    ULONGLONG daysOld = ageSec / SECS_PER_DAY;
+
+                    if (daysOld == 0)   return 25;  // today
+                    if (daysOld <= 1)   return 22;  // yesterday
+                    if (daysOld <= 3)   return 20;  // last 3 days
+                    if (daysOld <= 7)   return 17;  // last week
+                    if (daysOld <= 14)  return 14;  // last 2 weeks
+                    if (daysOld <= 30)  return 10;  // last month
+                    return 5;  // older WARP activity (still better than no signal)
+                }
+            }
+        }
+    }
+
+    // 2) Fallback: USN timestamp (weaker signal — filesystem metadata only)
     auto tsIt = timestampCache.find(fileRef);
     if (tsIt == timestampCache.end())
         return 0;
 
     ULONGLONG fileTime = (ULONGLONG)tsIt->second.QuadPart;
-
     if (fileTime == 0 || fileTime > now)
         return 0;
 
     ULONGLONG diff = now - fileTime;
     const ULONGLONG TICKS_PER_DAY = 864000000000ULL; // 10^7 * 86400
-
     ULONGLONG daysOld = diff / TICKS_PER_DAY;
 
     if (daysOld <= 7)   return 10;
@@ -1878,6 +2024,8 @@ void TriggerSearch(HWND hWnd)
     wchar_t timeBuf[64];
     swprintf_s(timeBuf, 64, L"  |  %.1f ms", searchElapsedMS);
     status += timeBuf;
+    if (bWarpAvailable)
+        status += L"  |  WARP \u2714";
     SetWindowTextW(hStatusText, status.c_str());
 }
 
@@ -3876,6 +4024,8 @@ void ReadDriveAndBuildTree(HWND hWnd, const std::wstring& drive)
         fullPathCache.clear();
         timestampCache.clear();
         searchResults.clear();
+        warpRecencyByPath.clear();
+        bWarpAvailable = false;
 
         // Disable drive buttons during scan
         for (auto& db : driveButtons)
@@ -3915,6 +4065,15 @@ void ReadDriveAndBuildTree(HWND hWnd, const std::wstring& drive)
             
             UpdateProgress(92, L"Building search index...");
             BuildSearchIndex(drive);
+
+            // Pre-populate fullPathCache for all files so WARP recency lookups work
+            UpdateProgress(98, L"Building path cache...");
+            for (auto& pair : fileMap)
+                BuildFullPath(pair.first, drive);
+
+            // Query WARP for file activity recency signals
+            UpdateProgress(99, L"Querying WARP activity...");
+            QueryWarpActivity();
 
             if (!bTreeRenderedOnce)
             {
