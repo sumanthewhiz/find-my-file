@@ -273,7 +273,9 @@ struct SearchResult {
     std::wstring contentSnippet;  // content match preview from Windows Search
     std::wstring cloudSource;     // provider name for cloud results (e.g. L"OneDrive")
     bool isDirectory;
-    int matchScore;  // higher = better match
+    int matchScore;  // higher = better match (includes all bonuses)
+    int baseScore = 0;   // match type score before any bonuses (for quality label)
+    int warpBonus = 0;   // WARP-specific recency boost included in matchScore (0 if none)
 };
 std::vector<SearchResult> searchResults;
 
@@ -1172,50 +1174,53 @@ void StopUsnMonitor()
     pendingUsnChanges.clear();
 }
 
-// Query the WARP file activity service for the last 30 days via named pipe.
-// Populates warpRecencyByPath with lowercased full path -> most recent Unix timestamp.
-static void QueryWarpActivity()
+// Send a request to WARP and read the full response as a UTF-8 string.
+// Returns an empty string on any pipe communication failure.
+static std::string WarpPipeQuery(const char* request)
 {
-    warpRecencyByPath.clear();
-    bWarpAvailable = false;
-
     HANDLE hPipe = CreateFileW(
         L"\\\\.\\pipe\\WarpFileActivityAPI",
         GENERIC_READ | GENERIC_WRITE,
         0, NULL, OPEN_EXISTING, 0, NULL);
     if (hPipe == INVALID_HANDLE_VALUE)
-        return;
+        return "";
 
     DWORD mode = PIPE_READMODE_MESSAGE;
     SetNamedPipeHandleState(hPipe, &mode, NULL, NULL);
 
-    // Request 30 days of activity
-    const char* request = "{\"window\":\"30d\"}";
     DWORD bytesWritten = 0;
     if (!WriteFile(hPipe, request, (DWORD)strlen(request), &bytesWritten, NULL))
     {
         CloseHandle(hPipe);
-        return;
+        return "";
     }
 
-    // Read response (up to 64 KB)
-    std::vector<char> buf(65536, 0);
-    DWORD bytesRead = 0;
-    if (!ReadFile(hPipe, buf.data(), (DWORD)buf.size() - 1, &bytesRead, NULL))
+    // Read response — loop to handle ERROR_MORE_DATA on message-mode pipes.
+    // WARP caps responses at ~64 KB per message, but the pipe layer may still
+    // split delivery across multiple ReadFile calls.
+    std::string json;
+    json.reserve(65536);
+    std::vector<char> buf(65536);
+    for (;;)
     {
-        CloseHandle(hPipe);
-        return;
+        DWORD bytesRead = 0;
+        BOOL ok = ReadFile(hPipe, buf.data(), (DWORD)buf.size(), &bytesRead, NULL);
+        if (bytesRead > 0)
+            json.append(buf.data(), bytesRead);
+        if (ok)
+            break;  // complete message received
+        if (GetLastError() == ERROR_MORE_DATA)
+            continue;  // more chunks remain
+        break;  // genuine error — use whatever we got
     }
     CloseHandle(hPipe);
+    return json;
+}
 
-    if (bytesRead == 0)
-        return;
-
-    bWarpAvailable = true;
-    std::string json(buf.data(), bytesRead);
-
-    // Parse the activities array: extract "path" and "timestamp" from each object.
-    // Keep only the most recent timestamp per lowercased path.
+// Parse WARP activity objects from JSON and merge into warpRecencyByPath.
+// Keeps the most recent timestamp per lowercased path.
+static void ParseWarpJson(const std::string& json)
+{
     size_t pos = 0;
     while (pos < json.size())
     {
@@ -1235,6 +1240,11 @@ static void QueryWarpActivity()
             if (json[i] == '{') depth++;
             else if (json[i] == '}') { depth--; if (depth == 0) { objEnd = i + 1; break; } }
         }
+
+        // If we couldn't find a matching '}', the JSON was likely truncated — stop.
+        if (depth != 0)
+            break;
+
         std::string obj = json.substr(objStart, objEnd - objStart);
 
         // Extract timestamp (integer value after "timestamp":)
@@ -1272,51 +1282,121 @@ static void QueryWarpActivity()
     }
 }
 
+// Query the WARP file activity service via named pipe.
+// Queries progressively longer time windows (24h ? 7d ? 15d ? 30d) and merges
+// results.  Shorter windows are queried first so that recent data is always
+// captured even if a longer window's response is truncated at the 64 KB pipe
+// message limit.  Results are merged — the map keeps max(timestamp) per path,
+// so overlapping windows are harmless.
+static void QueryWarpActivity()
+{
+    warpRecencyByPath.clear();
+    bWarpAvailable = false;
+
+    // Query from shortest to longest.  Each response is capped at ~64 KB by
+    // WARP, so shorter windows are more likely to contain complete data.  We
+    // merge all results to build the fullest picture possible.
+    static const char* windows[] = {
+        "{\"window\":\"24h\"}",
+        "{\"window\":\"7d\"}",
+        "{\"window\":\"15d\"}",
+        "{\"window\":\"30d\"}",
+    };
+
+    for (const char* req : windows)
+    {
+        std::string json = WarpPipeQuery(req);
+        if (json.empty())
+        {
+            // If even the first query fails, WARP isn't running.
+            if (!bWarpAvailable)
+                return;
+            // Otherwise a longer window just failed — stop extending, keep
+            // whatever we already collected from shorter windows.
+            break;
+        }
+
+        bWarpAvailable = true;
+        size_t prevSize = warpRecencyByPath.size();
+        ParseWarpJson(json);
+
+        // If a longer window didn't add any new paths beyond what we already
+        // had, it means either (a) there's no older data, or (b) the response
+        // was truncated and only contained duplicates we already have.  In
+        // either case, stop — querying an even longer window won't help.
+        if (warpRecencyByPath.size() == prevSize && prevSize > 0)
+            break;
+    }
+}
+
+// Return the WARP-only recency bonus for a file (0 if no WARP data).
+// Returns up to +125 for files accessed today.  The large magnitude is
+// intentional — it allows recent WARP activity to promote a weaker match
+// type (e.g. substring) above a stronger match type (e.g. exact) that has
+// no recent activity.  'now' is the current time as a 64-bit FILETIME value.
+static int GetWarpRecencyBonus(ULONGLONG fileRef, ULONGLONG now)
+{
+    if (!bWarpAvailable || warpRecencyByPath.empty())
+        return 0;
+
+    // Look up the full path — build it on-demand if the cache was invalidated
+    // (e.g. by ProcessPendingUsnChanges after a USN journal poll).
+    auto pathIt = fullPathCache.find(fileRef);
+    std::wstring filePath;
+    if (pathIt != fullPathCache.end())
+    {
+        filePath = pathIt->second;
+    }
+    else if (!currentDriveLetter.empty())
+    {
+        filePath = BuildFullPath(fileRef, currentDriveLetter);
+    }
+    else
+    {
+        return 0;
+    }
+
+    std::wstring lowerPath = filePath;
+    for (auto& ch : lowerPath)
+        ch = towlower(ch);
+    auto warpIt = warpRecencyByPath.find(lowerPath);
+    if (warpIt == warpRecencyByPath.end())
+        return 0;
+
+    const ULONGLONG EPOCH_DIFF = 116444736000000000ULL;
+    ULONGLONG nowUnix = (now > EPOCH_DIFF) ? (now - EPOCH_DIFF) / 10000000ULL : 0;
+    ULONGLONG warpTs = warpIt->second;
+
+    if (warpTs == 0 || nowUnix < warpTs)
+        return 0;
+
+    ULONGLONG ageSec = nowUnix - warpTs;
+    const ULONGLONG SECS_PER_DAY = 86400ULL;
+    ULONGLONG daysOld = ageSec / SECS_PER_DAY;
+
+    if (daysOld == 0)   return 125;  // today
+    if (daysOld <= 1)   return 110;  // yesterday
+    if (daysOld <= 3)   return 100;  // last 3 days
+    if (daysOld <= 7)   return 85;   // last week
+    if (daysOld <= 14)  return 65;   // last 2 weeks
+    if (daysOld <= 30)  return 40;   // last month
+    return 15;                        // older WARP activity
+}
+
 // Compute a recency bonus based on WARP activity signals and USN timestamp.
 // WARP provides real user interaction data (open, modify, create) and is the
-// primary signal. Files with WARP activity get a strong bonus (up to 25).
+// primary signal. Files with WARP activity get a strong bonus (up to 125)
+// that intentionally outweighs match-type differences so recently-used files
+// surface above stale exact matches.
 // Files with only USN timestamps get a smaller bonus (up to 10).
 // Files with no recency information at all get 0 (ranked lowest).
 // 'now' is the current time as a 64-bit FILETIME value.
 static int GetRecencyBonus(ULONGLONG fileRef, ULONGLONG now)
 {
-    // 1) Try WARP activity signal (strongest weight — real user interaction data)
-    if (bWarpAvailable && !warpRecencyByPath.empty())
-    {
-        // Build or fetch the full path for this file to look up in WARP data
-        auto pathIt = fullPathCache.find(fileRef);
-        if (pathIt != fullPathCache.end())
-        {
-            std::wstring lowerPath = pathIt->second;
-            for (auto& ch : lowerPath)
-                ch = towlower(ch);
-            auto warpIt = warpRecencyByPath.find(lowerPath);
-            if (warpIt != warpRecencyByPath.end())
-            {
-                // Convert current FILETIME to Unix epoch for comparison
-                // FILETIME epoch is Jan 1 1601; Unix epoch is Jan 1 1970
-                // Difference: 11644473600 seconds = 116444736000000000 100-ns ticks
-                const ULONGLONG EPOCH_DIFF = 116444736000000000ULL;
-                ULONGLONG nowUnix = (now > EPOCH_DIFF) ? (now - EPOCH_DIFF) / 10000000ULL : 0;
-                ULONGLONG warpTs = warpIt->second;
-
-                if (warpTs > 0 && nowUnix >= warpTs)
-                {
-                    ULONGLONG ageSec = nowUnix - warpTs;
-                    const ULONGLONG SECS_PER_DAY = 86400ULL;
-                    ULONGLONG daysOld = ageSec / SECS_PER_DAY;
-
-                    if (daysOld == 0)   return 25;  // today
-                    if (daysOld <= 1)   return 22;  // yesterday
-                    if (daysOld <= 3)   return 20;  // last 3 days
-                    if (daysOld <= 7)   return 17;  // last week
-                    if (daysOld <= 14)  return 14;  // last 2 weeks
-                    if (daysOld <= 30)  return 10;  // last month
-                    return 5;  // older WARP activity (still better than no signal)
-                }
-            }
-        }
-    }
+    // 1) Try WARP activity signal (delegates to GetWarpRecencyBonus)
+    int wb = GetWarpRecencyBonus(fileRef, now);
+    if (wb > 0)
+        return wb;
 
     // 2) Fallback: USN timestamp (weaker signal — filesystem metadata only)
     auto tsIt = timestampCache.find(fileRef);
@@ -1590,14 +1670,17 @@ void PerformSearch(const std::wstring& keyword, ULONGLONG scopeRef)
             if (!WildcardMatch(entry.lowerFileName.c_str(), lowerKeyword.c_str()))
                 return;
 
-            int score = 90; // wildcard match base score
-            score += GetRecencyBonus(ref, now);
+            int base = 90; // wildcard match base score
+            int wb = GetWarpRecencyBonus(ref, now);
+            int score = base + ((wb > 0) ? wb : GetRecencyBonus(ref, now));
 
             SearchResult sr;
             sr.fileRef = ref;
             sr.fileName = entry.fileName;
             sr.isDirectory = entry.isDirectory;
             sr.matchScore = score;
+            sr.baseScore = base;
+            sr.warpBonus = wb;
             searchResults.push_back(sr);
         };
 
@@ -1839,16 +1922,20 @@ void PerformSearch(const std::wstring& keyword, ULONGLONG scopeRef)
         if (scopeRef != 0 && ref != scopeRef && !IsDescendantOf(ref, scopeRef))
             continue;
 
-        int score = pair.second;
+        int base = pair.second;
+        int score = base;
 
         if (HasExactCaseMatch(it->second.fileName, keyword))
             score += 15;
 
-        score += GetRecencyBonus(ref, now);
+        int wb = GetWarpRecencyBonus(ref, now);
+        score += (wb > 0) ? wb : GetRecencyBonus(ref, now);
 
         SearchResult sr;
         sr.fileRef = ref;
         sr.fileName = it->second.fileName;
+        sr.baseScore = base;
+        sr.warpBonus = wb;
         // fullPath deferred — will be built only for the final top-N results
         sr.isDirectory = it->second.isDirectory;
         sr.matchScore = score;
@@ -3712,17 +3799,25 @@ void PopulateSearchResults()
                 quality = (sr.matchScore >= 60) ? L"Filename" : L"Content";
         }
         else if (bWildcardSearch) quality = L"Wildcard";
-        else if (sr.matchScore >= 100) quality = L"Exact";
-        else if (sr.matchScore >= 75) quality = L"Prefix";
-        else if (sr.matchScore >= 50) quality = L"Token Match";
-        else if (sr.matchScore >= 40) quality = L"Substring";
-        else if (sr.matchScore >= 25) quality = L"Stem";
-        else if (sr.matchScore >= 15) quality = L"Fuzzy";
+        else if (sr.baseScore >= 100) quality = L"Exact";
+        else if (sr.baseScore >= 75) quality = L"Prefix";
+        else if (sr.baseScore >= 50) quality = L"Token Match";
+        else if (sr.baseScore >= 40) quality = L"Substring";
+        else if (sr.baseScore >= 25) quality = L"Stem";
+        else if (sr.baseScore >= 15) quality = L"Fuzzy";
         ListView_SetItemText(hListView, (int)i, 4, (LPWSTR)quality);
+
+        // WARP Boost column
+        wchar_t warpBuf[16] = {0};
+        if (sr.warpBonus > 0)
+            swprintf_s(warpBuf, 16, L"+%d", sr.warpBonus);
+        else
+            wcscpy_s(warpBuf, 16, L"\u2014");
+        ListView_SetItemText(hListView, (int)i, 5, warpBuf);
 
         // Snippet column — show content preview for Windows Search content matches
         if (!sr.contentSnippet.empty())
-            ListView_SetItemText(hListView, (int)i, 5, (LPWSTR)sr.contentSnippet.c_str());
+            ListView_SetItemText(hListView, (int)i, 6, (LPWSTR)sr.contentSnippet.c_str());
     }
 
     SendMessage(hListView, WM_SETREDRAW, TRUE, 0);
@@ -4534,9 +4629,14 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
                 ListView_InsertColumn(hListView, 4, &lvc);
 
                 lvc.iSubItem = 5;
+                lvc.pszText = (LPWSTR)L"WARP Boost";
+                lvc.cx = 85;
+                ListView_InsertColumn(hListView, 5, &lvc);
+
+                lvc.iSubItem = 6;
                 lvc.pszText = (LPWSTR)L"Snippet";
                 lvc.cx = 300;
-                ListView_InsertColumn(hListView, 5, &lvc);
+                ListView_InsertColumn(hListView, 6, &lvc);
 
                 // Attach the system small icon image list to the ListView
                 SHFILEINFOW sfi = {0};
@@ -4811,7 +4911,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
                 {
                     const SearchResult& sr = searchResults[idx];
                     const wchar_t* tipText = NULL;
-                    if (sub == 5 && !sr.contentSnippet.empty())
+                    if (sub == 6 && !sr.contentSnippet.empty())
                         tipText = sr.contentSnippet.c_str();
                     else if (sub == 2 && !sr.fullPath.empty())
                         tipText = sr.fullPath.c_str();
@@ -4842,8 +4942,8 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
                             return CDRF_DODEFAULT;
                         }
 
-                        // Custom-draw the Name column (subitem 0) and Snippet column (subitem 5)
-                        if (iSubItem != 0 && iSubItem != 5)
+                        // Custom-draw the Name column (subitem 0) and Snippet column (subitem 6)
+                        if (iSubItem != 0 && iSubItem != 6)
                             return CDRF_DODEFAULT;
 
                         const SearchResult& sr = searchResults[iItem];

@@ -66,17 +66,17 @@ Results are scored and sorted by match quality:
 
 Bonus points are added for:
 - **Case-sensitive match** (+15) — The keyword appears with exact casing in the filename
-- **WARP recency** (up to +25) — If [WARP](https://github.com/sumanthewhiz/WARP) is running, real user interaction data provides the strongest recency signal:
+- **WARP recency** (up to +125) — If [WARP](https://github.com/sumanthewhiz/WARP) is running, real user interaction data provides a **dominant** recency signal that intentionally outweighs match-type differences. A substring match on a file you opened today will rank above an exact match on a file you haven't touched in months:
 
   | WARP Activity Age | Bonus |
   |-------------------|-------|
-  | Today | +25 |
-  | Yesterday | +22 |
-  | Last 3 days | +20 |
-  | Last 7 days | +17 |
-  | Last 14 days | +14 |
-  | Last 30 days | +10 |
-  | Older than 30 days | +5 |
+  | Today | +125 |
+  | Yesterday | +110 |
+  | Last 3 days | +100 |
+  | Last 7 days | +85 |
+  | Last 14 days | +65 |
+  | Last 30 days | +40 |
+  | Older than 30 days | +15 |
 
 - **USN timestamp recency** (fallback, up to +10) — When WARP data is unavailable for a file, the MFT timestamp provides a weaker signal: +10 (last 7 days), +7 (last 30 days), +3 (last year), +0 (older or unknown)
 - **No recency info** (+0) — Files with neither WARP activity nor a USN timestamp receive no recency bonus and are ranked lowest
