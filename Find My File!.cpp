@@ -261,8 +261,18 @@ std::unordered_map<ULONGLONG, std::wstring> fullPathCache;
 // Cached timestamps (USN timestamp) for each file reference
 std::unordered_map<ULONGLONG, LARGE_INTEGER> timestampCache;
 
-// WARP file activity recency: lowercased full path -> most recent Unix timestamp (UTC)
-std::unordered_map<std::wstring, ULONGLONG> warpRecencyByPath;
+// WARP file activity recency: lowercased full path -> activity info.
+// Tracks both the most recent timestamp and whether the activity looks like
+// genuine user interaction vs. system-generated noise (Explorer thumbnails,
+// antivirus scans, etc.).
+struct WarpActivityInfo {
+    ULONGLONG timestamp;    // most recent Unix epoch seconds (UTC)
+    bool hasDirectAction;   // true if any CREATE/MODIFY/DELETE/RENAME was seen
+    int totalOpens;         // total OPEN events recorded for this path
+    int batchOpens;         // how many of those OPENs fell in a batch bucket
+                            // (>= BATCH_THRESHOLD siblings in same time window)
+};
+std::unordered_map<std::wstring, WarpActivityInfo> warpRecencyByPath;
 bool bWarpAvailable = false;  // true if WARP service responded on last query
 
 // Search result for display
@@ -1218,7 +1228,15 @@ static std::string WarpPipeQuery(const char* request)
 }
 
 // Parse WARP activity objects from JSON and merge into warpRecencyByPath.
-// Keeps the most recent timestamp per lowercased path.
+// Keeps the most recent timestamp per lowercased path.  Also collects OPEN
+// events for a post-processing pass that detects batch folder-browsing noise.
+struct WarpOpenEvent {
+    std::wstring path;       // lowercased full path
+    std::wstring parentDir;  // lowercased parent directory
+    ULONGLONG timestamp;
+};
+static std::vector<WarpOpenEvent> pendingOpenEvents;
+
 static void ParseWarpJson(const std::string& json)
 {
     size_t pos = 0;
@@ -1265,17 +1283,47 @@ static void ParseWarpJson(const std::string& json)
             }
         }
 
-        // Extract path
+        // Extract path and action
         std::string pathStr = JsonGetString(obj, "path");
+        std::string action = JsonGetString(obj, "action");
 
         if (!pathStr.empty() && ts > 0)
         {
+            bool isDirect = (action == "CREATE" || action == "MODIFY" ||
+                            action == "DELETE" || action == "RENAME");
+
             std::wstring wpath = Utf8ToWide(pathStr);
             for (auto& ch : wpath)
                 ch = towlower(ch);
             auto it = warpRecencyByPath.find(wpath);
-            if (it == warpRecencyByPath.end() || ts > it->second)
-                warpRecencyByPath[wpath] = ts;
+            if (it == warpRecencyByPath.end())
+            {
+                warpRecencyByPath[wpath] = { ts, isDirect, (action == "OPEN") ? 1 : 0, 0 };
+            }
+            else
+            {
+                if (ts > it->second.timestamp)
+                    it->second.timestamp = ts;
+                if (isDirect)
+                    it->second.hasDirectAction = true;
+                if (action == "OPEN")
+                    it->second.totalOpens++;
+            }
+
+            // Collect OPEN events for batch-detection post-processing
+            if (action == "OPEN")
+            {
+                // Extract parent directory from the lowercased path
+                size_t lastSep = wpath.rfind(L'\\');
+                if (lastSep != std::wstring::npos && lastSep > 0)
+                {
+                    WarpOpenEvent evt;
+                    evt.path = wpath;
+                    evt.parentDir = wpath.substr(0, lastSep);
+                    evt.timestamp = ts;
+                    pendingOpenEvents.push_back(std::move(evt));
+                }
+            }
         }
 
         pos = objEnd;
@@ -1291,6 +1339,7 @@ static void ParseWarpJson(const std::string& json)
 static void QueryWarpActivity()
 {
     warpRecencyByPath.clear();
+    pendingOpenEvents.clear();
     bWarpAvailable = false;
 
     // Query from shortest to longest.  Each response is capped at ~64 KB by
@@ -1327,6 +1376,51 @@ static void QueryWarpActivity()
         if (warpRecencyByPath.size() == prevSize && prevSize > 0)
             break;
     }
+
+    // --- Batch-OPEN detection ---
+    // When a user browses a folder in Explorer, the OS generates OPEN events
+    // for many sibling files within a tight time window (thumbnail generation,
+    // icon extraction, search indexer reads, antivirus scans).  These are not
+    // real user interactions and should not boost ranking.
+    //
+    // Strategy: group OPEN events by (parentDir, timestamp quantised to 3-second
+    // buckets).  If a bucket has >= 5 sibling OPENs, mark all of them as batch
+    // noise.  A genuine user open is typically 1–2 files, not a burst of many.
+
+    // Count OPENs per (parentDir, time-bucket)
+    const ULONGLONG BUCKET_SECS = 3;
+    const size_t BATCH_THRESHOLD = 5;
+    // key = parentDir + "|" + bucket_id_as_string
+    std::unordered_map<std::wstring, size_t> bucketCounts;
+    for (const auto& evt : pendingOpenEvents)
+    {
+        ULONGLONG bucket = evt.timestamp / BUCKET_SECS;
+        wchar_t bucketStr[24];
+        swprintf_s(bucketStr, 24, L"|%llu", bucket);
+        std::wstring key = evt.parentDir + bucketStr;
+        bucketCounts[key]++;
+    }
+
+    // Mark entries that belong to large buckets — increment batchOpens count
+    // per file for each of its OPEN events that falls in a batch bucket.
+    for (const auto& evt : pendingOpenEvents)
+    {
+        ULONGLONG bucket = evt.timestamp / BUCKET_SECS;
+        wchar_t bucketStr[24];
+        swprintf_s(bucketStr, 24, L"|%llu", bucket);
+        std::wstring key = evt.parentDir + bucketStr;
+
+        auto bc = bucketCounts.find(key);
+        if (bc != bucketCounts.end() && bc->second >= BATCH_THRESHOLD)
+        {
+            auto wit = warpRecencyByPath.find(evt.path);
+            if (wit != warpRecencyByPath.end())
+                wit->second.batchOpens++;
+        }
+    }
+
+    pendingOpenEvents.clear();
+    pendingOpenEvents.shrink_to_fit();
 }
 
 // Return the WARP-only recency bonus for a file (0 if no WARP data).
@@ -1359,13 +1453,31 @@ static int GetWarpRecencyBonus(ULONGLONG fileRef, ULONGLONG now)
     std::wstring lowerPath = filePath;
     for (auto& ch : lowerPath)
         ch = towlower(ch);
+
+    // Only match the file's own path — never inherit recency from a parent
+    // folder.  A file inside a recently-browsed directory gets no boost unless
+    // it was directly accessed.
     auto warpIt = warpRecencyByPath.find(lowerPath);
     if (warpIt == warpRecencyByPath.end())
         return 0;
 
+    // Files with CREATE/MODIFY/DELETE/RENAME always qualify.
+    // Files with OPEN-only qualify UNLESS *every* OPEN event was part of a
+    // batch of sibling files opened simultaneously (folder-browsing noise).
+    // A genuine user open typically also has at least one non-batch OPEN
+    // (e.g., the user opened the file at a different time than the folder
+    // was browsed, or the file was the only one opened in that time window).
+    if (!warpIt->second.hasDirectAction)
+    {
+        // OPEN-only entry: check if it has any non-batch opens
+        if (warpIt->second.totalOpens > 0 &&
+            warpIt->second.batchOpens >= warpIt->second.totalOpens)
+            return 0;  // all opens were batch noise — no genuine user interaction
+    }
+
     const ULONGLONG EPOCH_DIFF = 116444736000000000ULL;
     ULONGLONG nowUnix = (now > EPOCH_DIFF) ? (now - EPOCH_DIFF) / 10000000ULL : 0;
-    ULONGLONG warpTs = warpIt->second;
+    ULONGLONG warpTs = warpIt->second.timestamp;
 
     if (warpTs == 0 || nowUnix < warpTs)
         return 0;
@@ -3815,9 +3927,14 @@ void PopulateSearchResults()
             wcscpy_s(warpBuf, 16, L"\u2014");
         ListView_SetItemText(hListView, (int)i, 5, warpBuf);
 
+        // Total Score column
+        wchar_t scoreBuf[16] = {0};
+        swprintf_s(scoreBuf, 16, L"%d", sr.matchScore);
+        ListView_SetItemText(hListView, (int)i, 6, scoreBuf);
+
         // Snippet column — show content preview for Windows Search content matches
         if (!sr.contentSnippet.empty())
-            ListView_SetItemText(hListView, (int)i, 6, (LPWSTR)sr.contentSnippet.c_str());
+            ListView_SetItemText(hListView, (int)i, 7, (LPWSTR)sr.contentSnippet.c_str());
     }
 
     SendMessage(hListView, WM_SETREDRAW, TRUE, 0);
@@ -4634,9 +4751,14 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
                 ListView_InsertColumn(hListView, 5, &lvc);
 
                 lvc.iSubItem = 6;
+                lvc.pszText = (LPWSTR)L"Total Score";
+                lvc.cx = 80;
+                ListView_InsertColumn(hListView, 6, &lvc);
+
+                lvc.iSubItem = 7;
                 lvc.pszText = (LPWSTR)L"Snippet";
                 lvc.cx = 300;
-                ListView_InsertColumn(hListView, 6, &lvc);
+                ListView_InsertColumn(hListView, 7, &lvc);
 
                 // Attach the system small icon image list to the ListView
                 SHFILEINFOW sfi = {0};
@@ -4911,7 +5033,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
                 {
                     const SearchResult& sr = searchResults[idx];
                     const wchar_t* tipText = NULL;
-                    if (sub == 6 && !sr.contentSnippet.empty())
+                    if (sub == 7 && !sr.contentSnippet.empty())
                         tipText = sr.contentSnippet.c_str();
                     else if (sub == 2 && !sr.fullPath.empty())
                         tipText = sr.fullPath.c_str();
@@ -4942,8 +5064,8 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
                             return CDRF_DODEFAULT;
                         }
 
-                        // Custom-draw the Name column (subitem 0) and Snippet column (subitem 6)
-                        if (iSubItem != 0 && iSubItem != 6)
+                        // Custom-draw the Name column (subitem 0) and Snippet column (subitem 7)
+                        if (iSubItem != 0 && iSubItem != 7)
                             return CDRF_DODEFAULT;
 
                         const SearchResult& sr = searchResults[iItem];
