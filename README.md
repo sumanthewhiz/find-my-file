@@ -66,18 +66,7 @@ Results are scored and sorted by match quality:
 
 Bonus points are added for:
 - **Case-sensitive match** (+15) — The keyword appears with exact casing in the filename
-- **WARP recency** (up to +125) — If [WARP](https://github.com/sumanthewhiz/WARP) is running, real user interaction data provides a **dominant** recency signal that intentionally outweighs match-type differences. A substring match on a file you opened today will rank above an exact match on a file you haven't touched in months:
-
-  | WARP Activity Age | Bonus |
-  |-------------------|-------|
-  | Today | +125 |
-  | Yesterday | +110 |
-  | Last 3 days | +100 |
-  | Last 7 days | +85 |
-  | Last 14 days | +65 |
-  | Last 30 days | +40 |
-  | Older than 30 days | +15 |
-
+- **WARP recency** (up to +125) — If [WARP](https://github.com/sumanthewhiz/WARP) is running, its Inference Engine provides a precomputed `recency_score` (0–255) per file that combines exponential time-decay with 7-day access frequency. This score is mapped linearly to a 0–125 bonus. The large magnitude is intentional — it allows a substring match on a file you opened today to rank above an exact match on a file you haven't touched in months. Noise filtering (Explorer thumbnails, antivirus scans, etc.) is handled server-side by the WARP Inference Engine.
 - **USN timestamp recency** (fallback, up to +10) — When WARP data is unavailable for a file, the MFT timestamp provides a weaker signal: +10 (last 7 days), +7 (last 30 days), +3 (last year), +0 (older or unknown)
 - **No recency info** (+0) — Files with neither WARP activity nor a USN timestamp receive no recency bonus and are ranked lowest
 
@@ -195,7 +184,7 @@ The project links against: `comctl32.lib`, `shlwapi.lib`, `uxtheme.lib`, `ole32.
 | `sortedTokens` / `sortedStemTokens` | Sorted vectors of all index keys, enabling O(log N) prefix range queries via `std::lower_bound`. |
 | `fullPathCache` / `timestampCache` | Memoize expensive path-building walks and filesystem timestamp queries. |
 | `treeItemToRef` (`unordered_map<HTREEITEM, ULONGLONG>`) | Reverse map from Win32 tree items back to MFT references for on-demand expansion. |
-| `warpRecencyByPath` (`unordered_map<wstring, ULONGLONG>`) | Maps lowercased full paths to their most recent WARP activity timestamp (Unix epoch seconds). Populated once per drive scan via the WARP named pipe. |
+| `warpRecencyByPath` (`unordered_map<wstring, double>`) | Maps lowercased full paths to their WARP Inference Engine `recency_score` (0–255). Populated once per drive scan via the `GetInferenceDeltas` API. |
 
 ### MFT Reading Pipeline
 
@@ -207,7 +196,7 @@ The project links against: `comctl32.lib`, `shlwapi.lib`, `uxtheme.lib`, `ole32.
 6. Pre-compute `hasChildren` flags for all directories
 7. Build the search indexes (inverted, stemmed, trigram) with progress reporting
 8. Pre-populate `fullPathCache` for all files
-9. Query WARP for 30 days of file activity via the `\\\\\\.\\.\\pipe\\WarpFileActivityAPI` named pipe, populating `warpRecencyByPath`
+9. Query WARP's Inference Engine via `GetInferenceDeltas` on the `\\\\\\.\\.\\pipe\\WarpFileActivityAPI` named pipe, populating `warpRecencyByPath` with precomputed recency scores
 
 ### Live Monitoring
 
@@ -238,16 +227,19 @@ Results are capped at 10,000 via `std::partial_sort` and full paths are built on
 
 ### WARP Recency Integration
 
-[WARP](https://github.com/sumanthewhiz/WARP) (Windows Activity Recency Pipe) is an optional local service that records real file-interaction events (opens, edits, creates, deletes, renames) via ETW kernel tracing and exposes them through a named pipe API.
+[WARP](https://github.com/sumanthewhiz/WARP) (Windows Activity Reasoning Platform) is an optional local service that records real file-interaction events (opens, edits, creates, deletes, renames) and exposes precomputed per-file inference data through a named pipe API.
 
 **How it works:**
 
 1. After building the search index, `QueryWarpActivity()` connects to `\\.\pipe\WarpFileActivityAPI`
-2. Sends `{"window":"30d"}` to request the last 30 days of activity
-3. Parses the JSON response and populates `warpRecencyByPath` — a map from lowercased file path to the most recent Unix timestamp
-4. During search scoring, `GetRecencyBonus()` first checks `warpRecencyByPath` for the file's full path. If found, the WARP timestamp provides a strong bonus (up to +25 for files accessed today)
-5. If no WARP data exists for a file, the function falls back to the USN journal timestamp (weaker signal, up to +10)
-6. Files with no recency information at all receive +0, ensuring they sort below any file that has activity data
+2. Sends `{"op":"GetInferenceDeltas","since_version":0}` to bulk-load all inference records, paging through batches of up to 5,000 records
+3. Filters for `entity_type == "file"` and extracts each file's `recency_score` — a composite value (0–255) computed server-side using the formula: `200 × e^(−Δt / 172800) + 5 × ln(1 + open_count_7d)`
+4. Populates `warpRecencyByPath` — a map from lowercased file path to its `recency_score`
+5. During search scoring, `GetWarpRecencyBonus()` looks up the file's path and linearly maps the score to a 0–125 bonus: `bonus = score × 125 / 255`
+6. If no WARP data exists for a file, the function falls back to the USN journal timestamp (weaker signal, up to +10)
+7. Files with no recency information at all receive +0, ensuring they sort below any file that has activity data
+
+**Advantages over raw event processing:** The Inference Engine handles noise filtering (Explorer thumbnails, antivirus scans, system-generated opens) server-side, provides exponential time-decay rather than discrete day-based tiers, and factors in access frequency — not just recency. A single API call replaces the previous approach of querying multiple time windows and performing client-side batch-OPEN detection.
 
 **Graceful degradation:** If WARP is not running (the named pipe doesn't exist), the connection simply fails and the app falls back entirely to USN timestamp-based recency — no error dialogs, no user action required. The status bar shows "WARP ✔" when WARP data is active.
 

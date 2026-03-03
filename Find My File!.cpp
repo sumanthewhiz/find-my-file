@@ -261,18 +261,11 @@ std::unordered_map<ULONGLONG, std::wstring> fullPathCache;
 // Cached timestamps (USN timestamp) for each file reference
 std::unordered_map<ULONGLONG, LARGE_INTEGER> timestampCache;
 
-// WARP file activity recency: lowercased full path -> activity info.
-// Tracks both the most recent timestamp and whether the activity looks like
-// genuine user interaction vs. system-generated noise (Explorer thumbnails,
-// antivirus scans, etc.).
-struct WarpActivityInfo {
-    ULONGLONG timestamp;    // most recent Unix epoch seconds (UTC)
-    bool hasDirectAction;   // true if any CREATE/MODIFY/DELETE/RENAME was seen
-    int totalOpens;         // total OPEN events recorded for this path
-    int batchOpens;         // how many of those OPENs fell in a batch bucket
-                            // (>= BATCH_THRESHOLD siblings in same time window)
-};
-std::unordered_map<std::wstring, WarpActivityInfo> warpRecencyByPath;
+// WARP inference data: lowercased full path -> precomputed recency_score.
+// The score (0–255) is computed server-side by the WARP Inference Engine using
+// exponential time-decay and 7-day access frequency.  Higher = more recent/frequent.
+// Populated via the GetInferenceDeltas API on each drive scan.
+std::unordered_map<std::wstring, double> warpRecencyByPath;
 bool bWarpAvailable = false;  // true if WARP service responded on last query
 
 // Search result for display
@@ -1227,41 +1220,31 @@ static std::string WarpPipeQuery(const char* request)
     return json;
 }
 
-// Parse WARP v2.0 response JSON and merge file events into warpRecencyByPath.
-// v2.0 structure: {"file_activities":{"count":N,"events":[{...},...]}, ...}
-// Keeps the most recent timestamp per lowercased path.  Also collects OPEN
-// events for a post-processing pass that detects batch folder-browsing noise.
-struct WarpOpenEvent {
-    std::wstring path;       // lowercased full path
-    std::wstring parentDir;  // lowercased parent directory
-    ULONGLONG timestamp;
-};
-static std::vector<WarpOpenEvent> pendingOpenEvents;
-
-static void ParseWarpJson(const std::string& json)
+// Parse the WARP GetInferenceDeltas response and populate warpRecencyByPath
+// with precomputed recency_score values for file entities.
+// Response format: {"now":..., "deltas":[{"entity_key":"...","entity_type":"file",
+//   "recency_score":187.3, ...}, ...]}
+static void ParseWarpInferenceDeltas(const std::string& json)
 {
-    // Locate the "file_activities" section, then the "events" array within it.
-    // This avoids accidentally parsing timestamps from app_launch or browsing
-    // sections if the response contains multiple event types.
-    size_t faPos = json.find("\"file_activities\"");
-    size_t eventsPos = std::string::npos;
-    if (faPos != std::string::npos)
-        eventsPos = json.find("\"events\"", faPos);
+    // Locate the "deltas" array
+    size_t deltasPos = json.find("\"deltas\"");
+    if (deltasPos == std::string::npos)
+        return;
 
-    // Find the '[' that starts the events array
+    // Find the '[' that starts the deltas array
     size_t arrayStart = std::string::npos;
-    if (eventsPos != std::string::npos)
     {
-        size_t p = eventsPos + 8; // skip past '"events"'
+        size_t p = deltasPos + 8; // skip past '"deltas"'
         while (p < json.size() && (json[p] == ' ' || json[p] == ':' || json[p] == '\t' || json[p] == '\n' || json[p] == '\r'))
             p++;
         if (p < json.size() && json[p] == '[')
             arrayStart = p;
     }
+    if (arrayStart == std::string::npos)
+        return;
 
-    // Find the matching ']' for the events array
+    // Find the matching ']'
     size_t arrayEnd = json.size();
-    if (arrayStart != std::string::npos)
     {
         int depth = 0;
         for (size_t i = arrayStart; i < json.size(); i++)
@@ -1271,95 +1254,63 @@ static void ParseWarpJson(const std::string& json)
         }
     }
 
-    // Determine the parse region: either within the events array, or
-    // fall back to the entire JSON for backward compatibility with v1.0
-    // responses that used a flat {"activities":[...]} structure.
-    size_t parseStart = (arrayStart != std::string::npos) ? arrayStart : 0;
-    size_t parseEnd = (arrayStart != std::string::npos) ? arrayEnd : json.size();
-
-    size_t pos = parseStart;
-    while (pos < parseEnd)
+    // Iterate over each object in the deltas array
+    size_t pos = arrayStart;
+    while (pos < arrayEnd)
     {
-        // Find next "timestamp" key within the parse region
-        size_t tsPos = json.find("\"timestamp\"", pos);
-        if (tsPos == std::string::npos || tsPos >= parseEnd) break;
-
-        // Find the enclosing object start
-        size_t objStart = json.rfind('{', tsPos);
-        if (objStart == std::string::npos || objStart < parseStart) { pos = tsPos + 11; continue; }
+        // Find next '{' for an object
+        size_t objStart = json.find('{', pos);
+        if (objStart == std::string::npos || objStart >= arrayEnd) break;
 
         // Find matching '}'
         int depth = 0;
         size_t objEnd = objStart;
-        for (size_t i = objStart; i < parseEnd; i++)
+        for (size_t i = objStart; i < arrayEnd; i++)
         {
             if (json[i] == '{') depth++;
             else if (json[i] == '}') { depth--; if (depth == 0) { objEnd = i + 1; break; } }
         }
-
-        // If we couldn't find a matching '}', the JSON was likely truncated — stop.
         if (depth != 0)
             break;
 
         std::string obj = json.substr(objStart, objEnd - objStart);
 
-        // Extract timestamp (integer value after "timestamp":)
-        ULONGLONG ts = 0;
+        // Only process file entities
+        std::string entityType = JsonGetString(obj, "entity_type");
+        if (entityType == "file")
         {
-            std::string tsKey = "\"timestamp\"";
-            size_t kp = obj.find(tsKey);
-            if (kp != std::string::npos)
+            std::string entityKey = JsonGetString(obj, "entity_key");
+            if (!entityKey.empty())
             {
-                kp += tsKey.size();
-                while (kp < obj.size() && (obj[kp] == ' ' || obj[kp] == ':' || obj[kp] == '\t'))
-                    kp++;
-                while (kp < obj.size() && obj[kp] >= '0' && obj[kp] <= '9')
+                // Extract recency_score (a floating-point number)
+                double score = 0.0;
                 {
-                    ts = ts * 10 + (obj[kp] - '0');
-                    kp++;
+                    std::string needle = "\"recency_score\"";
+                    size_t kp = obj.find(needle);
+                    if (kp != std::string::npos)
+                    {
+                        kp += needle.size();
+                        while (kp < obj.size() && (obj[kp] == ' ' || obj[kp] == ':' || obj[kp] == '\t'))
+                            kp++;
+                        // Parse the number (may be integer or float)
+                        std::string numStr;
+                        while (kp < obj.size() && (obj[kp] == '-' || obj[kp] == '+' ||
+                               obj[kp] == '.' || (obj[kp] >= '0' && obj[kp] <= '9') ||
+                               obj[kp] == 'e' || obj[kp] == 'E'))
+                        {
+                            numStr += obj[kp];
+                            kp++;
+                        }
+                        if (!numStr.empty())
+                            score = atof(numStr.c_str());
+                    }
                 }
-            }
-        }
 
-        // Extract path and action
-        std::string pathStr = JsonGetString(obj, "path");
-        std::string action = JsonGetString(obj, "action");
-
-        if (!pathStr.empty() && ts > 0)
-        {
-            bool isDirect = (action == "CREATE" || action == "MODIFY" ||
-                            action == "DELETE" || action == "RENAME");
-
-            std::wstring wpath = Utf8ToWide(pathStr);
-            for (auto& ch : wpath)
-                ch = towlower(ch);
-            auto it = warpRecencyByPath.find(wpath);
-            if (it == warpRecencyByPath.end())
-            {
-                warpRecencyByPath[wpath] = { ts, isDirect, (action == "OPEN") ? 1 : 0, 0 };
-            }
-            else
-            {
-                if (ts > it->second.timestamp)
-                    it->second.timestamp = ts;
-                if (isDirect)
-                    it->second.hasDirectAction = true;
-                if (action == "OPEN")
-                    it->second.totalOpens++;
-            }
-
-            // Collect OPEN events for batch-detection post-processing
-            if (action == "OPEN")
-            {
-                // Extract parent directory from the lowercased path
-                size_t lastSep = wpath.rfind(L'\\');
-                if (lastSep != std::wstring::npos && lastSep > 0)
+                if (score > 0.0)
                 {
-                    WarpOpenEvent evt;
-                    evt.path = wpath;
-                    evt.parentDir = wpath.substr(0, lastSep);
-                    evt.timestamp = ts;
-                    pendingOpenEvents.push_back(std::move(evt));
+                    // entity_key is already lowercase from WARP
+                    std::wstring wpath = Utf8ToWide(entityKey);
+                    warpRecencyByPath[wpath] = score;
                 }
             }
         }
@@ -1368,107 +1319,78 @@ static void ParseWarpJson(const std::string& json)
     }
 }
 
-// Query the WARP file activity service via named pipe.
-// Queries progressively longer time windows (24h ? 7d ? 15d ? 30d) and merges
-// results.  Shorter windows are queried first so that recent data is always
-// captured even if a longer window's response is truncated at the 64 KB pipe
-// message limit.  Results are merged — the map keeps max(timestamp) per path,
-// so overlapping windows are harmless.
+// Query WARP's Inference Engine for precomputed recency scores via the
+// GetInferenceDeltas API.  This replaces the old approach of reading raw
+// file events and computing scores client-side.  The Inference Engine
+// provides a composite recency_score (0-255) that combines exponential
+// time-decay with 7-day access frequency, with noise filtering handled
+// server-side.
 static void QueryWarpActivity()
 {
     warpRecencyByPath.clear();
-    pendingOpenEvents.clear();
     bWarpAvailable = false;
 
-    // Query from shortest to longest.  Each response is capped at ~64 KB by
-    // WARP, so shorter windows are more likely to contain complete data.  We
-    // merge all results to build the fullest picture possible.
-    // The "types":["file"] filter (WARP API v2.0) requests only file events,
-    // avoiding unnecessary app_launch and browsing data in the response.
-    static const char* windows[] = {
-        "{\"window\":\"24h\",\"types\":[\"file\"]}",
-        "{\"window\":\"7d\",\"types\":[\"file\"]}",
-        "{\"window\":\"15d\",\"types\":[\"file\"]}",
-        "{\"window\":\"30d\",\"types\":[\"file\"]}",
-    };
-
-    for (const char* req : windows)
+    // Use GetInferenceDeltas with since_version=0 to bulk-load all records.
+    // The response contains up to 5000 records per call; we loop to page
+    // through all of them.
+    ULONGLONG sinceVersion = 0;
+    for (;;)
     {
-        std::string json = WarpPipeQuery(req);
+        char request[128];
+        sprintf_s(request, sizeof(request),
+            "{\"op\":\"GetInferenceDeltas\",\"since_version\":%llu}", sinceVersion);
+
+        std::string json = WarpPipeQuery(request);
         if (json.empty())
         {
-            // If even the first query fails, WARP isn't running.
             if (!bWarpAvailable)
-                return;
-            // Otherwise a longer window just failed — stop extending, keep
-            // whatever we already collected from shorter windows.
+                return;  // WARP not running
             break;
         }
 
         bWarpAvailable = true;
         size_t prevSize = warpRecencyByPath.size();
-        ParseWarpJson(json);
+        ParseWarpInferenceDeltas(json);
 
-        // If a longer window didn't add any new paths beyond what we already
-        // had, it means either (a) there's no older data, or (b) the response
-        // was truncated and only contained duplicates we already have.  In
-        // either case, stop — querying an even longer window won't help.
-        if (warpRecencyByPath.size() == prevSize && prevSize > 0)
-            break;
-    }
-
-    // --- Batch-OPEN detection ---
-    // When a user browses a folder in Explorer, the OS generates OPEN events
-    // for many sibling files within a tight time window (thumbnail generation,
-    // icon extraction, search indexer reads, antivirus scans).  These are not
-    // real user interactions and should not boost ranking.
-    //
-    // Strategy: group OPEN events by (parentDir, timestamp quantised to 3-second
-    // buckets).  If a bucket has >= 5 sibling OPENs, mark all of them as batch
-    // noise.  A genuine user open is typically 1–2 files, not a burst of many.
-
-    // Count OPENs per (parentDir, time-bucket)
-    const ULONGLONG BUCKET_SECS = 3;
-    const size_t BATCH_THRESHOLD = 5;
-    // key = parentDir + "|" + bucket_id_as_string
-    std::unordered_map<std::wstring, size_t> bucketCounts;
-    for (const auto& evt : pendingOpenEvents)
-    {
-        ULONGLONG bucket = evt.timestamp / BUCKET_SECS;
-        wchar_t bucketStr[24];
-        swprintf_s(bucketStr, 24, L"|%llu", bucket);
-        std::wstring key = evt.parentDir + bucketStr;
-        bucketCounts[key]++;
-    }
-
-    // Mark entries that belong to large buckets — increment batchOpens count
-    // per file for each of its OPEN events that falls in a batch bucket.
-    for (const auto& evt : pendingOpenEvents)
-    {
-        ULONGLONG bucket = evt.timestamp / BUCKET_SECS;
-        wchar_t bucketStr[24];
-        swprintf_s(bucketStr, 24, L"|%llu", bucket);
-        std::wstring key = evt.parentDir + bucketStr;
-
-        auto bc = bucketCounts.find(key);
-        if (bc != bucketCounts.end() && bc->second >= BATCH_THRESHOLD)
+        // Find the highest version in this batch to use as watermark for next page.
+        // Look for the last "version": value in the response.
+        ULONGLONG maxVersion = sinceVersion;
         {
-            auto wit = warpRecencyByPath.find(evt.path);
-            if (wit != warpRecencyByPath.end())
-                wit->second.batchOpens++;
+            size_t searchPos = 0;
+            for (;;)
+            {
+                size_t vp = json.find("\"version\"", searchPos);
+                if (vp == std::string::npos) break;
+                vp += 9; // skip past '"version"'
+                while (vp < json.size() && (json[vp] == ' ' || json[vp] == ':' || json[vp] == '\t'))
+                    vp++;
+                ULONGLONG v = 0;
+                while (vp < json.size() && json[vp] >= '0' && json[vp] <= '9')
+                {
+                    v = v * 10 + (json[vp] - '0');
+                    vp++;
+                }
+                if (v > maxVersion)
+                    maxVersion = v;
+                searchPos = vp;
+            }
         }
-    }
 
-    pendingOpenEvents.clear();
-    pendingOpenEvents.shrink_to_fit();
+        // If no new records were added or version didn't advance, we're done
+        if (warpRecencyByPath.size() == prevSize || maxVersion == sinceVersion)
+            break;
+
+        sinceVersion = maxVersion;
+    }
 }
 
 // Return the WARP-only recency bonus for a file (0 if no WARP data).
-// Returns up to +125 for files accessed today.  The large magnitude is
-// intentional — it allows recent WARP activity to promote a weaker match
-// type (e.g. substring) above a stronger match type (e.g. exact) that has
-// no recent activity.  'now' is the current time as a 64-bit FILETIME value.
-static int GetWarpRecencyBonus(ULONGLONG fileRef, ULONGLONG now)
+// Maps the Inference Engine's precomputed recency_score (0-255) linearly
+// to a 0-125 bonus range.  The large magnitude is intentional — it allows
+// recent WARP activity to promote a weaker match type (e.g. substring)
+// above a stronger match type (e.g. exact) that has no recent activity.
+// 'now' is unused but kept for API compatibility with GetRecencyBonus.
+static int GetWarpRecencyBonus(ULONGLONG fileRef, ULONGLONG /*now*/)
 {
     if (!bWarpAvailable || warpRecencyByPath.empty())
         return 0;
@@ -1494,54 +1416,26 @@ static int GetWarpRecencyBonus(ULONGLONG fileRef, ULONGLONG now)
     for (auto& ch : lowerPath)
         ch = towlower(ch);
 
-    // Only match the file's own path — never inherit recency from a parent
-    // folder.  A file inside a recently-browsed directory gets no boost unless
-    // it was directly accessed.
     auto warpIt = warpRecencyByPath.find(lowerPath);
     if (warpIt == warpRecencyByPath.end())
         return 0;
 
-    // Files with CREATE/MODIFY/DELETE/RENAME always qualify.
-    // Files with OPEN-only qualify UNLESS *every* OPEN event was part of a
-    // batch of sibling files opened simultaneously (folder-browsing noise).
-    // A genuine user open typically also has at least one non-batch OPEN
-    // (e.g., the user opened the file at a different time than the folder
-    // was browsed, or the file was the only one opened in that time window).
-    if (!warpIt->second.hasDirectAction)
-    {
-        // OPEN-only entry: check if it has any non-batch opens
-        if (warpIt->second.totalOpens > 0 &&
-            warpIt->second.batchOpens >= warpIt->second.totalOpens)
-            return 0;  // all opens were batch noise — no genuine user interaction
-    }
-
-    const ULONGLONG EPOCH_DIFF = 116444736000000000ULL;
-    ULONGLONG nowUnix = (now > EPOCH_DIFF) ? (now - EPOCH_DIFF) / 10000000ULL : 0;
-    ULONGLONG warpTs = warpIt->second.timestamp;
-
-    if (warpTs == 0 || nowUnix < warpTs)
+    // Map recency_score (0-255) to bonus (0-125).
+    // The WARP formula: 200 * e^(-dt/172800) + 5 * ln(1 + open_count_7d)
+    // yields ~205 for a file opened right now with high frequency, decaying
+    // toward 0 over days.  We cap at 255 and scale linearly.
+    double score = warpIt->second;
+    if (score <= 0.0)
         return 0;
-
-    ULONGLONG ageSec = nowUnix - warpTs;
-    const ULONGLONG SECS_PER_DAY = 86400ULL;
-    ULONGLONG daysOld = ageSec / SECS_PER_DAY;
-
-    if (daysOld == 0)   return 125;  // today
-    if (daysOld <= 1)   return 110;  // yesterday
-    if (daysOld <= 3)   return 100;  // last 3 days
-    if (daysOld <= 7)   return 85;   // last week
-    if (daysOld <= 14)  return 65;   // last 2 weeks
-    if (daysOld <= 30)  return 40;   // last month
-    return 15;                        // older WARP activity
+    if (score > 255.0)
+        score = 255.0;
+    return (int)(score * 125.0 / 255.0 + 0.5);
 }
 
-// Compute a recency bonus based on WARP activity signals and USN timestamp.
-// WARP provides real user interaction data (open, modify, create) and is the
-// primary signal. Files with WARP activity get a strong bonus (up to 125)
-// that intentionally outweighs match-type differences so recently-used files
-// surface above stale exact matches.
-// Files with only USN timestamps get a smaller bonus (up to 10).
-// Files with no recency information at all get 0 (ranked lowest).
+// Compute a recency bonus based on WARP Inference Engine scores and USN timestamp.
+// WARP's precomputed recency_score (combining time-decay + access frequency) is
+// the primary signal, mapped to a 0-125 bonus.  Files with only USN timestamps
+// get a smaller bonus (up to 10).  Files with no recency information get 0.
 // 'now' is the current time as a 64-bit FILETIME value.
 static int GetRecencyBonus(ULONGLONG fileRef, ULONGLONG now)
 {
