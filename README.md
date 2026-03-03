@@ -20,7 +20,7 @@ A high-performance Windows desktop application that reads the NTFS Master File T
   - **Fuzzy/typo-tolerant match** — Levenshtein edit distance matching (max distance 1 for keywords 4–6 chars, max distance 2 for 7+ chars) catches common misspellings; exact matches always rank higher
 - **Scoped searches** — Select any folder in the tree view to restrict search results to that subtree
 - **Live filesystem monitoring** — Background USN journal polling detects file creates, deletes, and renames in real time and updates the index incrementally
-- **WARP-powered recency ranking** — Integrates with [WARP](https://github.com/sumanthewhiz/WARP) (Windows Activity Recency Pipe) to obtain real file-interaction signals (opens, edits, creates) from the last 30 days. Files with recent WARP activity are strongly promoted in search ranking; files with no recency information are ranked lowest. Gracefully degrades when WARP is not running.
+- **WARP-powered recency ranking** — Integrates with [WARP](https://github.com/sumanthewhiz/WARP) (Windows Activity Reasoning Platform) to obtain real file-interaction signals (opens, edits, creates) from the last 30 days. Files with recent WARP activity are strongly promoted in search ranking; files with no recency information are ranked lowest. Gracefully degrades when WARP is not running.
 
 ### Windows Search Integration
 - **Full-text content search** — The "Find with Windows Search" button queries the Windows Search Indexer via OLE DB, searching both filenames (`LIKE`) and file contents (`CONTAINS`)
