@@ -1227,7 +1227,8 @@ static std::string WarpPipeQuery(const char* request)
     return json;
 }
 
-// Parse WARP activity objects from JSON and merge into warpRecencyByPath.
+// Parse WARP v2.0 response JSON and merge file events into warpRecencyByPath.
+// v2.0 structure: {"file_activities":{"count":N,"events":[{...},...]}, ...}
 // Keeps the most recent timestamp per lowercased path.  Also collects OPEN
 // events for a post-processing pass that detects batch folder-browsing noise.
 struct WarpOpenEvent {
@@ -1239,21 +1240,58 @@ static std::vector<WarpOpenEvent> pendingOpenEvents;
 
 static void ParseWarpJson(const std::string& json)
 {
-    size_t pos = 0;
-    while (pos < json.size())
+    // Locate the "file_activities" section, then the "events" array within it.
+    // This avoids accidentally parsing timestamps from app_launch or browsing
+    // sections if the response contains multiple event types.
+    size_t faPos = json.find("\"file_activities\"");
+    size_t eventsPos = std::string::npos;
+    if (faPos != std::string::npos)
+        eventsPos = json.find("\"events\"", faPos);
+
+    // Find the '[' that starts the events array
+    size_t arrayStart = std::string::npos;
+    if (eventsPos != std::string::npos)
     {
-        // Find next "timestamp" key
+        size_t p = eventsPos + 8; // skip past '"events"'
+        while (p < json.size() && (json[p] == ' ' || json[p] == ':' || json[p] == '\t' || json[p] == '\n' || json[p] == '\r'))
+            p++;
+        if (p < json.size() && json[p] == '[')
+            arrayStart = p;
+    }
+
+    // Find the matching ']' for the events array
+    size_t arrayEnd = json.size();
+    if (arrayStart != std::string::npos)
+    {
+        int depth = 0;
+        for (size_t i = arrayStart; i < json.size(); i++)
+        {
+            if (json[i] == '[') depth++;
+            else if (json[i] == ']') { depth--; if (depth == 0) { arrayEnd = i + 1; break; } }
+        }
+    }
+
+    // Determine the parse region: either within the events array, or
+    // fall back to the entire JSON for backward compatibility with v1.0
+    // responses that used a flat {"activities":[...]} structure.
+    size_t parseStart = (arrayStart != std::string::npos) ? arrayStart : 0;
+    size_t parseEnd = (arrayStart != std::string::npos) ? arrayEnd : json.size();
+
+    size_t pos = parseStart;
+    while (pos < parseEnd)
+    {
+        // Find next "timestamp" key within the parse region
         size_t tsPos = json.find("\"timestamp\"", pos);
-        if (tsPos == std::string::npos) break;
+        if (tsPos == std::string::npos || tsPos >= parseEnd) break;
 
         // Find the enclosing object start
         size_t objStart = json.rfind('{', tsPos);
-        if (objStart == std::string::npos) { pos = tsPos + 11; continue; }
+        if (objStart == std::string::npos || objStart < parseStart) { pos = tsPos + 11; continue; }
 
         // Find matching '}'
         int depth = 0;
         size_t objEnd = objStart;
-        for (size_t i = objStart; i < json.size(); i++)
+        for (size_t i = objStart; i < parseEnd; i++)
         {
             if (json[i] == '{') depth++;
             else if (json[i] == '}') { depth--; if (depth == 0) { objEnd = i + 1; break; } }
@@ -1345,11 +1383,13 @@ static void QueryWarpActivity()
     // Query from shortest to longest.  Each response is capped at ~64 KB by
     // WARP, so shorter windows are more likely to contain complete data.  We
     // merge all results to build the fullest picture possible.
+    // The "types":["file"] filter (WARP API v2.0) requests only file events,
+    // avoiding unnecessary app_launch and browsing data in the response.
     static const char* windows[] = {
-        "{\"window\":\"24h\"}",
-        "{\"window\":\"7d\"}",
-        "{\"window\":\"15d\"}",
-        "{\"window\":\"30d\"}",
+        "{\"window\":\"24h\",\"types\":[\"file\"]}",
+        "{\"window\":\"7d\",\"types\":[\"file\"]}",
+        "{\"window\":\"15d\",\"types\":[\"file\"]}",
+        "{\"window\":\"30d\",\"types\":[\"file\"]}",
     };
 
     for (const char* req : windows)
