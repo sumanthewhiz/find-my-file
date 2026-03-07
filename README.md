@@ -19,6 +19,7 @@ A high-performance Windows desktop application that reads the NTFS Master File T
   - **Wildcard/glob patterns** — Supports `*` and `?` with trigram-accelerated pre-filtering
   - **Fuzzy/typo-tolerant match** — Levenshtein edit distance matching (max distance 1 for keywords 4–6 chars, max distance 2 for 7+ chars) catches common misspellings; exact matches always rank higher
 - **Scoped searches** — Select any folder in the tree view to restrict search results to that subtree
+- **Persistent index cache** — On exit, the in-memory file map is saved to `%APPDATA%\FindMyFile\index.db` as a compact binary file. On the next launch, the cached index is loaded automatically — the window appears instantly and the search indexes are rebuilt in-memory in 1–3 seconds, skipping the MFT scan entirely. If no cache exists, the app falls back to a manual drive scan.
 - **Live filesystem monitoring** — Background USN journal polling detects file creates, deletes, and renames in real time and updates the index incrementally
 - **WARP-powered recency ranking** — Integrates with [WARP](https://github.com/sumanthewhiz/WARP) (Windows Activity Reasoning Platform) to obtain real file-interaction signals (opens, edits, creates) from the last 30 days. Files with recent WARP activity are strongly promoted in search ranking; files with no recency information are ranked lowest. Gracefully degrades when WARP is not running.
 
@@ -97,7 +98,7 @@ The project links against: `comctl32.lib`, `shlwapi.lib`, `uxtheme.lib`, `ole32.
 ### Basic Workflow
 
 1. **Launch** the application as Administrator
-2. **Click a drive button** (e.g., "Scan C:") to read the MFT and build the file tree
+2. If a cached index exists from a previous session, it loads automatically — the tree view populates and Find buttons enable within seconds, with no manual scan required. Otherwise, **click a drive button** (e.g., "Scan C:") to read the MFT and build the file tree.
 3. **Browse** using the tree view (Browse tab) — nodes expand on demand
 4. **Search** by typing in the search box:
    - The **Find** button uses the MFT-based inverted index (fastest, filename only)
@@ -185,6 +186,7 @@ The project links against: `comctl32.lib`, `shlwapi.lib`, `uxtheme.lib`, `ole32.
 | `fullPathCache` / `timestampCache` | Memoize expensive path-building walks and filesystem timestamp queries. |
 | `treeItemToRef` (`unordered_map<HTREEITEM, ULONGLONG>`) | Reverse map from Win32 tree items back to MFT references for on-demand expansion. |
 | `warpRecencyByPath` (`unordered_map<wstring, double>`) | Maps lowercased full paths to their WARP Inference Engine `recency_score` (0–255). Populated once per drive scan via the `GetInferenceDeltas` API. |
+| `index.db` (binary file) | Persistent on-disk cache at `%APPDATA%\FindMyFile\index.db`. Stores `fileMap` entries and timestamps in a compact v2 binary format. Loaded via memory-mapped I/O on startup; saved via buffered writes on exit. |
 
 ### MFT Reading Pipeline
 
@@ -243,6 +245,36 @@ Results are capped at 10,000 via `std::partial_sort` and full paths are built on
 
 **Graceful degradation:** If WARP is not running (the named pipe doesn't exist), the connection simply fails and the app falls back entirely to USN timestamp-based recency — no error dialogs, no user action required. The status bar shows "WARP ✔" when WARP data is active.
 
+### Index Persistence
+
+The app saves the in-memory file index to disk on exit so subsequent launches can skip the MFT scan.
+
+**Binary format v2** (`%APPDATA%\FindMyFile\index.db`):
+
+| Section | Contents |
+|---------|----------|
+| Header | 8-byte magic (`FMF_IDX\0`), 4-byte format version (2) |
+| Drive | 4-byte length + wchar_t drive letter |
+| File entries | 4-byte count, then per entry: 8-byte fileReference, 8-byte parentReference, 1-byte isDirectory, 8-byte timestamp, 2-byte fileName length + wchar_t fileName |
+
+Only `fileMap` and `timestampCache` are persisted. The inverted, stemmed, and trigram search indexes are **not** serialized — they are rebuilt from `fileMap` via `BuildSearchIndex()` on load, which takes 1–3 seconds in-memory. This is far faster than the previous approach of serializing and deserializing the indexes with millions of individual I/O operations.
+
+**Save path** (`SaveIndexToFile`, called from `WM_DESTROY`):
+- Uses a `BufferedWriter` with a 4 MB buffer that coalesces millions of tiny field writes into a small number of large `WriteFile` calls
+- Writes to a `.tmp` file first, then does an atomic rename for crash safety
+
+**Load path** (`LoadIndexFromFile`, called from `WM_LOAD_CACHED_INDEX`):
+- Uses memory-mapped I/O (`CreateFileMapping` + `MapViewOfFile`) for zero-copy, zero-syscall-per-record reads
+- Walks the mapped region with pointer arithmetic — no per-field `ReadFile` calls
+- After loading `fileMap`, calls `BuildSearchIndex()` to rebuild all search indexes, then pre-populates `fullPathCache`
+
+**Deferred startup loading:**
+- `WM_CREATE` posts a `WM_LOAD_CACHED_INDEX` message to itself and returns immediately, so the window appears instantly
+- The actual index load runs when the message loop processes `WM_LOAD_CACHED_INDEX`, after the window is visible and painted
+- A "Loading cached index..." status message is displayed during the load
+
+**Graceful fallback:** If no `index.db` exists (first launch) or the file is corrupted / has a version mismatch, the app behaves normally — Find buttons stay disabled until the user clicks a drive scan button.
+
 ### Theming
 
 Two complete `ColorScheme` structs (22 colors each) define the light and dark palettes. `ApplyTheme` propagates colors to all controls, including Explorer dark-mode themes on the tree and list views. All buttons are owner-drawn (`BS_OWNERDRAW` + `WM_DRAWITEM`) with rounded corners, hover brightening, and press darkening.
@@ -254,6 +286,7 @@ Two complete `ColorScheme` structs (22 colors each) define the light and dark pa
 | Metric | Typical Value |
 |--------|---------------|
 | MFT scan time (C: drive, ~4M files) | 2–5 seconds |
+| Cached index load (memory-mapped) | 1–4 seconds (skips MFT scan) |
 | Search index build time | 1–3 seconds |
 | Search latency (inverted index) | < 50 ms |
 | Search latency (trigram substring) | < 200 ms |
@@ -279,6 +312,13 @@ Find My File!/
 ??? small.ico                  # Small application icon
 ??? README.md                  # This file
 ```
+
+**Runtime data** (created automatically under `%APPDATA%\FindMyFile\`):
+
+| File | Purpose |
+|------|---------|
+| `index.db` | Persistent binary cache of the file index (v2 format, memory-mapped on load) |
+| `cloud_tokens.ini` | OAuth credentials and tokens for cloud storage providers |
 
 The entire application is implemented in a single `.cpp` file with no external dependencies beyond the Windows SDK and system libraries.
 

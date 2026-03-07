@@ -55,6 +55,7 @@
 #define USN_POLL_MS         2000
 #define WM_USN_UPDATED      (WM_USER + 1)
 #define WM_OAUTH_COMPLETE   (WM_USER + 2)
+#define WM_LOAD_CACHED_INDEX (WM_USER + 3)
 #define IDC_PROPERTIES      7000
 #define IDC_PROP_TOGGLE     7001
 #define PROPERTIES_PANEL_W  420
@@ -336,6 +337,9 @@ static std::string  JsonGetString(const std::string& json, const std::string& ke
 static std::vector<SearchResult> JsonParseOneDriveResults(const std::string& json);
 static std::vector<SearchResult> JsonParseGoogleDriveResults(const std::string& json);
 static void QueryWarpActivity();
+static std::wstring GetIndexDbPath();
+static bool SaveIndexToFile();
+static bool LoadIndexFromFile();
 
 // Update the tooltip text for the properties toggle button to reflect its current action.
 static void UpdateToggleTooltip()
@@ -1382,6 +1386,306 @@ static void QueryWarpActivity()
 
         sinceVersion = maxVersion;
     }
+}
+
+// ---------------------------------------------------------------------------
+// Index persistence — save/load fileMap + timestamps to disk so subsequent
+// launches can skip the MFT scan.  Search indexes (inverted, stemmed,
+// trigram) are rebuilt from fileMap via BuildSearchIndex() on load — this is
+// far faster than serialising and deserialising them with millions of I/O
+// operations.
+// ---------------------------------------------------------------------------
+//
+// Binary format v2 (all values little-endian, native x64):
+//   [8]  magic "FMF_IDX\0"
+//   [4]  format version (2)
+//   [4]  drive letter length (wchar_t count)
+//   [n]  drive letter (wchar_t, no NUL)
+//   [4]  file entry count
+//   per entry (fixed 25 bytes + variable strings):
+//     [8]  fileReference
+//     [8]  parentReference
+//     [1]  isDirectory
+//     [8]  timestamp (LARGE_INTEGER.QuadPart)
+//     [2]  fileName length (wchar_t count, max 65535)
+//     [n]  fileName (wchar_t)
+//
+// Save uses a large write buffer to coalesce millions of tiny fields into
+// a small number of big WriteFile calls.  Load uses memory-mapped I/O for
+// zero-copy, zero-syscall-per-record reads.
+
+static const char INDEX_MAGIC[8] = {'F','M','F','_','I','D','X','\0'};
+static const DWORD INDEX_VERSION = 2;
+
+static std::wstring GetIndexDbPath()
+{
+    wchar_t appData[MAX_PATH] = {0};
+    if (SUCCEEDED(SHGetFolderPathW(NULL, CSIDL_APPDATA, NULL, 0, appData)))
+    {
+        std::wstring dir = std::wstring(appData) + L"\\FindMyFile";
+        CreateDirectoryW(dir.c_str(), NULL);
+        return dir + L"\\index.db";
+    }
+    return L"";
+}
+
+// --- Buffered writer: coalesces small writes into large WriteFile calls ---
+struct BufferedWriter {
+    HANDLE hFile;
+    std::vector<char> buf;
+    size_t pos;
+    bool failed;
+
+    BufferedWriter(HANDLE h, size_t capacity = 4 * 1024 * 1024)
+        : hFile(h), buf(capacity), pos(0), failed(false) {}
+
+    void Append(const void* data, size_t size)
+    {
+        if (failed) return;
+        const char* src = (const char*)data;
+        while (size > 0)
+        {
+            size_t space = buf.size() - pos;
+            size_t chunk = (size < space) ? size : space;
+            memcpy(buf.data() + pos, src, chunk);
+            pos += chunk;
+            src += chunk;
+            size -= chunk;
+            if (pos == buf.size())
+                Flush();
+        }
+    }
+
+    void Flush()
+    {
+        if (failed || pos == 0) return;
+        DWORD written = 0;
+        DWORD toWrite = (DWORD)pos;
+        if (!WriteFile(hFile, buf.data(), toWrite, &written, NULL) || written != toWrite)
+            failed = true;
+        pos = 0;
+    }
+
+    bool Ok() const { return !failed; }
+
+    void PutU16(USHORT v) { Append(&v, 2); }
+    void PutU32(DWORD v) { Append(&v, 4); }
+    void PutU64(ULONGLONG v) { Append(&v, 8); }
+    void PutByte(BYTE v) { Append(&v, 1); }
+    void PutWStr16(const std::wstring& s)
+    {
+        USHORT len = (USHORT)s.size();
+        PutU16(len);
+        if (len > 0) Append(s.data(), len * sizeof(wchar_t));
+    }
+};
+
+static bool SaveIndexToFile()
+{
+    if (fileMap.empty() || currentDriveLetter.empty())
+        return false;
+
+    std::wstring path = GetIndexDbPath();
+    if (path.empty()) return false;
+
+    std::wstring tmpPath = path + L".tmp";
+    HANDLE hFile = CreateFileW(tmpPath.c_str(), GENERIC_WRITE, 0, NULL,
+                               CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL |
+                               FILE_FLAG_SEQUENTIAL_SCAN, NULL);
+    if (hFile == INVALID_HANDLE_VALUE)
+        return false;
+
+    BufferedWriter w(hFile);
+
+    // Magic + version
+    w.Append(INDEX_MAGIC, 8);
+    w.PutU32(INDEX_VERSION);
+
+    // Drive letter
+    w.PutU32((DWORD)currentDriveLetter.size());
+    if (!currentDriveLetter.empty())
+        w.Append(currentDriveLetter.data(), currentDriveLetter.size() * sizeof(wchar_t));
+
+    // fileMap entries
+    w.PutU32((DWORD)fileMap.size());
+    for (auto& kv : fileMap)
+    {
+        const FileEntry& e = kv.second;
+        w.PutU64(e.fileReference);
+        w.PutU64(e.parentReference);
+        w.PutByte(e.isDirectory ? 1 : 0);
+        auto tsIt = timestampCache.find(e.fileReference);
+        LONGLONG tsVal = (tsIt != timestampCache.end()) ? tsIt->second.QuadPart : 0;
+        w.PutU64((ULONGLONG)tsVal);
+        w.PutWStr16(e.fileName);
+    }
+
+    w.Flush();
+    CloseHandle(hFile);
+
+    if (!w.Ok())
+    {
+        DeleteFileW(tmpPath.c_str());
+        return false;
+    }
+
+    DeleteFileW(path.c_str());
+    return MoveFileW(tmpPath.c_str(), path.c_str()) != 0;
+}
+
+static bool LoadIndexFromFile()
+{
+    std::wstring path = GetIndexDbPath();
+    if (path.empty()) return false;
+
+    // Memory-map the entire file for zero-copy, zero-syscall-per-record reads
+    HANDLE hFile = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL,
+                               OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL |
+                               FILE_FLAG_SEQUENTIAL_SCAN, NULL);
+    if (hFile == INVALID_HANDLE_VALUE)
+        return false;
+
+    LARGE_INTEGER fileSize;
+    if (!GetFileSizeEx(hFile, &fileSize) || fileSize.QuadPart < 16)
+    {
+        CloseHandle(hFile);
+        return false;
+    }
+
+    HANDLE hMapping = CreateFileMappingW(hFile, NULL, PAGE_READONLY, 0, 0, NULL);
+    if (!hMapping)
+    {
+        CloseHandle(hFile);
+        return false;
+    }
+
+    const char* base = (const char*)MapViewOfFile(hMapping, FILE_MAP_READ, 0, 0, 0);
+    if (!base)
+    {
+        CloseHandle(hMapping);
+        CloseHandle(hFile);
+        return false;
+    }
+
+    const size_t totalSize = (size_t)fileSize.QuadPart;
+    const char* ptr = base;
+    const char* end = base + totalSize;
+
+    // Helper lambdas for reading from the mapped region
+    auto remaining = [&]() -> size_t { return (size_t)(end - ptr); };
+    auto canRead = [&](size_t n) -> bool { return remaining() >= n; };
+
+    bool ok = true;
+
+    // Magic
+    if (!canRead(8) || memcmp(ptr, INDEX_MAGIC, 8) != 0) ok = false;
+    if (ok) ptr += 8;
+
+    // Version
+    DWORD version = 0;
+    if (ok && canRead(4)) { memcpy(&version, ptr, 4); ptr += 4; }
+    else ok = false;
+    if (ok && version != INDEX_VERSION) ok = false;
+
+    // Drive letter
+    std::wstring drive;
+    if (ok)
+    {
+        DWORD driveLen = 0;
+        if (canRead(4)) { memcpy(&driveLen, ptr, 4); ptr += 4; } else ok = false;
+        if (ok && driveLen > 0 && driveLen < 100)
+        {
+            size_t bytes = driveLen * sizeof(wchar_t);
+            if (canRead(bytes)) { drive.assign((const wchar_t*)ptr, driveLen); ptr += bytes; }
+            else ok = false;
+        }
+        else if (ok && driveLen == 0) ok = false;
+    }
+
+    // fileMap
+    DWORD fileCount = 0;
+    if (ok && canRead(4)) { memcpy(&fileCount, ptr, 4); ptr += 4; } else ok = false;
+    if (ok && fileCount > 50000000) ok = false;
+
+    if (ok)
+    {
+        fileMap.clear();
+        childrenMap.clear();
+        timestampCache.clear();
+        fileMap.reserve(fileCount);
+
+        for (DWORD i = 0; i < fileCount; i++)
+        {
+            // Each record: 8 + 8 + 1 + 8 + 2 = 27 bytes minimum
+            if (!canRead(27)) { ok = false; break; }
+
+            FileEntry e;
+            memcpy(&e.fileReference, ptr, 8);    ptr += 8;
+            memcpy(&e.parentReference, ptr, 8);   ptr += 8;
+            e.isDirectory = (*ptr != 0);          ptr += 1;
+
+            LONGLONG tsVal;
+            memcpy(&tsVal, ptr, 8);               ptr += 8;
+
+            USHORT nameLen;
+            memcpy(&nameLen, ptr, 2);             ptr += 2;
+
+            if (nameLen > 0)
+            {
+                size_t nameBytes = nameLen * sizeof(wchar_t);
+                if (!canRead(nameBytes)) { ok = false; break; }
+                e.fileName.assign((const wchar_t*)ptr, nameLen);
+                ptr += nameBytes;
+                // Pre-compute lowercased filename
+                e.lowerFileName.resize(nameLen);
+                for (USHORT ci = 0; ci < nameLen; ci++)
+                    e.lowerFileName[ci] = towlower(e.fileName[ci]);
+            }
+
+            e.hasChildren = false;
+            e.childrenLoaded = false;
+
+            ULONGLONG ref = e.fileReference;
+            ULONGLONG parentRef = e.parentReference & 0x0000FFFFFFFFFFFF;
+            fileMap[ref] = std::move(e);
+            childrenMap[parentRef].push_back(ref);
+
+            if (tsVal != 0)
+            {
+                LARGE_INTEGER li;
+                li.QuadPart = tsVal;
+                timestampCache[ref] = li;
+            }
+        }
+    }
+
+    UnmapViewOfFile(base);
+    CloseHandle(hMapping);
+    CloseHandle(hFile);
+
+    if (!ok)
+    {
+        fileMap.clear();
+        childrenMap.clear();
+        timestampCache.clear();
+        return false;
+    }
+
+    // Compute hasChildren flags
+    for (auto& kv : childrenMap)
+    {
+        auto it = fileMap.find(kv.first);
+        if (it != fileMap.end())
+            it->second.hasChildren = true;
+    }
+
+    currentDriveLetter = drive;
+
+    // Rebuild search indexes from fileMap (1-3 seconds in-memory, far faster
+    // than deserialising them from disk with millions of I/O calls)
+    BuildSearchIndex(drive);
+
+    return true;
 }
 
 // Return the WARP-only recency bonus for a file (0 if no WARP data).
@@ -4792,6 +5096,11 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
                 ti.lpszText = (LPWSTR)L"Hide properties panel";
                 SendMessage(hPropToggleTooltip, TTM_ADDTOOLW, 0, (LPARAM)&ti);
             }
+
+            // Defer index loading so the window appears immediately.
+            // The actual load runs when WM_LOAD_CACHED_INDEX is processed
+            // after the message loop starts pumping.
+            PostMessage(hWnd, WM_LOAD_CACHED_INDEX, 0, 0);
         }
         break;
     case WM_SIZE:
@@ -5448,6 +5757,61 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
     case WM_USN_UPDATED:
         ProcessPendingUsnChanges();
         break;
+    case WM_LOAD_CACHED_INDEX:
+        {
+            // Check if a saved index exists and load it.
+            // This runs after the window is visible so the UI isn't blocked
+            // during window creation.
+            std::wstring dbPath = GetIndexDbPath();
+            if (!dbPath.empty() && GetFileAttributesW(dbPath.c_str()) != INVALID_FILE_ATTRIBUTES)
+            {
+                if (hStatusText)
+                    SetWindowTextW(hStatusText, L"Loading cached index...");
+                // Pump one paint so the status text is visible
+                MSG paintMsg;
+                while (PeekMessage(&paintMsg, hWnd, WM_PAINT, WM_PAINT, PM_REMOVE))
+                    DispatchMessage(&paintMsg);
+
+                if (LoadIndexFromFile())
+                {
+                    BuildTreeView(currentDriveLetter);
+                    bTreeRenderedOnce = true;
+                    if (hSearchEdit) EnableWindow(hSearchEdit, TRUE);
+                    if (hFindButton) EnableWindow(hFindButton, TRUE);
+                    if (hWinSearchButton) EnableWindow(hWinSearchButton, TRUE);
+
+                    int nFiles = 0, nDirs = 0;
+                    for (auto& kv : fileMap)
+                    {
+                        if (kv.second.isDirectory) nDirs++;
+                        else nFiles++;
+                    }
+                    if (hSummaryText)
+                    {
+                        std::wstring summary = L"Loaded cached index for " +
+                            currentDriveLetter + L":\\  |  Folders: " +
+                            std::to_wstring(nDirs) + L"  |  Files: " +
+                            std::to_wstring(nFiles);
+                        SetWindowTextW(hSummaryText, summary.c_str());
+                        ShowWindow(hSummaryText, SW_SHOW);
+                    }
+                    if (hStatusText)
+                        SetWindowTextW(hStatusText, L"Index loaded from disk. Click a drive button to rescan.");
+
+                    // Pre-populate fullPathCache so WARP recency lookups work
+                    for (auto& pair : fileMap)
+                        BuildFullPath(pair.first, currentDriveLetter);
+
+                    QueryWarpActivity();
+                }
+                else
+                {
+                    if (hStatusText)
+                        SetWindowTextW(hStatusText, L"Select a drive to scan...");
+                }
+            }
+        }
+        break;
     case WM_MOUSELEAVE:
         // Forwarded from the toggle button's TrackMouseEvent; repaint to clear hover
         if (bToggleHovered)
@@ -5458,6 +5822,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
         }
         break;
     case WM_DESTROY:
+        SaveIndexToFile();
         CancelOAuthLogin();
         StopUsnMonitor();
         if (hPropToggleTooltip) { DestroyWindow(hPropToggleTooltip); hPropToggleTooltip = NULL; }
