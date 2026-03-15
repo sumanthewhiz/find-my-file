@@ -30,6 +30,10 @@ bld/
 [Bb]in/
 [Oo]bj/
 [Oo]ut/
+
+# Keep checked-in release binaries (populated by CI)
+!binaries/
+!binaries/**
 [Ll]og/
 [Ll]ogs/
 

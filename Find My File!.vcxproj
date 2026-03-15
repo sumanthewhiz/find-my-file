@@ -197,6 +197,12 @@
     <Image Include="Find My File!.ico" />
     <Image Include="small.ico" />
   </ItemGroup>
+  <ItemGroup>
+    <None Include=".github\workflows\build.yml" />
+    <None Include="binaries\ARM64\.gitkeep" />
+    <None Include="binaries\x64\.gitkeep" />
+    <None Include="binaries\x86\.gitkeep" />
+  </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
   </ImportGroup>

@@ -46,4 +46,10 @@
       <Filter>Resource Files</Filter>
     </Image>
   </ItemGroup>
+  <ItemGroup>
+    <None Include=".github\workflows\build.yml" />
+    <None Include="binaries\ARM64\.gitkeep" />
+    <None Include="binaries\x64\.gitkeep" />
+    <None Include="binaries\x86\.gitkeep" />
+  </ItemGroup>
 </Project>

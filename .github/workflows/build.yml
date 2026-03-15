@@ -1,0 +1,112 @@
+name: Build Release Binaries
+
+on:
+  push:
+    branches: [ master ]
+  pull_request:
+    branches: [ master ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    strategy:
+      matrix:
+        platform: [x86, x64, ARM64]
+        include:
+          - platform: x86
+            msbuild_platform: Win32
+            artifact_name: Release-x86
+          - platform: x64
+            msbuild_platform: x64
+            artifact_name: Release-x64
+          - platform: ARM64
+            msbuild_platform: ARM64
+            artifact_name: Release-ARM64
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Add MSBuild to PATH
+      uses: microsoft/setup-msbuild@v2
+
+    - name: Build Release (${{ matrix.platform }})
+      run: >
+        msbuild "Find My File!.sln"
+        /p:Configuration=Release
+        /p:Platform=${{ matrix.msbuild_platform }}
+        /m
+        /v:minimal
+
+    - name: Upload ${{ matrix.platform }} binaries
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ matrix.artifact_name }}
+        path: ${{ matrix.msbuild_platform }}/Release/
+        if-no-files-found: error
+        retention-days: 90
+
+  # ---------------------------------------------------------------
+  # Collect all three Release builds into binaries/ and commit them
+  # back to the repo so they are visible in the repository tree.
+  # Only runs on pushes to master (not on PRs).
+  # ---------------------------------------------------------------
+  publish:
+    needs: build
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Clean previous binaries
+      run: rm -rf binaries
+
+    - name: Create target folders
+      run: |
+        mkdir -p binaries/ARM64
+        mkdir -p binaries/x64
+        mkdir -p binaries/x86
+
+    - name: Download ARM64 build
+      uses: actions/download-artifact@v4
+      with:
+        name: Release-ARM64
+        path: binaries/ARM64
+
+    - name: Download x64 build
+      uses: actions/download-artifact@v4
+      with:
+        name: Release-x64
+        path: binaries/x64
+
+    - name: Download x86 build
+      uses: actions/download-artifact@v4
+      with:
+        name: Release-x86
+        path: binaries/x86
+
+    - name: Copy readme into each folder
+      run: |
+        cp "Find My File - Readme.txt" binaries/ARM64/
+        cp "Find My File - Readme.txt" binaries/x64/
+        cp "Find My File - Readme.txt" binaries/x86/
+
+    - name: Commit and push binaries
+      run: |
+        git config user.name  "github-actions[bot]"
+        git config user.email "github-actions[bot]@users.noreply.github.com"
+        git add binaries/
+        # Only commit if there are actual changes
+        if git diff --cached --quiet; then
+          echo "No changes to binaries — skipping commit."
+        else
+          git commit -m "Update release binaries (ARM64, x64, x86) [skip ci]"
+          git push
+        fi
