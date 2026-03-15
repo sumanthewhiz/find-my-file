@@ -19,6 +19,7 @@ A high-performance Windows desktop application that reads the NTFS Master File T
   - **Wildcard/glob patterns** — Supports `*` and `?` with trigram-accelerated pre-filtering
   - **Fuzzy/typo-tolerant match** — Levenshtein edit distance matching (max distance 1 for keywords 4–6 chars, max distance 2 for 7+ chars) catches common misspellings; exact matches always rank higher
 - **Scoped searches** — Select any folder in the tree view to restrict search results to that subtree
+- **Goop folder exclusion** — Global (unscoped) searches automatically exclude files from system, application, cache, and developer build directories — roughly 40–50% of all files on a typical device. The exclusion list covers 10 categories including `Windows\`, `Program Files\`, `AppData\`, `node_modules`, `.git`, `Cache`, `$Recycle.Bin`, NTFS metadata, and more. When you navigate to a specific folder in the tree and search from there, no exclusions apply — the scoped search returns everything under that folder.
 - **Persistent index cache** — On exit, the in-memory file map is saved to `%APPDATA%\FindMyFile\index.db` as a compact binary file. On the next launch, the cached index is loaded automatically — the window appears instantly and the search indexes are rebuilt in-memory in 1–3 seconds, skipping the MFT scan entirely. If no cache exists, the app falls back to a manual drive scan.
 - **Live filesystem monitoring** — Background USN journal polling detects file creates, deletes, and renames in real time and updates the index incrementally
 - **WARP-powered recency ranking** — Integrates with [WARP](https://github.com/sumanthewhiz/WARP) (Windows Activity Reasoning Platform) to obtain real file-interaction signals (opens, edits, creates) from the last 30 days. Files with recent WARP activity are strongly promoted in search ranking; files with no recency information are ranked lowest. Gracefully degrades when WARP is not running.
@@ -186,6 +187,7 @@ The project links against: `comctl32.lib`, `shlwapi.lib`, `uxtheme.lib`, `ole32.
 | `fullPathCache` / `timestampCache` | Memoize expensive path-building walks and filesystem timestamp queries. |
 | `treeItemToRef` (`unordered_map<HTREEITEM, ULONGLONG>`) | Reverse map from Win32 tree items back to MFT references for on-demand expansion. |
 | `warpRecencyByPath` (`unordered_map<wstring, double>`) | Maps lowercased full paths to their WARP Inference Engine `recency_score` (0–255). Populated once per drive scan via the `GetInferenceDeltas` API. |
+| `goopCache` (`unordered_map<ULONGLONG, int8_t>`) | Per-search cache mapping directory refs to goop status (1 = goop, 0 = clean). Avoids re-walking the parent chain for directories already classified during the current search. Cleared at the start of each search. |
 | `index.db` (binary file) | Persistent on-disk cache at `%APPDATA%\FindMyFile\index.db`. Stores `fileMap` entries and timestamps in a compact v2 binary format. Loaded via memory-mapped I/O on startup; saved via buffered writes on exit. |
 
 ### MFT Reading Pipeline
@@ -215,6 +217,8 @@ After the initial scan, a background thread (`UsnMonitorThreadFunc`) polls the U
 5. **Fuzzy** (score 18/15) — For keywords ≥ 4 characters, iterates all tokens whose length is within ±`maxDist` of the keyword and computes the Levenshtein edit distance with early-exit pruning. `maxDist` is 1 for short keywords (4–6 chars) and 2 for longer ones (7+ chars). Only files not already matched by earlier stages receive the fuzzy score.
 
 Results are capped at 10,000 via `std::partial_sort` and full paths are built only for the final set.
+
+**Goop folder exclusion** is applied during result collection for global (unscoped) searches — i.e., when `scopeRef == 0`. Each candidate file's parent chain is walked to check whether any ancestor directory is classified as "goop" (system, application, cache, or build folder). The `goopCache` provides O(1) amortised lookups for directories already visited during the current search. When a user explicitly selects a folder in the tree view (`scopeRef != 0`), goop filtering is bypassed entirely.
 
 **Wildcard search** uses an iterative backtracking glob matcher. When the pattern contains a literal span ? 3 characters, trigram pre-filtering narrows candidates before running the glob.
 
@@ -274,6 +278,33 @@ Only `fileMap` and `timestampCache` are persisted. The inverted, stemmed, and tr
 - A "Loading cached index..." status message is displayed during the load
 
 **Graceful fallback:** If no `index.db` exists (first launch) or the file is corrupted / has a version mismatch, the app behaves normally — Find buttons stay disabled until the user clicks a drive scan button.
+
+### Goop Folder Exclusion
+
+Global (unscoped) searches automatically filter out files that live under "goop" folders — system-managed, application-internal, or transient directories that 99%+ of users would never intentionally search for. The definition is sourced from the PM spec *Intelligent Global File Searchability* and covers 10 categories:
+
+| Category | Examples | Matching Strategy |
+|----------|----------|-------------------|
+| 1. Windows OS & System | `Windows\`, `System32\`, `WinSxS\` | Root-level path match (direct child of drive root) |
+| 2. Program Files | `Program Files\`, `Program Files (x86)\` | Root-level path match |
+| 3. ProgramData | `ProgramData\` | Root-level path match |
+| 4. User AppData | `AppData\` (Local, LocalLow, Roaming) | Name match at any depth |
+| 5. Per-Volume System | `System Volume Information\`, `$Recycle.Bin\`, `Recovery\`, `found.NNN\` | Root-level + any-depth name match |
+| 6. Developer Artifacts | `node_modules\`, `.git\`, `obj\`, `venv\`, `.cargo\` | Name match at any depth |
+| 7. Legacy Shell Junctions | `Application Data`, `Local Settings`, `Cookies` | Name match at any depth |
+| 8. App Caches & Databases | `Cache\`, `GPUCache\`, `IndexedDB\`, `blob_storage\` | Name match at any depth |
+| 9. OS Upgrade/Recovery | `$WINDOWS.~BT\`, `Windows.old\`, `$SysReset\` | Root-level path match |
+| 10. NTFS Metadata | `$Extend\` | Name match at any depth |
+
+**How it works:**
+
+- `IsInGoopFolder(fileRef)` walks the parent chain from a file toward the MFT root (ref 5), checking each ancestor directory name against three classifier functions: `IsRootLevelGoopName` (root-level only), `IsUserProfileGoopName` (AppData/legacy junctions at any depth), and `IsAnyDepthGoopName` (developer/cache/metadata at any depth).
+- A per-search `goopCache` (directory ref — 1/0) provides amortised O(1) lookups. When a directory's goop status is determined, every directory visited along the same parent-chain walk is cached with the same result.
+- The cache is cleared at the start of each search (`goopCache.clear()`).
+
+**Scoped search bypass:** When `scopeRef != 0` (user selected a specific folder in the tree), goop filtering is completely skipped. This ensures that navigating to `C:\Windows\System32` and searching from there returns all files, as the user explicitly requested that scope.
+
+**Estimated impact:** On a typical consumer device, goop folders account for roughly 40–50% of all files. Excluding them from global search significantly reduces noise and improves result relevance.
 
 ### Theming
 

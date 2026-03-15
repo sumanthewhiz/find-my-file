@@ -269,6 +269,10 @@ std::unordered_map<ULONGLONG, LARGE_INTEGER> timestampCache;
 std::unordered_map<std::wstring, double> warpRecencyByPath;
 bool bWarpAvailable = false;  // true if WARP service responded on last query
 
+// Goop folder exclusion cache: directory ref -> 1 (goop) / 0 (not goop).
+// Cleared on each search to avoid stale data after USN updates.
+std::unordered_map<ULONGLONG, int8_t> goopCache;
+
 // Search result for display
 struct SearchResult {
     ULONGLONG fileRef;
@@ -1948,12 +1952,214 @@ static void ForEachPrefixMatch(
     }
 }
 
+// ---------------------------------------------------------------------------
+// "Goop" folder exclusion — filter out system/app/cache/build directories
+// from global (unscoped) searches.  Definition sourced from the PM spec
+// "Intelligent Global File Searchability" goop categories 1-10.
+// ---------------------------------------------------------------------------
+
+// Case-insensitive wstring compare helper.
+static bool IEqualW(const std::wstring& a, const wchar_t* b)
+{
+    return _wcsicmp(a.c_str(), b) == 0;
+}
+
+// Check whether a single directory name (case-insensitive) is a "goop" folder
+// when it sits directly under the drive root (depth-1 from MFT root ref 5).
+// Covers Categories 1-3, 5, 9 absolute-path root-level patterns.
+static bool IsRootLevelGoopName(const std::wstring& name)
+{
+    // Cat 1: Windows OS
+    if (IEqualW(name, L"Windows")) return true;
+    // Cat 2: Program Files
+    if (IEqualW(name, L"Program Files")) return true;
+    if (IEqualW(name, L"Program Files (x86)")) return true;
+    // Cat 3: ProgramData  (exception: Start Menu shortcut subdir — handled
+    //         by the scoped-search escape: user navigates there explicitly)
+    if (IEqualW(name, L"ProgramData")) return true;
+    // Cat 5 / 9: per-volume system & recovery
+    if (IEqualW(name, L"System Volume Information")) return true;
+    if (IEqualW(name, L"$Recycle.Bin")) return true;
+    if (IEqualW(name, L"Recovery")) return true;
+    if (IEqualW(name, L"$WINDOWS.~BT")) return true;
+    if (IEqualW(name, L"$WINDOWS.~WS")) return true;
+    if (IEqualW(name, L"$Windows.~Q")) return true;
+    if (IEqualW(name, L"$WinREAgent")) return true;
+    if (IEqualW(name, L"$SysReset")) return true;
+    if (IEqualW(name, L"$GetCurrent")) return true;
+    if (IEqualW(name, L"Windows.old")) return true;
+    if (IEqualW(name, L"OneDriveTemp")) return true;
+    if (IEqualW(name, L"inetpub")) return true;
+    if (IEqualW(name, L"PerfLogs")) return true;
+    if (IEqualW(name, L"MSOCache")) return true;
+    if (IEqualW(name, L"Config.Msi")) return true;
+    return false;
+}
+
+// Check whether a directory name is an "AppData" sub-tree root (Cat 4).
+// When a directory named "AppData" appears directly under a user profile
+// folder (which itself is under "Users" at root), everything beneath it
+// is goop.  We detect this structurally: parent is a child of "Users"
+// which is a child of root.  But for simplicity and coverage, we just
+// match the name "AppData" at any depth — the false-positive risk of a
+// user folder literally named "AppData" is near zero.
+// Also covers Cat 7 legacy junction names under user profiles.
+static bool IsUserProfileGoopName(const std::wstring& name)
+{
+    // Cat 4: AppData tree
+    if (IEqualW(name, L"AppData")) return true;
+    // Cat 7: hidden/system shell junctions
+    if (IEqualW(name, L"Application Data")) return true;
+    if (IEqualW(name, L"Local Settings")) return true;
+    if (IEqualW(name, L"Cookies")) return true;
+    if (IEqualW(name, L"NetHood")) return true;
+    if (IEqualW(name, L"PrintHood")) return true;
+    if (IEqualW(name, L"Recent")) return true;
+    if (IEqualW(name, L"SendTo")) return true;
+    if (IEqualW(name, L"Templates")) return true;
+    if (IEqualW(name, L"MicrosoftEdgeBackups")) return true;
+    if (IEqualW(name, L"IntelGraphicsProfiles")) return true;
+    return false;
+}
+
+// Check whether a directory name is a "goop by name" folder that should be
+// excluded at ANY depth in the tree (Categories 6, 8, 10).
+static bool IsAnyDepthGoopName(const std::wstring& name)
+{
+    // Cat 6: developer toolchain & build artifacts
+    if (IEqualW(name, L"node_modules")) return true;
+    if (IEqualW(name, L".git")) return true;
+    if (IEqualW(name, L".hg")) return true;
+    if (IEqualW(name, L".svn")) return true;
+    if (IEqualW(name, L"__pycache__")) return true;
+    if (IEqualW(name, L".pytest_cache")) return true;
+    if (IEqualW(name, L".mypy_cache")) return true;
+    if (IEqualW(name, L".tox")) return true;
+    if (IEqualW(name, L"venv")) return true;
+    if (IEqualW(name, L".venv")) return true;
+    if (IEqualW(name, L".conda")) return true;
+    if (IEqualW(name, L"obj")) return true;
+    if (IEqualW(name, L".gradle")) return true;
+    if (IEqualW(name, L".m2")) return true;
+    if (IEqualW(name, L".cargo")) return true;
+    if (IEqualW(name, L".rustup")) return true;
+    if (IEqualW(name, L".nuget")) return true;
+
+    // Cat 8: application-specific caches & databases (name patterns)
+    if (IEqualW(name, L"Cache")) return true;
+    if (IEqualW(name, L"CacheStorage")) return true;
+    if (IEqualW(name, L"Code Cache")) return true;
+    if (IEqualW(name, L"GPUCache")) return true;
+    if (IEqualW(name, L"DawnCache")) return true;
+    if (IEqualW(name, L"GrShaderCache")) return true;
+    if (IEqualW(name, L"ShaderCache")) return true;
+    if (IEqualW(name, L"Crash Reports")) return true;
+    if (IEqualW(name, L"CrashDumps")) return true;
+    if (IEqualW(name, L"Crashpad")) return true;
+    if (IEqualW(name, L"blob_storage")) return true;
+    if (IEqualW(name, L"IndexedDB")) return true;
+    if (IEqualW(name, L"Local Storage")) return true;
+    if (IEqualW(name, L"Session Storage")) return true;
+    if (IEqualW(name, L"Service Worker")) return true;
+    if (IEqualW(name, L"WebStorage")) return true;
+    if (IEqualW(name, L"databases")) return true;
+
+    // Cat 5: per-volume dirs that can appear at any depth
+    if (IEqualW(name, L"DfsrPrivate")) return true;
+
+    // Cat 10: NTFS metadata
+    if (IEqualW(name, L"$Extend")) return true;
+
+    // found.NNN from CHKDSK (Cat 5) — match "found.000" through "found.999"
+    if (name.length() == 9 && _wcsnicmp(name.c_str(), L"found.", 6) == 0)
+    {
+        bool allDigits = true;
+        for (int k = 6; k < 9; k++)
+            if (name[k] < L'0' || name[k] > L'9') { allDigits = false; break; }
+        if (allDigits) return true;
+    }
+
+    return false;
+}
+
+// Determine whether the file at 'fileRef' lives under a goop folder.
+// Walks the parent chain from the file toward root, checking each ancestor
+// directory.  Uses goopCache for O(1) amortised repeat lookups.
+static bool IsInGoopFolder(ULONGLONG fileRef)
+{
+    // Walk ancestors, collecting refs along the way so we can cache the result
+    // for every directory we visit.
+    std::vector<ULONGLONG> chain;
+    chain.reserve(16);
+    ULONGLONG current = fileRef;
+    int depth = 0;
+
+    while (current != 5 && depth < 512)
+    {
+        // If we already know the answer for this directory, use it and propagate
+        auto cacheIt = goopCache.find(current);
+        if (cacheIt != goopCache.end())
+        {
+            bool isGoop = (cacheIt->second != 0);
+            // Cache the same result for every directory in the chain we just walked
+            for (ULONGLONG ref : chain)
+                goopCache[ref] = cacheIt->second;
+            return isGoop;
+        }
+
+        auto it = fileMap.find(current);
+        if (it == fileMap.end())
+            break;
+
+        const FileEntry& e = it->second;
+        if (e.isDirectory)
+            chain.push_back(current);
+
+        ULONGLONG parentRef = e.parentReference & 0x0000FFFFFFFFFFFF;
+
+        // Check if this directory is goop by name (any depth)
+        if (e.isDirectory && IsAnyDepthGoopName(e.lowerFileName))
+        {
+            for (ULONGLONG ref : chain)
+                goopCache[ref] = 1;
+            return true;
+        }
+
+        // Check if this directory is goop by name (user-profile patterns at any depth)
+        if (e.isDirectory && IsUserProfileGoopName(e.lowerFileName))
+        {
+            for (ULONGLONG ref : chain)
+                goopCache[ref] = 1;
+            return true;
+        }
+
+        // Check if this directory is a root-level goop (direct child of MFT root 5)
+        if (e.isDirectory && parentRef == 5 && IsRootLevelGoopName(e.lowerFileName))
+        {
+            for (ULONGLONG ref : chain)
+                goopCache[ref] = 1;
+            return true;
+        }
+
+        if (parentRef == current)
+            break;
+        current = parentRef;
+        depth++;
+    }
+
+    // Reached root without hitting any goop ancestor — mark all as clean
+    for (ULONGLONG ref : chain)
+        goopCache[ref] = 0;
+    return false;
+}
+
 // Perform a search and populate searchResults sorted by match quality.
 // If scopeRef != 0, only include results that are descendants of that directory.
 void PerformSearch(const std::wstring& keyword, ULONGLONG scopeRef)
 {
     searchResults.clear();
     bWildcardSearch = false;
+    goopCache.clear();
 
     if (keyword.empty() || fileMap.empty())
         return;
@@ -2016,6 +2222,9 @@ void PerformSearch(const std::wstring& keyword, ULONGLONG scopeRef)
 
         auto processWildcardCandidate = [&](ULONGLONG ref, const FileEntry& entry) {
             if (scopeRef != 0 && ref != scopeRef && !IsDescendantOf(ref, scopeRef))
+                return;
+            // Exclude goop folders in global (unscoped) searches
+            if (scopeRef == 0 && IsInGoopFolder(ref))
                 return;
             if (!WildcardMatch(entry.lowerFileName.c_str(), lowerKeyword.c_str()))
                 return;
@@ -2270,6 +2479,10 @@ void PerformSearch(const std::wstring& keyword, ULONGLONG scopeRef)
             continue;
 
         if (scopeRef != 0 && ref != scopeRef && !IsDescendantOf(ref, scopeRef))
+            continue;
+
+        // Exclude goop folders in global (unscoped) searches
+        if (scopeRef == 0 && IsInGoopFolder(ref))
             continue;
 
         int base = pair.second;
@@ -4475,6 +4688,7 @@ void ReadDriveAndBuildTree(HWND hWnd, const std::wstring& drive)
         timestampCache.clear();
         searchResults.clear();
         warpRecencyByPath.clear();
+        goopCache.clear();
         bWarpAvailable = false;
 
         // Disable drive buttons during scan
