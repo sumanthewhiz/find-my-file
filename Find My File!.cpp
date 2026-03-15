@@ -267,6 +267,10 @@ std::unordered_map<ULONGLONG, LARGE_INTEGER> timestampCache;
 // exponential time-decay and 7-day access frequency.  Higher = more recent/frequent.
 // Populated via the GetInferenceDeltas API on each drive scan.
 std::unordered_map<std::wstring, double> warpRecencyByPath;
+// Resolved map: file reference -> WARP recency score.  Built by
+// BuildWarpRefMap() after both fullPathCache and warpRecencyByPath are ready.
+// Eliminates path-format mismatches at search time.
+std::unordered_map<ULONGLONG, double> warpRecencyByRef;
 bool bWarpAvailable = false;  // true if WARP service responded on last query
 
 // Goop folder exclusion cache: directory ref -> 1 (goop) / 0 (not goop).
@@ -1316,8 +1320,12 @@ static void ParseWarpInferenceDeltas(const std::string& json)
 
                 if (score > 0.0)
                 {
-                    // entity_key is already lowercase from WARP
+                    // Lowercase the path to match the lookup in
+                    // GetWarpRecencyBonus, which lowercases the path
+                    // built from MFT data before searching.
                     std::wstring wpath = Utf8ToWide(entityKey);
+                    for (auto& ch : wpath)
+                        ch = towlower(ch);
                     warpRecencyByPath[wpath] = score;
                 }
             }
@@ -1336,6 +1344,7 @@ static void ParseWarpInferenceDeltas(const std::string& json)
 static void QueryWarpActivity()
 {
     warpRecencyByPath.clear();
+    warpRecencyByRef.clear();
     bWarpAvailable = false;
 
     // Use GetInferenceDeltas with since_version=0 to bulk-load all records.
@@ -1700,44 +1709,40 @@ static bool LoadIndexFromFile()
 // 'now' is unused but kept for API compatibility with GetRecencyBonus.
 static int GetWarpRecencyBonus(ULONGLONG fileRef, ULONGLONG /*now*/)
 {
-    if (!bWarpAvailable || warpRecencyByPath.empty())
+    if (!bWarpAvailable || warpRecencyByRef.empty())
         return 0;
 
-    // Look up the full path — build it on-demand if the cache was invalidated
-    // (e.g. by ProcessPendingUsnChanges after a USN journal poll).
-    auto pathIt = fullPathCache.find(fileRef);
-    std::wstring filePath;
-    if (pathIt != fullPathCache.end())
-    {
-        filePath = pathIt->second;
-    }
-    else if (!currentDriveLetter.empty())
-    {
-        filePath = BuildFullPath(fileRef, currentDriveLetter);
-    }
-    else
-    {
-        return 0;
-    }
-
-    std::wstring lowerPath = filePath;
-    for (auto& ch : lowerPath)
-        ch = towlower(ch);
-
-    auto warpIt = warpRecencyByPath.find(lowerPath);
-    if (warpIt == warpRecencyByPath.end())
+    auto it = warpRecencyByRef.find(fileRef);
+    if (it == warpRecencyByRef.end())
         return 0;
 
     // Map recency_score (0-255) to bonus (0-125).
-    // The WARP formula: 200 * e^(-dt/172800) + 5 * ln(1 + open_count_7d)
-    // yields ~205 for a file opened right now with high frequency, decaying
-    // toward 0 over days.  We cap at 255 and scale linearly.
-    double score = warpIt->second;
+    double score = it->second;
     if (score <= 0.0)
         return 0;
     if (score > 255.0)
         score = 255.0;
     return (int)(score * 125.0 / 255.0 + 0.5);
+}
+
+// Build the warpRecencyByRef lookup from warpRecencyByPath + fullPathCache.
+// Called after both are fully populated (after QueryWarpActivity).
+static void BuildWarpRefMap()
+{
+    warpRecencyByRef.clear();
+    if (warpRecencyByPath.empty())
+        return;
+
+    // Build a reverse index: lowercased full path -> file reference
+    for (auto& kv : fullPathCache)
+    {
+        std::wstring lower = kv.second;
+        for (auto& ch : lower)
+            ch = towlower(ch);
+        auto warpIt = warpRecencyByPath.find(lower);
+        if (warpIt != warpRecencyByPath.end())
+            warpRecencyByRef[kv.first] = warpIt->second;
+    }
 }
 
 // Compute a recency bonus based on WARP Inference Engine scores and USN timestamp.
@@ -4688,6 +4693,7 @@ void ReadDriveAndBuildTree(HWND hWnd, const std::wstring& drive)
         timestampCache.clear();
         searchResults.clear();
         warpRecencyByPath.clear();
+        warpRecencyByRef.clear();
         goopCache.clear();
         bWarpAvailable = false;
 
@@ -4738,6 +4744,7 @@ void ReadDriveAndBuildTree(HWND hWnd, const std::wstring& drive)
             // Query WARP for file activity recency signals
             UpdateProgress(99, L"Querying WARP activity...");
             QueryWarpActivity();
+            BuildWarpRefMap();
 
             if (!bTreeRenderedOnce)
             {
@@ -6017,6 +6024,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
                         BuildFullPath(pair.first, currentDriveLetter);
 
                     QueryWarpActivity();
+                    BuildWarpRefMap();
                 }
                 else
                 {

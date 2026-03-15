@@ -51,5 +51,7 @@
     <None Include="binaries\ARM64\.gitkeep" />
     <None Include="binaries\x64\.gitkeep" />
     <None Include="binaries\x86\.gitkeep" />
+    <None Include="_test_warp.ps1" />
+    <None Include="_test_warp2.ps1" />
   </ItemGroup>
 </Project>
