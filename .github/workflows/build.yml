@@ -19,14 +19,17 @@ jobs:
         platform: [x86, x64, ARM64]
         include:
           - platform: x86
-            msbuild_platform: Win32
+            msbuild_platform: x86
             artifact_name: Release-x86
+            artifact_path: Win32/Release/
           - platform: x64
             msbuild_platform: x64
             artifact_name: Release-x64
+            artifact_path: x64/Release/
           - platform: ARM64
             msbuild_platform: ARM64
             artifact_name: Release-ARM64
+            artifact_path: ARM64/Release/
 
     steps:
     - name: Checkout repository
@@ -47,7 +50,7 @@ jobs:
       uses: actions/upload-artifact@v4
       with:
         name: ${{ matrix.artifact_name }}
-        path: ${{ matrix.msbuild_platform }}/Release/
+        path: ${{ matrix.artifact_path }}
         if-no-files-found: error
         retention-days: 90
 
@@ -105,7 +108,7 @@ jobs:
         git add binaries/
         # Only commit if there are actual changes
         if git diff --cached --quiet; then
-          echo "No changes to binaries — skipping commit."
+          echo "No changes to binaries ï¿½ skipping commit."
         else
           git commit -m "Update release binaries (ARM64, x64, x86) [skip ci]"
           git push
