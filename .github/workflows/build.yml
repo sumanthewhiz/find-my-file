@@ -2,9 +2,15 @@ name: Build Release Binaries
 
 on:
   push:
-    branches: [ master ]
+    branches:
+      - master
+      - find-my-file-RELEASE-1.0.0
+      - find-my-file-DEV
   pull_request:
-    branches: [ master ]
+    branches:
+      - master
+      - find-my-file-RELEASE-1.0.0
+      - find-my-file-DEV
   workflow_dispatch:
 
 permissions:
@@ -55,9 +61,10 @@ jobs:
         retention-days: 90
 
   # ---------------------------------------------------------------
-  # Collect all three Release builds into binaries/ and commit them
-  # back to the repo so they are visible in the repository tree.
-  # Only runs on pushes to master (not on PRs).
+  # Collect all three Release builds into binaries/<branch>/ and
+  # commit them back to the repo.  Each branch gets its own subfolder
+  # so binaries from different branches coexist in the tree.
+  # Only runs on pushes (not on PRs).
   # ---------------------------------------------------------------
   publish:
     needs: build
@@ -68,38 +75,46 @@ jobs:
     - name: Checkout repository
       uses: actions/checkout@v4
 
-    - name: Clean previous binaries
-      run: rm -rf binaries
+    - name: Determine branch folder name
+      id: branch
+      run: |
+        # Extract the short branch name from GITHUB_REF (e.g. refs/heads/master -> master)
+        BRANCH_NAME="${GITHUB_REF#refs/heads/}"
+        echo "name=$BRANCH_NAME" >> "$GITHUB_OUTPUT"
+        echo "Branch folder: $BRANCH_NAME"
+
+    - name: Clean previous binaries for this branch
+      run: rm -rf "binaries/${{ steps.branch.outputs.name }}"
 
     - name: Create target folders
       run: |
-        mkdir -p binaries/ARM64
-        mkdir -p binaries/x64
-        mkdir -p binaries/x86
+        mkdir -p "binaries/${{ steps.branch.outputs.name }}/ARM64"
+        mkdir -p "binaries/${{ steps.branch.outputs.name }}/x64"
+        mkdir -p "binaries/${{ steps.branch.outputs.name }}/x86"
 
     - name: Download ARM64 build
       uses: actions/download-artifact@v4
       with:
         name: Release-ARM64
-        path: binaries/ARM64
+        path: binaries/${{ steps.branch.outputs.name }}/ARM64
 
     - name: Download x64 build
       uses: actions/download-artifact@v4
       with:
         name: Release-x64
-        path: binaries/x64
+        path: binaries/${{ steps.branch.outputs.name }}/x64
 
     - name: Download x86 build
       uses: actions/download-artifact@v4
       with:
         name: Release-x86
-        path: binaries/x86
+        path: binaries/${{ steps.branch.outputs.name }}/x86
 
     - name: Copy readme into each folder
       run: |
-        cp "Find My File - Readme.txt" binaries/ARM64/
-        cp "Find My File - Readme.txt" binaries/x64/
-        cp "Find My File - Readme.txt" binaries/x86/
+        cp "Find My File - Readme.txt" "binaries/${{ steps.branch.outputs.name }}/ARM64/"
+        cp "Find My File - Readme.txt" "binaries/${{ steps.branch.outputs.name }}/x64/"
+        cp "Find My File - Readme.txt" "binaries/${{ steps.branch.outputs.name }}/x86/"
 
     - name: Commit and push binaries
       run: |
@@ -108,8 +123,8 @@ jobs:
         git add binaries/
         # Only commit if there are actual changes
         if git diff --cached --quiet; then
-          echo "No changes to binaries � skipping commit."
+          echo "No changes to binaries — skipping commit."
         else
-          git commit -m "Update release binaries (ARM64, x64, x86) [skip ci]"
+          git commit -m "Update release binaries for ${{ steps.branch.outputs.name }} (ARM64, x64, x86) [skip ci]"
           git push
         fi
