@@ -4,13 +4,13 @@ on:
   push:
     branches:
       - master
-      - find-my-file-RELEASE-1.0.0
-      - find-my-file-DEV
+      - release-1.0.0
+      - dev
   pull_request:
     branches:
       - master
-      - find-my-file-RELEASE-1.0.0
-      - find-my-file-DEV
+      - release-1.0.0
+      - dev
   workflow_dispatch:
 
 permissions:
