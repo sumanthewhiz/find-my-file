@@ -25,10 +25,12 @@ jobs:
 
     steps:
     - name: Checkout repository
-      uses: actions/checkout@v4
+      uses: actions/checkout@v5
 
     - name: Add MSBuild to PATH
       uses: microsoft/setup-msbuild@v2
+      env:
+        FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
     - name: Build Release (${{ matrix.platform }})
       run: >
@@ -39,7 +41,7 @@ jobs:
         /v:minimal
 
     - name: Upload ${{ matrix.platform }} build output
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v5
       with:
         name: build-${{ matrix.platform }}
         path: ${{ matrix.artifact_path }}
@@ -61,7 +63,7 @@ jobs:
 
     steps:
     - name: Checkout repository (for readme)
-      uses: actions/checkout@v4
+      uses: actions/checkout@v5
       with:
         sparse-checkout: |
           Find My File - Readme.txt
@@ -79,7 +81,7 @@ jobs:
         echo "Zip label: $LABEL"
 
     - name: Download all build outputs
-      uses: actions/download-artifact@v4
+      uses: actions/download-artifact@v5
       with:
         path: staging
 
@@ -102,21 +104,21 @@ jobs:
         ls -lh dist/*.zip
 
     - name: Upload ARM64 zip
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v5
       with:
         name: find-my-file-${{ steps.label.outputs.value }}-ARM64
         path: dist/find-my-file-${{ steps.label.outputs.value }}-ARM64.zip
         retention-days: 90
 
     - name: Upload x64 zip
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v5
       with:
         name: find-my-file-${{ steps.label.outputs.value }}-x64
         path: dist/find-my-file-${{ steps.label.outputs.value }}-x64.zip
         retention-days: 90
 
     - name: Upload x86 zip
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v5
       with:
         name: find-my-file-${{ steps.label.outputs.value }}-x86
         path: dist/find-my-file-${{ steps.label.outputs.value }}-x86.zip
