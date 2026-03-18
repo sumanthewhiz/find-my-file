@@ -1,20 +1,11 @@
 name: Build Release Binaries
 
+name: Build Release Binaries
+
 on:
   push:
-    branches:
-      - master
-      - release-1.0.0
-      - dev
   pull_request:
-    branches:
-      - master
-      - release-1.0.0
-      - dev
   workflow_dispatch:
-
-permissions:
-  contents: write
 
 jobs:
   build:
@@ -26,15 +17,12 @@ jobs:
         include:
           - platform: x86
             msbuild_platform: x86
-            artifact_name: Release-x86
             artifact_path: Release/
           - platform: x64
             msbuild_platform: x64
-            artifact_name: Release-x64
             artifact_path: x64/Release/
           - platform: ARM64
             msbuild_platform: ARM64
-            artifact_name: Release-ARM64
             artifact_path: ARM64/Release/
 
     steps:
@@ -52,36 +40,39 @@ jobs:
         /m
         /v:minimal
 
-    - name: Upload ${{ matrix.platform }} binaries
+    - name: Upload ${{ matrix.platform }} build output
       uses: actions/upload-artifact@v4
       with:
-        name: ${{ matrix.artifact_name }}
+        name: build-${{ matrix.platform }}
         path: ${{ matrix.artifact_path }}
         if-no-files-found: error
-        retention-days: 90
+        retention-days: 1
 
   # ---------------------------------------------------------------
-  # Package each architecture into a zip and commit to binaries/.
+  # Package each architecture into a distributable zip and upload
+  # as a workflow artifact.  Nothing is committed to the repo.
+  #
   # Zip naming: find-my-file-<label>-<arch>.zip
-  #   master  -> label = releasepreview
-  #   others  -> label = branch name  (e.g. release-1.0.0, dev)
-  # Each zip contains: Find My File/<binary> + Find My File/<readme>
-  # Only runs on pushes (not on PRs).
+  #   master/main -> label = releasepreview
+  #   others      -> label = branch name  (e.g. release-1.0.0)
+  # Each zip contains: Find My File/<exe> + Find My File/<readme>
   # ---------------------------------------------------------------
-  publish:
+  package:
     needs: build
-    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
 
     steps:
-    - name: Checkout repository
+    - name: Checkout repository (for readme)
       uses: actions/checkout@v4
+      with:
+        sparse-checkout: |
+          Find My File - Readme.txt
 
     - name: Determine zip label
       id: label
       run: |
         BRANCH_NAME="${GITHUB_REF#refs/heads/}"
-        if [ "$BRANCH_NAME" = "master" ]; then
+        if [ "$BRANCH_NAME" = "master" ] || [ "$BRANCH_NAME" = "main" ]; then
           LABEL="releasepreview"
         else
           LABEL="$BRANCH_NAME"
@@ -89,56 +80,46 @@ jobs:
         echo "value=$LABEL" >> "$GITHUB_OUTPUT"
         echo "Zip label: $LABEL"
 
-    - name: Download ARM64 build
+    - name: Download all build outputs
       uses: actions/download-artifact@v4
       with:
-        name: Release-ARM64
-        path: staging/ARM64
-
-    - name: Download x64 build
-      uses: actions/download-artifact@v4
-      with:
-        name: Release-x64
-        path: staging/x64
-
-    - name: Download x86 build
-      uses: actions/download-artifact@v4
-      with:
-        name: Release-x86
-        path: staging/x86
+        path: staging
 
     - name: Create zip packages
       run: |
         LABEL="${{ steps.label.outputs.value }}"
-
-        # Remove old zips for this label (keeps other branches' zips intact)
-        rm -f binaries/find-my-file-$LABEL-*.zip
+        mkdir -p dist
 
         for ARCH in ARM64 x64 x86; do
-          # Build the inner folder structure: "Find My File/"
           mkdir -p "pkg/Find My File"
-          cp staging/$ARCH/* "pkg/Find My File/"
+          cp staging/build-$ARCH/* "pkg/Find My File/"
           cp "Find My File - Readme.txt" "pkg/Find My File/"
 
-          # Create the zip
           ZIP_NAME="find-my-file-${LABEL}-${ARCH}.zip"
-          (cd pkg && zip -r "../binaries/$ZIP_NAME" "Find My File")
-
-          # Clean up for next architecture
+          (cd pkg && zip -r "../dist/$ZIP_NAME" "Find My File")
           rm -rf pkg
         done
 
         echo "Generated zips:"
-        ls -lh binaries/*.zip
+        ls -lh dist/*.zip
 
-    - name: Commit and push binaries
-      run: |
-        git config user.name  "github-actions[bot]"
-        git config user.email "github-actions[bot]@users.noreply.github.com"
-        git add binaries/
-        if git diff --cached --quiet; then
-          echo "No changes to binaries — skipping commit."
-        else
-          git commit -m "Update release zips for ${{ steps.label.outputs.value }} (ARM64, x64, x86) [skip ci]"
-          git push
-        fi
+    - name: Upload ARM64 zip
+      uses: actions/upload-artifact@v4
+      with:
+        name: find-my-file-${{ steps.label.outputs.value }}-ARM64
+        path: dist/find-my-file-${{ steps.label.outputs.value }}-ARM64.zip
+        retention-days: 90
+
+    - name: Upload x64 zip
+      uses: actions/upload-artifact@v4
+      with:
+        name: find-my-file-${{ steps.label.outputs.value }}-x64
+        path: dist/find-my-file-${{ steps.label.outputs.value }}-x64.zip
+        retention-days: 90
+
+    - name: Upload x86 zip
+      uses: actions/upload-artifact@v4
+      with:
+        name: find-my-file-${{ steps.label.outputs.value }}-x86
+        path: dist/find-my-file-${{ steps.label.outputs.value }}-x86.zip
+        retention-days: 90
