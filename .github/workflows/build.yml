@@ -123,3 +123,11 @@ jobs:
         name: find-my-file-${{ steps.label.outputs.value }}-x86
         path: dist/find-my-file-${{ steps.label.outputs.value }}-x86.zip
         retention-days: 90
+
+    - name: Delete intermediate build artifacts
+      uses: geekyeggo/delete-artifact@v5
+      with:
+        name: |
+          build-x86
+          build-x64
+          build-ARM64
