@@ -1,0 +1,52 @@
+name: Delete Copilot Branches
+
+on:
+  pull_request:
+    types: [closed]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  delete-pr-branch:
+    if: github.event_name == 'pull_request' && startsWith(github.head_ref, 'copilot/')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Delete copilot branch
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.git.deleteRef({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              ref: `heads/${context.payload.pull_request.head.ref}`
+            });
+            console.log(`Deleted branch: ${context.payload.pull_request.head.ref}`);
+
+  delete-stale-branches:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Delete all copilot branches
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const branches = await github.paginate(github.rest.repos.listBranches, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              per_page: 100
+            });
+            const copilotBranches = branches.filter(b => b.name.startsWith('copilot/'));
+            for (const branch of copilotBranches) {
+              try {
+                await github.rest.git.deleteRef({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  ref: `heads/${branch.name}`
+                });
+                console.log(`Deleted branch: ${branch.name}`);
+              } catch (err) {
+                console.error(`Failed to delete branch ${branch.name}: ${err.message}`);
+              }
+            }
