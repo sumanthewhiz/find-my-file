@@ -44,18 +44,23 @@ jobs:
       uses: actions/upload-artifact@v5
       with:
         name: build-${{ matrix.platform }}
-        path: ${{ matrix.artifact_path }}
+        path: |
+          ${{ matrix.artifact_path }}
+          !${{ matrix.artifact_path }}*.pdb
         if-no-files-found: error
         retention-days: 1
 
   # ---------------------------------------------------------------
-  # Package each architecture into a distributable zip and upload
-  # as a workflow artifact.  Nothing is committed to the repo.
+  # Package each architecture into a distributable artifact.
+  # Nothing is committed to the repo.
   #
-  # Zip naming: find-my-file-<label>-<arch>.zip
+  # Artifact naming: find-my-file-<label>-<arch>
   #   master/main -> label = releasepreview
   #   others      -> label = branch name  (e.g. release-1.0.0)
-  # Each zip contains: Find My File/<exe> + Find My File/<readme>
+  # Each artifact contains: Find My File/<exe> + Find My File/<readme>
+  #
+  # GitHub Actions zips the artifact on download, so the user gets
+  # find-my-file-<label>-<arch>.zip containing the folder directly.
   # ---------------------------------------------------------------
   package:
     needs: build
@@ -85,43 +90,36 @@ jobs:
       with:
         path: staging
 
-    - name: Create zip packages
+    - name: Prepare distribution folders
       run: |
-        LABEL="${{ steps.label.outputs.value }}"
-        mkdir -p dist
-
         for ARCH in ARM64 x64 x86; do
-          mkdir -p "pkg/Find My File"
-          cp staging/build-$ARCH/* "pkg/Find My File/"
-          cp "Find My File - Readme.txt" "pkg/Find My File/"
-
-          ZIP_NAME="find-my-file-${LABEL}-${ARCH}.zip"
-          (cd pkg && zip -r "../dist/$ZIP_NAME" "Find My File")
-          rm -rf pkg
+          mkdir -p "dist/$ARCH/Find My File"
+          cp staging/build-$ARCH/* "dist/$ARCH/Find My File/"
+          cp "Find My File - Readme.txt" "dist/$ARCH/Find My File/"
         done
 
-        echo "Generated zips:"
-        ls -lh dist/*.zip
+        echo "Distribution contents:"
+        find dist -type f
 
-    - name: Upload ARM64 zip
+    - name: Upload ARM64 artifact
       uses: actions/upload-artifact@v5
       with:
         name: find-my-file-${{ steps.label.outputs.value }}-ARM64
-        path: dist/find-my-file-${{ steps.label.outputs.value }}-ARM64.zip
+        path: dist/ARM64/
         retention-days: 90
 
-    - name: Upload x64 zip
+    - name: Upload x64 artifact
       uses: actions/upload-artifact@v5
       with:
         name: find-my-file-${{ steps.label.outputs.value }}-x64
-        path: dist/find-my-file-${{ steps.label.outputs.value }}-x64.zip
+        path: dist/x64/
         retention-days: 90
 
-    - name: Upload x86 zip
+    - name: Upload x86 artifact
       uses: actions/upload-artifact@v5
       with:
         name: find-my-file-${{ steps.label.outputs.value }}-x86
-        path: dist/find-my-file-${{ steps.label.outputs.value }}-x86.zip
+        path: dist/x86/
         retention-days: 90
 
     - name: Delete intermediate build artifacts
