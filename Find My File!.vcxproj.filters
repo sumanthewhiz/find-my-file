@@ -27,9 +27,18 @@
     <ClInclude Include="Find My File!.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="SearchRanking.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="WarpContext.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="Find My File!.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="WarpContext.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
   </ItemGroup>

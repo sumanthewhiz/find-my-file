@@ -21,8 +21,9 @@ FEATURES
     so startup is near-instant without re-scanning drives
   - Live filesystem monitoring: file creates, deletes, and renames are detected
     in real time and the index updates automatically
-  - WARP recency ranking (optional): integrates with WARP to boost recently
-    used files in search results. Works without WARP installed.
+  - WARP context ranking (optional): bounded query-specific boosts, exact-match
+    protection, no unseen-file penalty, and baseline fallback without WARP.
+    Select current context, past 30 minutes, past 2 hours, or past 24 hours.
 
   Windows Search Integration
   - Full-text content search via the Windows Search Indexer
@@ -39,7 +40,7 @@ FEATURES
   User Interface
   - Tabbed layout: Browse tab (tree view) and Search Results tab
   - Hierarchical tree view with lazy loading
-  - Search results with six columns: Name, Type, Path, Modified, Match, Snippet
+  - Search results show Context +, match quality, total score and explanations
   - Keyword highlighting in results
   - Resizable properties panel with file details and content previews
   - Dark mode toggle (single click)
@@ -48,13 +49,25 @@ FEATURES
 REQUIREMENTS
 ------------
 
-  - Windows 10 or 11 (x64)
-  - Must run as Administrator (required for direct MFT access)
+  - Windows 10 or 11 (ARM64, x64, or x86)
+  - Regular app requires Administrator for direct MFT access
+  - Synthetic-only FindMyFileContextDemo.exe runs without elevation
   - NTFS file system (non-NTFS volumes are skipped automatically)
-  - WARP (optional): install for enhanced recency-based ranking
+  - WARP (optional): use a Phase C dev build for live contextual ranking
 
 USAGE
 -----
+
+  Synthetic WARP showcase (no personal data needed):
+
+  1. Keep context-demo.json beside FindMyFileContextDemo.exe and run the exe.
+  2. Turn "Use WARP context" off, then on to compare the same budget candidates.
+  3. Inspect "Context +" and click a result for the explanation.
+
+  This is a labeled replay of real WARP feature responses, not live capture.
+  It does not scan drives, load/save the personal index, load cloud credentials,
+  open the listed files, or connect to installed WARP. The regular application
+  provides the live integration. Unseen files remain eligible for search.
 
   Basic Workflow:
 
@@ -71,6 +84,8 @@ USAGE
   6. Right-click a result for: Open, Copy Path, Open Containing Folder.
   7. Scope searches by selecting a folder in the tree before searching.
   8. Use wildcards: *.pdf, report_202?.*, *budget*
+  9. Toggle WARP context to compare baseline/context ranking. Inspect Context +
+     and the properties explanation. No model runs in the search request.
 
   Cloud Setup:
 

@@ -15,12 +15,15 @@ jobs:
         include:
           - platform: x86
             msbuild_platform: x86
+            project_platform: Win32
             artifact_path: Release/
           - platform: x64
             msbuild_platform: x64
+            project_platform: x64
             artifact_path: x64/Release/
           - platform: ARM64
             msbuild_platform: ARM64
+            project_platform: ARM64
             artifact_path: ARM64/Release/
 
     steps:
@@ -40,13 +43,61 @@ jobs:
         /m
         /v:minimal
 
+    - name: Build synthetic-only showcase (no elevation or personal indexing)
+      run: >
+        msbuild "Find My File!.vcxproj"
+        /p:Configuration=Release
+        /p:Platform=${{ matrix.project_platform }}
+        /p:ContextDemoOnly=true
+        /m
+        /v:minimal
+
+    - name: Stage synthetic showcase data
+      shell: pwsh
+      run: Copy-Item context-demo.json '${{ matrix.artifact_path }}context-demo.json'
+
+    - name: Set up Python for context evaluation
+      if: matrix.platform == 'x64'
+      uses: actions/setup-python@v6
+      with:
+        python-version: '3.12'
+
+    - name: Test production context client and labeled search replay
+      if: matrix.platform == 'x64'
+      shell: pwsh
+      run: .\tests\run_context_quality.ps1 -Platform x64
+
+    - name: Exercise actual showcase UI toggle
+      if: matrix.platform == 'x64'
+      shell: pwsh
+      run: |
+        $arguments = "--context-demo `"$env:GITHUB_WORKSPACE\context-demo.json`" --smoke-report `"$env:GITHUB_WORKSPACE\build\ui-smoke.txt`""
+        $process = Start-Process '.\x64\Release\FindMyFileContextDemo.exe' -ArgumentList $arguments -PassThru
+        if (!$process.WaitForExit(30000)) {
+          Stop-Process -Id $process.Id
+          throw 'Synthetic UI smoke timed out.'
+        }
+        if ($process.ExitCode -ne 0) { throw 'Synthetic UI smoke failed.' }
+        Get-Content '.\build\ui-smoke.txt'
+        if ((Get-Content '.\build\ui-smoke.txt' -First 1) -ne 'PASS') { throw 'Missing UI pass evidence.' }
+
+    - name: Upload context quality evidence
+      if: always() && matrix.platform == 'x64'
+      uses: actions/upload-artifact@v5
+      with:
+        name: find-my-file-context-quality
+        path: |
+          build/context-eval-x64/
+          build/ui-smoke.txt
+        retention-days: 90
+
     - name: Upload ${{ matrix.platform }} build output
       uses: actions/upload-artifact@v5
       with:
         name: build-${{ matrix.platform }}
         path: |
-          ${{ matrix.artifact_path }}
-          !${{ matrix.artifact_path }}*.pdb
+          ${{ matrix.artifact_path }}*.exe
+          ${{ matrix.artifact_path }}context-demo.json
         if-no-files-found: error
         retention-days: 1
 

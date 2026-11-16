@@ -2,7 +2,24 @@
 
 A high-performance Windows desktop application that reads the NTFS Master File Table (MFT) directly to index millions of files in seconds, then provides instant search across your entire file system — including cloud storage providers — with a modern, themeable UI.
 
-![Windows](https://img.shields.io/badge/platform-Windows%2010%2F11-blue) ![C++14](https://img.shields.io/badge/language-C%2B%2B14-orange) ![Win32 API](https://img.shields.io/badge/framework-Win32%20API-lightgrey)
+![Windows](https://img.shields.io/badge/platform-Windows%2010%2F11-blue) ![C++20](https://img.shields.io/badge/language-C%2B%2B20-orange) ![Win32 API](https://img.shields.io/badge/framework-Win32%20API-lightgrey)
+
+## Try the WARP search showcase
+
+1. Download the matching `find-my-file-dev-ARM64`, `-x64`, or `-x86` artifact from
+   the latest successful [dev build](https://github.com/sumanthewhiz/find-my-file/actions/workflows/build.yml?query=branch%3Adev).
+2. Extract it and run **`FindMyFileContextDemo.exe`**, keeping `context-demo.json`
+   beside it. This synthetic-only executable does **not** require elevation.
+3. Turn **Use WARP context** off, then on. The same ambiguous `budget` candidates
+   are shown in both cases; context moves the labeled project file above
+   unrelated directories. The **Context +** column exposes the bounded change.
+4. Select a result to inspect the explanation.
+
+This is explicitly a **recorded synthetic replay**, using feature responses from
+the real WARP Phase C implementation, not a live capture or a model-generated
+success story. It does not scan drives, load/save the personal index, load cloud
+credentials, open the listed files, or contact the installed WARP instance.
+The regular **`Find My File!.exe`** provides the live integration below.
 
 ---
 
@@ -22,7 +39,7 @@ A high-performance Windows desktop application that reads the NTFS Master File T
 - **Goop folder exclusion** — Global (unscoped) searches automatically exclude files from system, application, cache, and developer build directories — roughly 40–50% of all files on a typical device. The exclusion list covers 10 categories including `Windows\`, `Program Files\`, `AppData\`, `node_modules`, `.git`, `Cache`, `$Recycle.Bin`, NTFS metadata, and more. When you navigate to a specific folder in the tree and search from there, no exclusions apply — the scoped search returns everything under that folder.
 - **Persistent index cache** — On exit, the in-memory file map is saved to `%APPDATA%\FindMyFile\index.db` as a compact binary file. On the next launch, the cached index is loaded automatically — the window appears instantly and the search indexes are rebuilt in-memory in 1–3 seconds, skipping the MFT scan entirely. If no cache exists, the app falls back to a manual drive scan.
 - **Live filesystem monitoring** — Background USN journal polling detects file creates, deletes, and renames in real time and updates the index incrementally
-- **WARP-powered recency ranking** — Integrates with [WARP](https://github.com/sumanthewhiz/WARP) (Windows Activity Reasoning Platform) to obtain real file-interaction signals (opens, edits, creates) from the last 30 days. Files with recent WARP activity are strongly promoted in search ranking; files with no recency information are ranked lowest. Gracefully degrades when WARP is not running.
+- **WARP contextual ranking** — Uses [WARP Phase C](https://github.com/sumanthewhiz/WARP/tree/dev) task/evidence features conditioned on the query and selected time window. Applies at most **+8**, protects exact filenames, and never penalizes a file merely because WARP has not seen it. No model runs on the search request path.
 
 ### Windows Search Integration
 - **Full-text content search** — The "Find with Windows Search" button queries the Windows Search Indexer via OLE DB, searching both filenames (`LIKE`) and file contents (`CONTAINS`)
@@ -40,7 +57,7 @@ A high-performance Windows desktop application that reads the NTFS Master File T
 ### User Interface
 - **Tabbed layout** — Browse tab (tree view) and Search Results tab (list view + properties panel)
 - **Hierarchical tree view** — On-demand lazy loading: only one level of children is populated per expansion, keeping memory and startup time low
-- **Search results list** — Six columns: Name, Type, Full Path, Modified, Match quality, and Snippet — with system file icons from the shell image list
+- **Search results list** — Name, Context +, Match quality, Full Path, Type, Modified, Total Score, and Snippet, with contextual explanations in the properties panel
 - **Keyword highlighting** — Custom-drawn cells highlight every occurrence of the search keyword in the Name and Snippet columns
 - **Properties panel** — A resizable right-hand panel shows file name, type, path, size, timestamps (created/modified/accessed), attributes, and content match previews with `«keyword»` markers
 - **Splitter** — Drag the vertical splitter between the list view and properties panel to resize; a collapse/expand toggle button (» / «) hides or shows the panel entirely
@@ -68,19 +85,19 @@ Results are scored and sorted by match quality:
 
 Bonus points are added for:
 - **Case-sensitive match** (+15) — The keyword appears with exact casing in the filename
-- **WARP recency** (up to +125) — If [WARP](https://github.com/sumanthewhiz/WARP) is running, its Inference Engine provides a precomputed `recency_score` (0–255) per file that combines exponential time-decay with 7-day access frequency. This score is mapped linearly to a 0–125 bonus. The large magnitude is intentional — it allows a substring match on a file you opened today to rank above an exact match on a file you haven't touched in months. Noise filtering (Explorer thumbnails, antivirus scans, etc.) is handled server-side by the WARP Inference Engine.
-- **USN timestamp recency** (fallback, up to +10) — When WARP data is unavailable for a file, the MFT timestamp provides a weaker signal: +10 (last 7 days), +7 (last 30 days), +3 (last year), +0 (older or unknown)
-- **No recency info** (+0) — Files with neither WARP activity nor a USN timestamp receive no recency bonus and are ranked lowest
+- **USN timestamp recency** (up to +10) — The existing baseline filesystem tie-breaker remains: +10 (last 7 days), +7 (last 30 days), +3 (last year), +0 (older or unknown). A filesystem timestamp does not prove user interaction.
+- **WARP context** (0 to +8) — Applied after baseline retrieval, only with query agreement and supported task/window evidence. The relevance floor uses the raw match tier, before case/timestamp bonuses: fuzzy-only matches cannot be rescued by context. If any delta applies, literal filename/path matches stay ahead of nonexact matches. Otherwise the baseline order is unchanged.
+- **Unseen or unavailable context** — No negative score and no candidate filtering. The old blanket `+125` engagement promotion is removed.
 
 ---
 
 ## Requirements
 
-- **OS**: Windows 10 or 11 (x64)
-- **Privileges**: Must run as **Administrator** (required for direct MFT access via `DeviceIoControl`)
+- **OS**: Windows 10 or 11; ARM64, x64, and x86 builds
+- **Privileges**: The regular app still requires **Administrator** for direct MFT access via `DeviceIoControl`. The synthetic-only demo runs as the current user.
 - **File system**: NTFS (the app auto-detects and skips non-NTFS volumes)
-- **Build tools**: Visual Studio 2022 with the C++ Desktop workload
-- **WARP** *(optional)*: Install [WARP](https://github.com/sumanthewhiz/WARP) for enhanced recency-based ranking. When running, WARP provides real file-interaction signals. Without it, ranking falls back to USN timestamps.
+- **Build tools**: Visual Studio 2022 or newer, C++ Desktop workload, and the Windows SDK C++/WinRT headers. C++20 and UTF-8 source are used for the SDK JSON parser; no additional package is required.
+- **WARP** *(optional)*: Use a Phase C `dev` build exposing `GetSearchContext` / `ScoreCandidates`. Older versions, missing service, policy denial, expiry and malformed replies all retain baseline results.
 
 ---
 
@@ -90,7 +107,18 @@ Bonus points are added for:
 2. Select the **x64 Release** configuration
 3. Build the solution (**Ctrl+Shift+B**)
 
-The project links against: `comctl32.lib`, `shlwapi.lib`, `uxtheme.lib`, `ole32.lib`, `oleaut32.lib`, `winhttp.lib`, `ws2_32.lib`.
+The project also links `windowsapp.lib` and `advapi32.lib` for SDK JSON and local
+pipe peer validation. Build the safe showcase from the same source:
+
+```powershell
+msbuild 'Find My File!.vcxproj' /p:Configuration=Release /p:Platform=x64 /p:ContextDemoOnly=true
+Copy-Item context-demo.json .\x64\Release\context-demo.json
+.\x64\Release\FindMyFileContextDemo.exe
+```
+
+`ContextDemoOnly` forces synthetic mode and an `asInvoker` manifest; it cannot
+scan personal files. The regular manifest remains `requireAdministrator`.
+Local VS 18 builds can add `/p:PlatformToolset=v145`.
 
 ---
 
@@ -186,7 +214,8 @@ The project links against: `comctl32.lib`, `shlwapi.lib`, `uxtheme.lib`, `ole32.
 | `sortedTokens` / `sortedStemTokens` | Sorted vectors of all index keys, enabling O(log N) prefix range queries via `std::lower_bound`. |
 | `fullPathCache` / `timestampCache` | Memoize expensive path-building walks and filesystem timestamp queries. |
 | `treeItemToRef` (`unordered_map<HTREEITEM, ULONGLONG>`) | Reverse map from Win32 tree items back to MFT references for on-demand expansion. |
-| `warpRecencyByPath` (`unordered_map<wstring, double>`) | Maps lowercased full paths to their WARP Inference Engine `recency_score` (0–255). Populated once per drive scan via the `GetInferenceDeltas` API. |
+| `baselineResults` / `warpContextResult` | Baseline candidates and short-lived contextual features. Kept in memory only, independent of the persistent index. |
+| `WarpContext::Worker` | One cancellable worker, a single latest pending request, generation-bound UI completion, and bounded local pipe calls. |
 | `goopCache` (`unordered_map<ULONGLONG, int8_t>`) | Per-search cache mapping directory refs to goop status (1 = goop, 0 = clean). Avoids re-walking the parent chain for directories already classified during the current search. Cleared at the start of each search. |
 | `index.db` (binary file) | Persistent on-disk cache at `%APPDATA%\FindMyFile\index.db`. Stores `fileMap` entries and timestamps in a compact v2 binary format. Loaded via memory-mapped I/O on startup; saved via buffered writes on exit. |
 
@@ -199,8 +228,7 @@ The project links against: `comctl32.lib`, `shlwapi.lib`, `uxtheme.lib`, `ole32.
 5. Build `fileMap` and `childrenMap` in a single pass
 6. Pre-compute `hasChildren` flags for all directories
 7. Build the search indexes (inverted, stemmed, trigram) with progress reporting
-8. Pre-populate `fullPathCache` for all files
-9. Query WARP's Inference Engine via `GetInferenceDeltas` on the `\\\\\\.\\.\\pipe\\WarpFileActivityAPI` named pipe, populating `warpRecencyByPath` with precomputed recency scores
+8. Resolve paths lazily for tree nodes and final search results. No bulk WARP activity download or all-file path-cache warmup runs during indexing.
 
 ### Live Monitoring
 
@@ -231,23 +259,82 @@ Results are capped at 10,000 via `std::partial_sort` and full paths are built on
 5. Cloud results are merged into the main results list with score 51 and tagged with their provider name
 6. Double-clicking a cloud result opens its `webUrl` / `webViewLink` in the default browser
 
-### WARP Recency Integration
+### WARP Context Integration
 
-[WARP](https://github.com/sumanthewhiz/WARP) (Windows Activity Reasoning Platform) is an optional local service that records real file-interaction events (opens, edits, creates, deletes, renames) and exposes precomputed per-file inference data through a named pipe API.
+```mermaid
+flowchart LR
+    Query["Query + selected time window"] --> Retrieve["Existing MFT / Windows Search retrieval"]
+    Retrieve --> Baseline["Display baseline immediately"]
+    Baseline --> Worker["Async: up to 256 unique eligible local files"]
+    Worker --> Freeze["GetSearchContext: current or explicit interval"]
+    Freeze --> Score["ScoreCandidates: query + names / authorized snippets"]
+    Score --> Validate["SDK JSON, reference / expiry / key / bound validation"]
+    Validate --> Rank["Shared SearchRanking.h: exact guard + at most 8 points"]
+    Rank --> UI["Same candidates; visible delta + explanation"]
+    Validate -->|failure or invalidation| Baseline
+```
 
-**How it works:**
+**Live walkthrough**
 
-1. After building the search index, `QueryWarpActivity()` connects to `\\.\pipe\WarpFileActivityAPI`
-2. Sends `{"op":"GetInferenceDeltas","since_version":0}` to bulk-load all inference records, paging through batches of up to 5,000 records
-3. Filters for `entity_type == "file"` and extracts each file's `recency_score` — a composite value (0–255) computed server-side using the formula: `200 × e^(−Δt / 172800) + 5 × ln(1 + open_count_7d)`
-4. Populates `warpRecencyByPath` — a map from lowercased file path to its `recency_score`
-5. During search scoring, `GetWarpRecencyBonus()` looks up the file's path and linearly maps the score to a 0–125 bonus: `bonus = score × 125 / 255`
-6. If no WARP data exists for a file, the function falls back to the USN journal timestamp (weaker signal, up to +10)
-7. Files with no recency information at all receive +0, ensuring they sort below any file that has activity data
+1. Start a current WARP `dev` build in the same Windows user/session.
+2. Open and interact with a document in a project directory, then search within
+   five minutes. For a controlled demonstration, use two directories containing
+   similarly named budget files, and work in a brief beside one of them.
+3. Start the regular FindMyFile app, load/scan the index, and search for `budget`.
+   Filename and local content candidates can benefit; folders and remote cloud
+   results are not sent for scoring.
+4. Leave **Use WARP context** checked and inspect **Context +** and the properties
+   explanation. Turn it off to restore the baseline order. An already-good
+   baseline need not change its first result.
+5. Select **Past 30 minutes**, **Past 2 hours**, or **Past 24 hours** to correlate
+   with evidence in that interval instead of today's dominant task. These are
+   ranking contexts, not hard filters claiming every result was opened.
 
-**Advantages over raw event processing:** The Inference Engine handles noise filtering (Explorer thumbnails, antivirus scans, system-generated opens) server-side, provides exponential time-decay rather than discrete day-based tiers, and factors in access frequency — not just recency. A single API call replaces the previous approach of querying multiple time windows and performing client-side batch-OPEN detection.
+The client prefers `\\.\pipe\WarpFileActivityAPI-<session>`, with a legacy-name
+fallback, and checks server PID, user, session and executable name. This is not
+publisher/signature verification. An overall 1.5-second pipe budget, a 1 MiB
+message limit and generation checks keep stale completions out of the UI.
+The complete response is parsed before any features are accepted.
 
-**Graceful degradation:** If WARP is not running (the named pipe doesn't exist), the connection simply fails and the app falls back entirely to USN timestamp-based recency — no error dialogs, no user action required. The status bar shows "WARP ✔" when WARP data is active.
+Frozen references live at most 60 seconds. While the results window is active,
+the client revalidates the reference every five seconds; purge/clear/policy
+invalidation discards its features. Expiry is also checked locally. Unchanged
+features do not rebuild the results list. Queries, candidate metadata and
+context features are not added to FindMyFile's persistent index, and WARP's
+search API does not persist them either.
+
+The integration requests WARP's **activity** scope. If a restrictive policy is
+configured, `Find My File!.exe` must be allowed in the existing client/activity
+lists. The app does not weaken policy or change registry settings. The status
+line distinguishes unavailable, denied, expired and invalid responses.
+
+The shared ranker is copied byte-for-byte from WARP; the evaluator checks its
+hash against the recorded source. A same-directory association is a hypothesis,
+not proof that an unseen file was used. Current task features, not a blanket
+popularity score, determine the bounded delta.
+
+### Reproduce the synthetic evaluation
+
+```powershell
+.\tests\run_context_quality.ps1
+# ARM64 on VS 18:
+.\tests\run_context_quality.ps1 -Platform ARM64 -Toolset v145
+```
+
+This runs the production parser/ranker over **272 labeled cases**, including
+204 held-out cases across 12 project groups, with actual WARP-produced feature
+packets. Native tests exercise malformed data, exact/unseen safeguards, bounded
+relevance, multi-part pipes, timeout, peer checks and cancellation. The native
+predictor never reads relevance labels. Reports are written under
+`build\context-eval-<platform>`. See [the evaluation guide](tests/README.md).
+
+The upstream held-out result is nDCG@10 **0.3760 to 0.7556**, MRR@10 **0.2737 to
+0.7158**, Recall@10 **0.7255 to 0.8922**, and top-result success **0.1618 to
+0.6716**. Consumer gates require exact agreement with that verified ordering,
+without candidate loss or fallback changes. These are synthetic **reranking**
+results, not real-user relevance, live capture precision or full-disk recall.
+WARP's tested Qwen arm added no gain and remains experimental/off by default;
+FindMyFile does not call a model.
 
 ### Index Persistence
 
@@ -270,7 +357,7 @@ Only `fileMap` and `timestampCache` are persisted. The inverted, stemmed, and tr
 **Load path** (`LoadIndexFromFile`, called from `WM_LOAD_CACHED_INDEX`):
 - Uses memory-mapped I/O (`CreateFileMapping` + `MapViewOfFile`) for zero-copy, zero-syscall-per-record reads
 - Walks the mapped region with pointer arithmetic — no per-field `ReadFile` calls
-- After loading `fileMap`, calls `BuildSearchIndex()` to rebuild all search indexes, then pre-populates `fullPathCache`
+- After loading `fileMap`, calls `BuildSearchIndex()` to rebuild the search indexes; paths are resolved lazily.
 
 **Deferred startup loading:**
 - `WM_CREATE` posts a `WM_LOAD_CACHED_INDEX` message to itself and returns immediately, so the window appears instantly

@@ -3,6 +3,8 @@
 
 #include "framework.h"
 #include "Find My File!.h"
+#include "WarpContext.h"
+#include "SearchRanking.h"
 #include <winioctl.h>
 #include <vector>
 #include <string>
@@ -22,6 +24,8 @@
 #include <shlobj.h>
 #include <winhttp.h>
 #include <functional>
+#include <memory>
+#include <roapi.h>
 
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "shlwapi.lib")
@@ -56,6 +60,11 @@
 #define WM_USN_UPDATED      (WM_USER + 1)
 #define WM_OAUTH_COMPLETE   (WM_USER + 2)
 #define WM_LOAD_CACHED_INDEX (WM_USER + 3)
+#define WM_WARP_RESULT      (WM_USER + 4)
+#define IDC_WARP_CONTEXT    3005
+#define IDC_WARP_WINDOW     3006
+#define IDC_WARP_STATUS     3007
+#define IDT_WARP_REFRESH    6002
 #define IDC_PROPERTIES      7000
 #define IDC_PROP_TOGGLE     7001
 #define PROPERTIES_PANEL_W  420
@@ -120,7 +129,7 @@ HFONT hToggleFont = NULL;       // larger font for the toggle button glyph
 HFONT hHeaderFont = NULL;       // bold font for ListView column headers
 bool bToggleHovered = false;    // mouse is hovering over the toggle button
 
-// Cloud storage providers — OAuth2-based API access (no local sync required)
+// Cloud storage providers â€” OAuth2-based API access (no local sync required)
 HWND hCloudBtn = NULL;
 enum CloudProviderId { CP_ONEDRIVE = 0, CP_GOOGLEDRIVE = 1, CP_ICLOUD = 2, CP_COUNT = 3 };
 struct CloudProvider {
@@ -262,16 +271,17 @@ std::unordered_map<ULONGLONG, std::wstring> fullPathCache;
 // Cached timestamps (USN timestamp) for each file reference
 std::unordered_map<ULONGLONG, LARGE_INTEGER> timestampCache;
 
-// WARP inference data: lowercased full path -> precomputed recency_score.
-// The score (0–255) is computed server-side by the WARP Inference Engine using
-// exponential time-decay and 7-day access frequency.  Higher = more recent/frequent.
-// Populated via the GetInferenceDeltas API on each drive scan.
-std::unordered_map<std::wstring, double> warpRecencyByPath;
-// Resolved map: file reference -> WARP recency score.  Built by
-// BuildWarpRefMap() after both fullPathCache and warpRecencyByPath are ready.
-// Eliminates path-format mismatches at search time.
-std::unordered_map<ULONGLONG, double> warpRecencyByRef;
-bool bWarpAvailable = false;  // true if WARP service responded on last query
+HWND hWarpContext = NULL, hWarpWindow = NULL, hWarpStatus = NULL;
+std::unique_ptr<WarpContext::Worker> warpWorker;
+uint64_t warpGeneration = 0;
+bool warpInFlight = false, contextDemo = false;
+ULONGLONG warpNextRefresh = 0;
+WarpContext::Result warpContextResult;
+WarpContext::Demo warpDemo;
+#ifdef FINDMYFILE_CONTEXT_DEMO_ONLY
+std::wstring demoSmokeReport;
+int demoExitCode = 0;
+#endif
 
 // Goop folder exclusion cache: directory ref -> 1 (goop) / 0 (not goop).
 // Cleared on each search to avoid stale data after USN updates.
@@ -287,9 +297,11 @@ struct SearchResult {
     bool isDirectory;
     int matchScore;  // higher = better match (includes all bonuses)
     int baseScore = 0;   // match type score before any bonuses (for quality label)
-    int warpBonus = 0;   // WARP-specific recency boost included in matchScore (0 if none)
+    double warpBonus = 0; // bounded contextual delta; matchScore remains the baseline
+    std::wstring warpReason;
 };
 std::vector<SearchResult> searchResults;
+std::vector<SearchResult> baselineResults;
 
 // Drive buttons
 struct DriveButton {
@@ -344,7 +356,10 @@ static std::wstring UrlEncode(const std::wstring& s);
 static std::string  JsonGetString(const std::string& json, const std::string& key);
 static std::vector<SearchResult> JsonParseOneDriveResults(const std::string& json);
 static std::vector<SearchResult> JsonParseGoogleDriveResults(const std::string& json);
-static void QueryWarpActivity();
+static void BeginWarpSearch();
+static void ResetWarpContext(bool restoreOrder = true);
+static void RequestWarpContext(bool refresh = false);
+static void ShowContextDemo();
 static std::wstring GetIndexDbPath();
 static bool SaveIndexToFile();
 static bool LoadIndexFromFile();
@@ -1189,222 +1204,131 @@ void StopUsnMonitor()
     pendingUsnChanges.clear();
 }
 
-// Send a request to WARP and read the full response as a UTF-8 string.
-// Returns an empty string on any pipe communication failure.
-static std::string WarpPipeQuery(const char* request)
+static bool ExactCandidate(const SearchResult& item)
 {
-    HANDLE hPipe = CreateFileW(
-        L"\\\\.\\pipe\\WarpFileActivityAPI",
-        GENERIC_READ | GENERIC_WRITE,
-        0, NULL, OPEN_EXISTING, 0, NULL);
-    if (hPipe == INVALID_HANDLE_VALUE)
-        return "";
-
-    DWORD mode = PIPE_READMODE_MESSAGE;
-    SetNamedPipeHandleState(hPipe, &mode, NULL, NULL);
-
-    DWORD bytesWritten = 0;
-    if (!WriteFile(hPipe, request, (DWORD)strlen(request), &bytesWritten, NULL))
-    {
-        CloseHandle(hPipe);
-        return "";
-    }
-
-    // Read response — loop to handle ERROR_MORE_DATA on message-mode pipes.
-    // WARP caps responses at ~64 KB per message, but the pipe layer may still
-    // split delivery across multiple ReadFile calls.
-    std::string json;
-    json.reserve(65536);
-    std::vector<char> buf(65536);
-    for (;;)
-    {
-        DWORD bytesRead = 0;
-        BOOL ok = ReadFile(hPipe, buf.data(), (DWORD)buf.size(), &bytesRead, NULL);
-        if (bytesRead > 0)
-            json.append(buf.data(), bytesRead);
-        if (ok)
-            break;  // complete message received
-        if (GetLastError() == ERROR_MORE_DATA)
-            continue;  // more chunks remain
-        break;  // genuine error — use whatever we got
-    }
-    CloseHandle(hPipe);
-    return json;
+    return !bWildcardSearch && (_wcsicmp(item.fileName.c_str(), currentSearchKeyword.c_str()) == 0 ||
+        _wcsicmp(item.fullPath.c_str(), currentSearchKeyword.c_str()) == 0);
 }
 
-// Parse the WARP GetInferenceDeltas response and populate warpRecencyByPath
-// with precomputed recency_score values for file entities.
-// Response format: {"now":..., "deltas":[{"entity_key":"...","entity_type":"file",
-//   "recency_score":187.3, ...}, ...]}
-static void ParseWarpInferenceDeltas(const std::string& json)
+static void ApplyWarpContext(const WarpContext::Result& result)
 {
-    // Locate the "deltas" array
-    size_t deltasPos = json.find("\"deltas\"");
-    if (deltasPos == std::string::npos)
-        return;
-
-    // Find the '[' that starts the deltas array
-    size_t arrayStart = std::string::npos;
+    std::wstring selected;
+    const int selection = ListView_GetNextItem(hListView, -1, LVNI_SELECTED);
+    if (selection >= 0 && selection < (int)searchResults.size()) selected = searchResults[selection].fullPath;
+    searchResults = baselineResults;
+    std::map<std::wstring, const WarpContext::Feature*> features;
+    if (result.available)
+        for (const auto& feature : result.features) features[feature.key] = &feature;
+    std::vector<WarpSearch::RankInput> input;
+    for (auto& item : searchResults)
     {
-        size_t p = deltasPos + 8; // skip past '"deltas"'
-        while (p < json.size() && (json[p] == ' ' || json[p] == ':' || json[p] == '\t' || json[p] == '\n' || json[p] == '\r'))
-            p++;
-        if (p < json.size() && json[p] == '[')
-            arrayStart = p;
-    }
-    if (arrayStart == std::string::npos)
-        return;
-
-    // Find the matching ']'
-    size_t arrayEnd = json.size();
-    {
-        int depth = 0;
-        for (size_t i = arrayStart; i < json.size(); i++)
+        const auto it = features.find(WarpContext::NormalizePath(item.fullPath));
+        if (it != features.end())
         {
-            if (json[i] == '[') depth++;
-            else if (json[i] == ']') { depth--; if (depth == 0) { arrayEnd = i + 1; break; } }
+            item.warpBonus = WarpSearch::BoundedDelta({double(item.baseScore), it->second->delta, ExactCandidate(item)});
+            item.warpReason = it->second->reason;
         }
+        input.push_back({double(item.matchScore), item.warpBonus, ExactCandidate(item)});
     }
-
-    // Iterate over each object in the deltas array
-    size_t pos = arrayStart;
-    while (pos < arrayEnd)
-    {
-        // Find next '{' for an object
-        size_t objStart = json.find('{', pos);
-        if (objStart == std::string::npos || objStart >= arrayEnd) break;
-
-        // Find matching '}'
-        int depth = 0;
-        size_t objEnd = objStart;
-        for (size_t i = objStart; i < arrayEnd; i++)
+    const auto order = WarpSearch::Rank(input, result.available);
+    std::vector<SearchResult> ranked; ranked.reserve(searchResults.size());
+    for (auto index : order) ranked.push_back(std::move(searchResults[index]));
+    searchResults = std::move(ranked);
+    PopulateSearchResults();
+    for (size_t i = 0; !selected.empty() && i < searchResults.size(); ++i)
+        if (searchResults[i].fullPath == selected)
         {
-            if (json[i] == '{') depth++;
-            else if (json[i] == '}') { depth--; if (depth == 0) { objEnd = i + 1; break; } }
-        }
-        if (depth != 0)
+            ListView_SetItemState(hListView, (int)i, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
+            ListView_EnsureVisible(hListView, (int)i, FALSE);
             break;
-
-        std::string obj = json.substr(objStart, objEnd - objStart);
-
-        // Only process file entities
-        std::string entityType = JsonGetString(obj, "entity_type");
-        if (entityType == "file")
-        {
-            std::string entityKey = JsonGetString(obj, "entity_key");
-            if (!entityKey.empty())
-            {
-                // Extract recency_score (a floating-point number)
-                double score = 0.0;
-                {
-                    std::string needle = "\"recency_score\"";
-                    size_t kp = obj.find(needle);
-                    if (kp != std::string::npos)
-                    {
-                        kp += needle.size();
-                        while (kp < obj.size() && (obj[kp] == ' ' || obj[kp] == ':' || obj[kp] == '\t'))
-                            kp++;
-                        // Parse the number (may be integer or float)
-                        std::string numStr;
-                        while (kp < obj.size() && (obj[kp] == '-' || obj[kp] == '+' ||
-                               obj[kp] == '.' || (obj[kp] >= '0' && obj[kp] <= '9') ||
-                               obj[kp] == 'e' || obj[kp] == 'E'))
-                        {
-                            numStr += obj[kp];
-                            kp++;
-                        }
-                        if (!numStr.empty())
-                            score = atof(numStr.c_str());
-                    }
-                }
-
-                if (score > 0.0)
-                {
-                    // Lowercase the path to match the lookup in
-                    // GetWarpRecencyBonus, which lowercases the path
-                    // built from MFT data before searching.
-                    std::wstring wpath = Utf8ToWide(entityKey);
-                    for (auto& ch : wpath)
-                        ch = towlower(ch);
-                    warpRecencyByPath[wpath] = score;
-                }
-            }
         }
-
-        pos = objEnd;
-    }
 }
 
-// Query WARP's Inference Engine for precomputed recency scores via the
-// GetInferenceDeltas API.  This replaces the old approach of reading raw
-// file events and computing scores client-side.  The Inference Engine
-// provides a composite recency_score (0-255) that combines exponential
-// time-decay with 7-day access frequency, with noise filtering handled
-// server-side.
-static void QueryWarpActivity()
+static void ResetWarpContext(bool restoreOrder)
 {
-    warpRecencyByPath.clear();
-    warpRecencyByRef.clear();
-    bWarpAvailable = false;
+    if (warpWorker) warpGeneration = warpWorker->Cancel();
+    warpInFlight = false;
+    const bool hadFeatures = warpContextResult.available;
+    warpContextResult = {};
+    if (restoreOrder && hadFeatures) ApplyWarpContext(warpContextResult);
+}
 
-    // Use GetInferenceDeltas with since_version=0 to bulk-load all records.
-    // The response contains up to 5000 records per call; we loop to page
-    // through all of them.
-    ULONGLONG sinceVersion = 0;
-    for (;;)
+static void RequestWarpContext(bool refresh)
+{
+    warpNextRefresh = GetTickCount64() + 5000;
+    if (!hWarpContext || SendMessage(hWarpContext, BM_GETCHECK, 0, 0) != BST_CHECKED)
     {
-        char request[128];
-        sprintf_s(request, sizeof(request),
-            "{\"op\":\"GetInferenceDeltas\",\"since_version\":%llu}", sinceVersion);
-
-        std::string json = WarpPipeQuery(request);
-        if (json.empty())
-        {
-            if (!bWarpAvailable)
-                return;  // WARP not running
-            break;
-        }
-
-        bWarpAvailable = true;
-        size_t prevSize = warpRecencyByPath.size();
-        ParseWarpInferenceDeltas(json);
-
-        // Find the highest version in this batch to use as watermark for next page.
-        // Look for the last "version": value in the response.
-        ULONGLONG maxVersion = sinceVersion;
-        {
-            size_t searchPos = 0;
-            for (;;)
-            {
-                size_t vp = json.find("\"version\"", searchPos);
-                if (vp == std::string::npos) break;
-                vp += 9; // skip past '"version"'
-                while (vp < json.size() && (json[vp] == ' ' || json[vp] == ':' || json[vp] == '\t'))
-                    vp++;
-                ULONGLONG v = 0;
-                while (vp < json.size() && json[vp] >= '0' && json[vp] <= '9')
-                {
-                    v = v * 10 + (json[vp] - '0');
-                    vp++;
-                }
-                if (v > maxVersion)
-                    maxVersion = v;
-                searchPos = vp;
-            }
-        }
-
-        // If no new records were added or version didn't advance, we're done
-        if (warpRecencyByPath.size() == prevSize || maxVersion == sinceVersion)
-            break;
-
-        sinceVersion = maxVersion;
+        SetWindowTextW(hWarpStatus, contextDemo ? L"Synthetic replay: baseline order (context off)" : L"Context off; baseline results");
+        return;
     }
+    if (contextDemo)
+    {
+        warpContextResult = warpDemo.result;
+        ApplyWarpContext(warpContextResult);
+        SetWindowTextW(hWarpStatus, L"SYNTHETIC REPLAY: recorded WARP features; no live capture");
+        return;
+    }
+    if (!warpWorker || baselineResults.empty() || currentSearchKeyword.empty()) return;
+    WarpContext::Request request;
+    request.query = currentSearchKeyword;
+    const int windows[] = {0, 1800, 7200, 86400};
+    const int selection = (int)SendMessage(hWarpWindow, CB_GETCURSEL, 0, 0);
+    request.windowSeconds = windows[(selection >= 0 && selection < 4) ? selection : 0];
+    if (refresh && warpContextResult.available && warpContextResult.expiresMs > WarpContext::NowMs())
+        request.reference = warpContextResult.reference;
+    std::set<std::wstring> keys;
+    for (const auto& item : baselineResults)
+    {
+        if (item.isDirectory || !item.cloudSource.empty() || item.fullPath.empty() || item.baseScore < 20 ||
+            item.fullPath.find(L"://") != std::wstring::npos) continue;
+        const auto key = WarpContext::NormalizePath(item.fullPath);
+        if (!keys.insert(key).second) continue;
+        request.candidates.push_back({key, item.fileName, item.contentSnippet, double(item.baseScore), ExactCandidate(item)});
+        if (request.candidates.size() == WarpContext::MaxCandidates) break;
+    }
+    if (request.candidates.empty())
+    {
+        SetWindowTextW(hWarpStatus, L"No eligible local candidates; baseline results");
+        return;
+    }
+    warpGeneration = warpWorker->Submit(std::move(request));
+    warpInFlight = true;
+    if (!refresh) SetWindowTextW(hWarpStatus, L"Baseline results ready; checking WARP context...");
+}
+
+static void BeginWarpSearch()
+{
+    ResetWarpContext(false);
+    baselineResults = searchResults;
+    RequestWarpContext();
+}
+
+static void ShowContextDemo()
+{
+    ResetWarpContext(false);
+    searchResults.clear();
+    currentSearchKeyword = warpDemo.request.query;
+    bWindowsSearch = false; bWildcardSearch = false;
+    for (const auto& item : warpDemo.request.candidates)
+    {
+        SearchResult row{};
+        row.fileName = item.name; row.fullPath = item.key; row.contentSnippet = item.title;
+        row.matchScore = row.baseScore = (int)item.base;
+        searchResults.push_back(std::move(row));
+    }
+    std::stable_sort(searchResults.begin(), searchResults.end(),
+        [](const SearchResult& a, const SearchResult& b) { return a.matchScore > b.matchScore; });
+    baselineResults = searchResults;
+    PopulateSearchResults();
+    TabCtrl_SetCurSel(hTabControl, 1); ShowTab(1);
+    SetWindowTextW(hStatusText, L"Synthetic labeled budget search. Toggle WARP context to compare the same candidates.");
+    RequestWarpContext();
 }
 
 // ---------------------------------------------------------------------------
-// Index persistence — save/load fileMap + timestamps to disk so subsequent
+// Index persistence â€” save/load fileMap + timestamps to disk so subsequent
 // launches can skip the MFT scan.  Search indexes (inverted, stemmed,
-// trigram) are rebuilt from fileMap via BuildSearchIndex() on load — this is
+// trigram) are rebuilt from fileMap via BuildSearchIndex() on load â€” this is
 // far faster than serialising and deserialising them with millions of I/O
 // operations.
 // ---------------------------------------------------------------------------
@@ -1701,63 +1625,10 @@ static bool LoadIndexFromFile()
     return true;
 }
 
-// Return the WARP-only recency bonus for a file (0 if no WARP data).
-// Maps the Inference Engine's precomputed recency_score (0-255) linearly
-// to a 0-125 bonus range.  The large magnitude is intentional — it allows
-// recent WARP activity to promote a weaker match type (e.g. substring)
-// above a stronger match type (e.g. exact) that has no recent activity.
-// 'now' is unused but kept for API compatibility with GetRecencyBonus.
-static int GetWarpRecencyBonus(ULONGLONG fileRef, ULONGLONG /*now*/)
-{
-    if (!bWarpAvailable || warpRecencyByRef.empty())
-        return 0;
-
-    auto it = warpRecencyByRef.find(fileRef);
-    if (it == warpRecencyByRef.end())
-        return 0;
-
-    // Map recency_score (0-255) to bonus (0-125).
-    double score = it->second;
-    if (score <= 0.0)
-        return 0;
-    if (score > 255.0)
-        score = 255.0;
-    return (int)(score * 125.0 / 255.0 + 0.5);
-}
-
-// Build the warpRecencyByRef lookup from warpRecencyByPath + fullPathCache.
-// Called after both are fully populated (after QueryWarpActivity).
-static void BuildWarpRefMap()
-{
-    warpRecencyByRef.clear();
-    if (warpRecencyByPath.empty())
-        return;
-
-    // Build a reverse index: lowercased full path -> file reference
-    for (auto& kv : fullPathCache)
-    {
-        std::wstring lower = kv.second;
-        for (auto& ch : lower)
-            ch = towlower(ch);
-        auto warpIt = warpRecencyByPath.find(lower);
-        if (warpIt != warpRecencyByPath.end())
-            warpRecencyByRef[kv.first] = warpIt->second;
-    }
-}
-
-// Compute a recency bonus based on WARP Inference Engine scores and USN timestamp.
-// WARP's precomputed recency_score (combining time-decay + access frequency) is
-// the primary signal, mapped to a 0-125 bonus.  Files with only USN timestamps
-// get a smaller bonus (up to 10).  Files with no recency information get 0.
+// Preserve the existing filesystem-timestamp tie-breaker independently of WARP.
 // 'now' is the current time as a 64-bit FILETIME value.
 static int GetRecencyBonus(ULONGLONG fileRef, ULONGLONG now)
 {
-    // 1) Try WARP activity signal (delegates to GetWarpRecencyBonus)
-    int wb = GetWarpRecencyBonus(fileRef, now);
-    if (wb > 0)
-        return wb;
-
-    // 2) Fallback: USN timestamp (weaker signal — filesystem metadata only)
     auto tsIt = timestampCache.find(fileRef);
     if (tsIt == timestampCache.end())
         return 0;
@@ -1847,7 +1718,7 @@ static bool IsWildcardPattern(const std::wstring& s)
 }
 
 // Case-insensitive glob/wildcard match. Supports * (any sequence) and ? (any single char).
-// Uses an iterative algorithm with backtracking — no recursion, O(N*M) worst case.
+// Uses an iterative algorithm with backtracking â€” no recursion, O(N*M) worst case.
 static bool WildcardMatch(const wchar_t* str, const wchar_t* pattern)
 {
     const wchar_t* sp = nullptr;  // backtrack position in str
@@ -1958,7 +1829,7 @@ static void ForEachPrefixMatch(
 }
 
 // ---------------------------------------------------------------------------
-// "Goop" folder exclusion — filter out system/app/cache/build directories
+// "Goop" folder exclusion â€” filter out system/app/cache/build directories
 // from global (unscoped) searches.  Definition sourced from the PM spec
 // "Intelligent Global File Searchability" goop categories 1-10.
 // ---------------------------------------------------------------------------
@@ -1979,7 +1850,7 @@ static bool IsRootLevelGoopName(const std::wstring& name)
     // Cat 2: Program Files
     if (IEqualW(name, L"Program Files")) return true;
     if (IEqualW(name, L"Program Files (x86)")) return true;
-    // Cat 3: ProgramData  (exception: Start Menu shortcut subdir — handled
+    // Cat 3: ProgramData  (exception: Start Menu shortcut subdir â€” handled
     //         by the scoped-search escape: user navigates there explicitly)
     if (IEqualW(name, L"ProgramData")) return true;
     // Cat 5 / 9: per-volume system & recovery
@@ -2006,7 +1877,7 @@ static bool IsRootLevelGoopName(const std::wstring& name)
 // folder (which itself is under "Users" at root), everything beneath it
 // is goop.  We detect this structurally: parent is a child of "Users"
 // which is a child of root.  But for simplicity and coverage, we just
-// match the name "AppData" at any depth — the false-positive risk of a
+// match the name "AppData" at any depth â€” the false-positive risk of a
 // user folder literally named "AppData" is near zero.
 // Also covers Cat 7 legacy junction names under user profiles.
 static bool IsUserProfileGoopName(const std::wstring& name)
@@ -2075,7 +1946,7 @@ static bool IsAnyDepthGoopName(const std::wstring& name)
     // Cat 10: NTFS metadata
     if (IEqualW(name, L"$Extend")) return true;
 
-    // found.NNN from CHKDSK (Cat 5) — match "found.000" through "found.999"
+    // found.NNN from CHKDSK (Cat 5) â€” match "found.000" through "found.999"
     if (name.length() == 9 && _wcsnicmp(name.c_str(), L"found.", 6) == 0)
     {
         bool allDigits = true;
@@ -2152,7 +2023,7 @@ static bool IsInGoopFolder(ULONGLONG fileRef)
         depth++;
     }
 
-    // Reached root without hitting any goop ancestor — mark all as clean
+    // Reached root without hitting any goop ancestor â€” mark all as clean
     for (ULONGLONG ref : chain)
         goopCache[ref] = 0;
     return false;
@@ -2235,8 +2106,7 @@ void PerformSearch(const std::wstring& keyword, ULONGLONG scopeRef)
                 return;
 
             int base = 90; // wildcard match base score
-            int wb = GetWarpRecencyBonus(ref, now);
-            int score = base + ((wb > 0) ? wb : GetRecencyBonus(ref, now));
+            int score = base + GetRecencyBonus(ref, now);
 
             SearchResult sr;
             sr.fileRef = ref;
@@ -2244,7 +2114,6 @@ void PerformSearch(const std::wstring& keyword, ULONGLONG scopeRef)
             sr.isDirectory = entry.isDirectory;
             sr.matchScore = score;
             sr.baseScore = base;
-            sr.warpBonus = wb;
             searchResults.push_back(sr);
         };
 
@@ -2313,7 +2182,7 @@ void PerformSearch(const std::wstring& keyword, ULONGLONG scopeRef)
             res.first->second = score;
     };
 
-    // 1) Exact token match (score 100) — O(1) hash lookup
+    // 1) Exact token match (score 100) â€” O(1) hash lookup
     {
         auto exactIt = invertedIndex.find(lowerKeyword);
         if (exactIt != invertedIndex.end())
@@ -2323,7 +2192,7 @@ void PerformSearch(const std::wstring& keyword, ULONGLONG scopeRef)
         }
     }
 
-    // 2) Prefix matches on sorted token list — O(log N + matches)
+    // 2) Prefix matches on sorted token list â€” O(log N + matches)
     ForEachPrefixMatch(sortedTokens, invertedIndex, lowerKeyword,
         [&](const std::wstring& token, const std::vector<ULONGLONG>& refs) {
             if (token == lowerKeyword) return; // already handled as exact
@@ -2331,7 +2200,7 @@ void PerformSearch(const std::wstring& keyword, ULONGLONG scopeRef)
                 addScore(ref, 75);
         });
 
-    // 3) Substring match via trigram index — eliminates the O(N) fileMap scan.
+    // 3) Substring match via trigram index â€” eliminates the O(N) fileMap scan.
     //    For keywords >= 3 chars: extract trigrams from the keyword, find the trigram
     //    with the smallest posting list, then verify actual substring on those candidates.
     //    For keywords < 3 chars: fall back to brute-force scan (rare, very fast anyway).
@@ -2356,7 +2225,7 @@ void PerformSearch(const std::wstring& keyword, ULONGLONG scopeRef)
             if (tgIt == trigramIndex.end())
             {
                 smallest = nullptr;
-                break; // trigram not in any filename — zero candidates
+                break; // trigram not in any filename â€” zero candidates
             }
             if (!smallest || tgIt->second.size() < smallest->size())
                 smallest = &tgIt->second;
@@ -2381,7 +2250,7 @@ void PerformSearch(const std::wstring& keyword, ULONGLONG scopeRef)
     }
     else if (kwLen > 0 && kwLen < 3)
     {
-        // Short keyword fallback — brute-force scan (only for 1-2 char queries)
+        // Short keyword fallback â€” brute-force scan (only for 1-2 char queries)
         for (auto& pair : fileMap)
         {
             if (matchScores.count(pair.first))
@@ -2394,7 +2263,7 @@ void PerformSearch(const std::wstring& keyword, ULONGLONG scopeRef)
         }
     }
 
-    // 4) Stemmed matching — O(1) hash + O(log N) prefix range
+    // 4) Stemmed matching â€” O(1) hash + O(log N) prefix range
     std::wstring stemmedKeyword = StemWord(lowerKeyword);
     if (!stemmedKeyword.empty())
     {
@@ -2432,7 +2301,7 @@ void PerformSearch(const std::wstring& keyword, ULONGLONG scopeRef)
     }
 
     // 5) Fuzzy matching via Levenshtein distance (max distance 2).
-    //    Only check tokens whose length is within ±2 of the keyword length,
+    //    Only check tokens whose length is within Â±2 of the keyword length,
     //    since edit distance ? 2 can change length by at most 2.
     //    Skip very short keywords (< 4 chars) to avoid noisy false positives.
     if (kwLen >= 4)
@@ -2474,7 +2343,7 @@ void PerformSearch(const std::wstring& keyword, ULONGLONG scopeRef)
     GetSystemTimeAsFileTime(&ftNow);
     ULONGLONG now = ((ULONGLONG)ftNow.dwHighDateTime << 32) | ftNow.dwLowDateTime;
 
-    // Build results with bonus scoring — defer fullPath to after truncation
+    // Build results with bonus scoring â€” defer fullPath to after truncation
     searchResults.reserve(matchScores.size());
     for (auto& pair : matchScores)
     {
@@ -2496,15 +2365,13 @@ void PerformSearch(const std::wstring& keyword, ULONGLONG scopeRef)
         if (HasExactCaseMatch(it->second.fileName, keyword))
             score += 15;
 
-        int wb = GetWarpRecencyBonus(ref, now);
-        score += (wb > 0) ? wb : GetRecencyBonus(ref, now);
+        score += GetRecencyBonus(ref, now);
 
         SearchResult sr;
         sr.fileRef = ref;
         sr.fileName = it->second.fileName;
         sr.baseScore = base;
-        sr.warpBonus = wb;
-        // fullPath deferred — will be built only for the final top-N results
+        // fullPath deferred â€” will be built only for the final top-N results
         sr.isDirectory = it->second.isDirectory;
         sr.matchScore = score;
         searchResults.push_back(sr);
@@ -2541,6 +2408,7 @@ void PerformSearch(const std::wstring& keyword, ULONGLONG scopeRef)
 // First tries the USN timestamp cache; falls back to querying the filesystem.
 static std::wstring FormatTimestamp(ULONGLONG fileRef, const std::wstring& fullPath)
 {
+    if (contextDemo) return L"Synthetic";
     FILETIME ft = {0, 0};
 
     auto tsIt = timestampCache.find(fileRef);
@@ -2621,6 +2489,9 @@ int GetFileIconIndex(const std::wstring& fileName, bool isDirectory)
 // Execute the current search (called from Find button and debounce timer)
 void TriggerSearch(HWND hWnd)
 {
+    if (contextDemo) { ShowContextDemo(); return; }
+    ResetWarpContext();
+    baselineResults.clear();
     wchar_t searchText[512] = {0};
     GetWindowTextW(hSearchEdit, searchText, 512);
     std::wstring keyword(searchText);
@@ -2679,9 +2550,8 @@ void TriggerSearch(HWND hWnd)
     wchar_t timeBuf[64];
     swprintf_s(timeBuf, 64, L"  |  %.1f ms", searchElapsedMS);
     status += timeBuf;
-    if (bWarpAvailable)
-        status += L"  |  WARP \u2714";
     SetWindowTextW(hStatusText, status.c_str());
+    BeginWarpSearch();
 }
 
 // --- Cloud storage provider configuration (OAuth2 + REST API) ---
@@ -2692,9 +2562,9 @@ void TriggerSearch(HWND hWnd)
 // %APPDATA%\FindMyFile\cloud_tokens.ini.
 //
 // To obtain credentials, register an application at:
-//   OneDrive  — Azure App Registration  (https://portal.azure.com)
-//   Google    — Google Cloud Console     (https://console.cloud.google.com)
-//   iCloud    — Apple Developer account  (https://developer.apple.com)
+//   OneDrive  â€” Azure App Registration  (https://portal.azure.com)
+//   Google    â€” Google Cloud Console     (https://console.cloud.google.com)
+//   iCloud    â€” Apple Developer account  (https://developer.apple.com)
 // Each registration must add http://localhost:5483/callback as a redirect URI.
 
 static const int  OAUTH_PORT = 5483;
@@ -2959,7 +2829,7 @@ static void CancelOAuthListen()
 }
 
 // Perform OAuth2 login for a given provider. Opens the browser, waits for callback.
-// This function blocks until the OAuth flow completes — call from a background thread.
+// This function blocks until the OAuth flow completes â€” call from a background thread.
 bool CloudOAuth2Login(HWND hParent, CloudProviderId id)
 {
     CloudProvider& cp = cloudProviders[id];
@@ -3178,7 +3048,7 @@ static std::vector<SearchResult> JsonParseOneDriveResults(const std::string& jso
         size_t objStart = json.rfind('{', itemStart);
         if (objStart == std::string::npos) { pos = itemStart + 6; continue; }
 
-        // Find matching '}' — simple brace counting
+        // Find matching '}' â€” simple brace counting
         int depth = 0;
         size_t objEnd = objStart;
         for (size_t i = objStart; i < json.size(); i++)
@@ -3462,13 +3332,13 @@ static void RefreshCloudDialogStatus(HWND hDlg)
     setProviderUI(CP_GOOGLEDRIVE, IDC_GD_STATUS, IDC_GD_LOGIN, IDC_GD_LOGOUT);
     setProviderUI(CP_ICLOUD,      IDC_IC_STATUS, IDC_IC_LOGIN, IDC_IC_LOGOUT);
 
-    // iCloud note: no public API — override status
+    // iCloud note: no public API â€” override status
     if (!cloudProviders[CP_ICLOUD].loggedIn)
     {
         if (hasCredentials(CP_ICLOUD))
-            SetDlgItemTextW(hDlg, IDC_IC_STATUS, L"Ready (limited — no public search API)");
+            SetDlgItemTextW(hDlg, IDC_IC_STATUS, L"Ready (limited â€” no public search API)");
         else
-            SetDlgItemTextW(hDlg, IDC_IC_STATUS, L"Enter credentials (limited — no public search API)");
+            SetDlgItemTextW(hDlg, IDC_IC_STATUS, L"Enter credentials (limited â€” no public search API)");
     }
 
     int online = 0;
@@ -3536,7 +3406,7 @@ INT_PTR CALLBACK CloudConfigDlgProc(HWND hDlg, UINT message, WPARAM wParam, LPAR
 
     case WM_OAUTH_COMPLETE:
         {
-            // Background OAuth thread finished — update UI
+            // Background OAuth thread finished â€” update UI
             bool ok = (wParam != 0);
             CloudProvider& cp = cloudProviders[oauthActiveProvider];
             if (ok)
@@ -3581,7 +3451,7 @@ INT_PTR CALLBACK CloudConfigDlgProc(HWND hDlg, UINT message, WPARAM wParam, LPAR
             {
                 if (wmId2 == IDOK || wmId2 == IDCANCEL)
                 {
-                    // "Cancel" button pressed — abort the OAuth flow
+                    // "Cancel" button pressed â€” abort the OAuth flow
                     CancelOAuthLogin();
                     SetDlgItemTextW(hDlg, IDC_CLOUD_STATUS, L"Sign-in cancelled.");
                     SetCloudDialogBusy(hDlg, false);
@@ -3655,6 +3525,9 @@ INT_PTR CALLBACK CloudConfigDlgProc(HWND hDlg, UINT message, WPARAM wParam, LPAR
 // Perform a search using the Windows Search Indexer via OLE DB.
 void TriggerWindowsSearch(HWND hWnd)
 {
+    if (contextDemo) { ShowContextDemo(); return; }
+    ResetWarpContext();
+    baselineResults.clear();
     wchar_t searchText[512] = {0};
     GetWindowTextW(hSearchEdit, searchText, 512);
     std::wstring keyword(searchText);
@@ -3772,7 +3645,7 @@ void TriggerWindowsSearch(HWND hWnd)
         }
     }
 
-    // Build the SQL query — search by System.FileName LIKE '%keyword%'
+    // Build the SQL query â€” search by System.FileName LIKE '%keyword%'
     // Escape single quotes in the keyword
     std::wstring escapedKw;
     for (wchar_t c : keyword)
@@ -3783,7 +3656,7 @@ void TriggerWindowsSearch(HWND hWnd)
             escapedKw += c;
     }
 
-    // Build scope — use the selected folder if available, otherwise fall back to drive
+    // Build scope â€” use the selected folder if available, otherwise fall back to drive
     std::wstring scopeClause;
     if (!scopePath.empty())
     {
@@ -4128,7 +4001,7 @@ void TriggerWindowsSearch(HWND hWnd)
             }
 
             // Filename matches rank higher than content-only matches
-            sr.matchScore = filenameMatch ? 60 : 20;
+            sr.matchScore = sr.baseScore = filenameMatch ? 60 : 20;
             searchResults.push_back(std::move(sr));
 
             if (searchResults.size() >= MAX_RESULTS)
@@ -4155,7 +4028,7 @@ void TriggerWindowsSearch(HWND hWnd)
         std::vector<SearchResult> cloudResults = CloudSearchFiles((CloudProviderId)ci, keyword);
         for (auto& cr : cloudResults)
         {
-            cr.matchScore = 51; // cloud results ranked between local filename(60) and content(20)
+            cr.matchScore = cr.baseScore = 51; // cloud results ranked between local filename(60) and content(20)
             searchResults.push_back(std::move(cr));
             cloudHits++;
         }
@@ -4205,6 +4078,7 @@ void TriggerWindowsSearch(HWND hWnd)
     swprintf_s(timeBuf, 64, L"  |  %.1f ms", searchElapsedMS);
     status += timeBuf;
     SetWindowTextW(hStatusText, status.c_str());
+    BeginWarpSearch();
 }
 
 // Format a byte size into a human-readable string.
@@ -4241,10 +4115,21 @@ void UpdatePropertiesPanel(int selectedIndex)
     info += L"  Name:\r\n  " + sr.fileName + L"\r\n\r\n";
     info += L"  Type:  " + std::wstring(sr.isDirectory ? L"Folder" : L"File") + L"\r\n\r\n";
     info += L"  Path:\r\n  " + sr.fullPath + L"\r\n\r\n";
+    if (!sr.warpReason.empty())
+    {
+        wchar_t delta[32]; swprintf_s(delta, L" (+%.1f)", sr.warpBonus);
+        info += L"  WARP context" + std::wstring(delta) + L":\r\n  " + sr.warpReason + L"\r\n\r\n";
+    }
+    if (contextDemo)
+    {
+        info += L"  SYNTHETIC REPLAY\r\n  No real file is opened or inspected.\r\n";
+        SetWindowTextW(hPropertiesPanel, info.c_str());
+        return;
+    }
 
     if (!sr.contentSnippet.empty())
     {
-        // Build snippet text with «keyword» markers around each match
+        // Build snippet text with Â«keywordÂ» markers around each match
         std::wstring snippet = sr.contentSnippet;
         std::wstring lowerSnippet = snippet;
         for (auto& sc : lowerSnippet)
@@ -4280,7 +4165,7 @@ void UpdatePropertiesPanel(int selectedIndex)
 
         auto fmtTime = [](const FILETIME& ft) -> std::wstring {
             if (ft.dwLowDateTime == 0 && ft.dwHighDateTime == 0)
-                return L"—";
+                return L"â€”";
             FILETIME ftLocal;
             FileTimeToLocalFileTime(&ft, &ftLocal);
             SYSTEMTIME st;
@@ -4367,7 +4252,7 @@ void PopulateSearchResults()
                 quality = (sr.matchScore >= 60) ? L"Filename" : L"Content";
         }
         else if (bWildcardSearch) quality = L"Wildcard";
-        else if (sr.baseScore >= 100) quality = L"Exact";
+        else if (sr.baseScore >= 100) quality = ExactCandidate(sr) ? L"Exact name" : L"Exact token";
         else if (sr.baseScore >= 75) quality = L"Prefix";
         else if (sr.baseScore >= 50) quality = L"Token Match";
         else if (sr.baseScore >= 40) quality = L"Substring";
@@ -4378,17 +4263,17 @@ void PopulateSearchResults()
         // WARP Boost column
         wchar_t warpBuf[16] = {0};
         if (sr.warpBonus > 0)
-            swprintf_s(warpBuf, 16, L"+%d", sr.warpBonus);
+            swprintf_s(warpBuf, 16, L"+%.1f", sr.warpBonus);
         else
             wcscpy_s(warpBuf, 16, L"\u2014");
         ListView_SetItemText(hListView, (int)i, 5, warpBuf);
 
         // Total Score column
         wchar_t scoreBuf[16] = {0};
-        swprintf_s(scoreBuf, 16, L"%d", sr.matchScore);
+        swprintf_s(scoreBuf, 16, L"%.1f", sr.matchScore + sr.warpBonus);
         ListView_SetItemText(hListView, (int)i, 6, scoreBuf);
 
-        // Snippet column — show content preview for Windows Search content matches
+        // Snippet column â€” show content preview for Windows Search content matches
         if (!sr.contentSnippet.empty())
             ListView_SetItemText(hListView, (int)i, 7, (LPWSTR)sr.contentSnippet.c_str());
     }
@@ -4400,12 +4285,13 @@ void PopulateSearchResults()
 // Launch a file or folder from search results
 void LaunchSearchResult(int index)
 {
+    if (contextDemo) return;
     if (index < 0 || index >= (int)searchResults.size())
         return;
 
     const SearchResult& sr = searchResults[index];
 
-    // Cloud results have URLs — open in browser
+    // Cloud results have URLs â€” open in browser
     if (sr.fullPath.find(L"http://") == 0 || sr.fullPath.find(L"https://") == 0)
     {
         ShellExecuteW(NULL, L"open", sr.fullPath.c_str(), NULL, NULL, SW_SHOWNORMAL);
@@ -4692,10 +4578,8 @@ void ReadDriveAndBuildTree(HWND hWnd, const std::wstring& drive)
         fullPathCache.clear();
         timestampCache.clear();
         searchResults.clear();
-        warpRecencyByPath.clear();
-        warpRecencyByRef.clear();
+        baselineResults.clear();
         goopCache.clear();
-        bWarpAvailable = false;
 
         // Disable drive buttons during scan
         for (auto& db : driveButtons)
@@ -4735,16 +4619,6 @@ void ReadDriveAndBuildTree(HWND hWnd, const std::wstring& drive)
             
             UpdateProgress(92, L"Building search index...");
             BuildSearchIndex(drive);
-
-            // Pre-populate fullPathCache for all files so WARP recency lookups work
-            UpdateProgress(98, L"Building path cache...");
-            for (auto& pair : fileMap)
-                BuildFullPath(pair.first, drive);
-
-            // Query WARP for file activity recency signals
-            UpdateProgress(99, L"Querying WARP activity...");
-            QueryWarpActivity();
-            BuildWarpRefMap();
 
             if (!bTreeRenderedOnce)
             {
@@ -4897,6 +4771,13 @@ void LayoutControls(HWND hWnd)
             darkBtnWidth, buttonHeight, SWP_NOZORDER);
     }
     currentY += buttonRowHeight;
+    if (hWarpContext)
+        SetWindowPos(hWarpContext, NULL, 12, currentY + 3, 170, 26, SWP_NOZORDER);
+    if (hWarpWindow)
+        SetWindowPos(hWarpWindow, NULL, 190, currentY + 3, 180, 160, SWP_NOZORDER);
+    if (hWarpStatus)
+        SetWindowPos(hWarpStatus, NULL, 384, currentY + 7, (std::max)(100L, rcClient.right - 396), 24, SWP_NOZORDER);
+    currentY += 34;
     
     if (hStatusText)
     {
@@ -5030,6 +4911,44 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
 {
     UNREFERENCED_PARAMETER(hPrevInstance);
     UNREFERENCED_PARAMETER(lpCmdLine);
+    const HRESULT runtime = RoInitialize(RO_INIT_SINGLETHREADED);
+    if (FAILED(runtime)) return 2;
+    int argc = 0;
+    LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+    std::wstring demoPath;
+#ifdef FINDMYFILE_CONTEXT_DEMO_ONLY
+    contextDemo = true;
+#endif
+    for (int i = 1; argv && i < argc; ++i)
+    {
+#ifdef FINDMYFILE_CONTEXT_DEMO_ONLY
+        if (wcscmp(argv[i], L"--smoke-report") == 0 && i + 1 < argc)
+        { demoSmokeReport = argv[++i]; continue; }
+#endif
+        if (wcscmp(argv[i], L"--context-demo") == 0)
+        {
+            contextDemo = true;
+            if (i + 1 < argc) demoPath = argv[++i];
+        }
+    }
+    if (argv) LocalFree(argv);
+    if (contextDemo)
+    {
+        if (demoPath.empty())
+        {
+            wchar_t path[32768]; GetModuleFileNameW(NULL, path, (DWORD)std::size(path));
+            const std::wstring exe(path);
+            demoPath = exe.substr(0, exe.find_last_of(L'\\') + 1) + L"context-demo.json";
+        }
+        try { warpDemo = WarpContext::ReadDemo(demoPath); }
+        catch (...)
+        {
+            MessageBoxW(NULL, L"Could not load the synthetic context-demo.json fixture. No live search was started.",
+                L"FindMyFile Context Demo", MB_OK | MB_ICONERROR);
+            RoUninitialize();
+            return 2;
+        }
+    }
 
     INITCOMMONCONTROLSEX icex;
     icex.dwSize = sizeof(INITCOMMONCONTROLSEX);
@@ -5037,11 +4956,13 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
     InitCommonControlsEx(&icex);
 
     LoadStringW(hInstance, IDS_APP_TITLE, szTitle, MAX_LOADSTRING);
+    if (contextDemo) wcscpy_s(szTitle, L"FindMyFile - Synthetic WARP Context Demo");
     LoadStringW(hInstance, IDC_FINDMYFILE, szWindowClass, MAX_LOADSTRING);
     MyRegisterClass(hInstance);
 
     if (!InitInstance(hInstance, nCmdShow))
     {
+        RoUninitialize();
         return FALSE;
     }
 
@@ -5058,6 +4979,7 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
         }
     }
 
+    RoUninitialize();
     return (int)msg.wParam;
 }
 
@@ -5086,14 +5008,14 @@ BOOL InitInstance(HINSTANCE hInstance, int nCmdShow)
     hInst = hInstance;
 
     HWND hWnd = CreateWindowW(szWindowClass, szTitle, WS_OVERLAPPEDWINDOW,
-        CW_USEDEFAULT, 0, 1024, 700, nullptr, nullptr, hInstance, nullptr);
+        CW_USEDEFAULT, 0, 1240, 780, nullptr, nullptr, hInstance, nullptr);
 
     if (!hWnd)
     {
         return FALSE;
     }
 
-    ShowWindow(hWnd, SW_SHOWMAXIMIZED);
+    ShowWindow(hWnd, contextDemo ? nCmdShow : SW_SHOWMAXIMIZED);
     UpdateWindow(hWnd);
 
     return TRUE;
@@ -5105,7 +5027,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
     {
     case WM_CREATE:
         {
-            CreateDriveButtons(hWnd);
+            if (!contextDemo) CreateDriveButtons(hWnd);
 
             // Search box and Find button (placed after drive buttons in the toolbar row)
             hSearchEdit = CreateWindowExW(
@@ -5122,6 +5044,20 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
                 0, L"BUTTON", L"Find with Windows Search",
                 WS_CHILD | WS_VISIBLE | BS_OWNERDRAW | WS_DISABLED,
                 0, 5, 160, 25, hWnd, (HMENU)IDC_WINSEARCH_BUTTON, hInst, NULL);
+
+            hWarpContext = CreateWindowExW(0, L"BUTTON", L"Use WARP context",
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
+                12, 42, 170, 26, hWnd, (HMENU)IDC_WARP_CONTEXT, hInst, NULL);
+            SendMessage(hWarpContext, BM_SETCHECK, BST_CHECKED, 0);
+            hWarpWindow = CreateWindowExW(0, L"COMBOBOX", L"",
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST,
+                190, 42, 180, 160, hWnd, (HMENU)IDC_WARP_WINDOW, hInst, NULL);
+            for (const auto label : {L"Current context", L"Past 30 minutes", L"Past 2 hours", L"Past 24 hours"})
+                SendMessage(hWarpWindow, CB_ADDSTRING, 0, (LPARAM)label);
+            SendMessage(hWarpWindow, CB_SETCURSEL, 0, 0);
+            hWarpStatus = CreateWindowExW(0, L"STATIC", L"Context is checked only after retrieving search candidates.",
+                WS_CHILD | WS_VISIBLE | SS_ENDELLIPSIS | SS_NOPREFIX,
+                384, 46, 700, 24, hWnd, (HMENU)IDC_WARP_STATUS, hInst, NULL);
 
             hStatusText = CreateWindowExW(
                 0, L"STATIC", L"Select a drive to scan...",
@@ -5205,7 +5141,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
                 ListView_InsertColumn(hListView, 4, &lvc);
 
                 lvc.iSubItem = 5;
-                lvc.pszText = (LPWSTR)L"WARP Boost";
+                lvc.pszText = (LPWSTR)L"Context +";
                 lvc.cx = 85;
                 ListView_InsertColumn(hListView, 5, &lvc);
 
@@ -5218,11 +5154,13 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
                 lvc.pszText = (LPWSTR)L"Snippet";
                 lvc.cx = 300;
                 ListView_InsertColumn(hListView, 7, &lvc);
+                const int columnOrder[] = {0, 5, 4, 2, 1, 3, 6, 7};
+                ListView_SetColumnOrderArray(hListView, (int)std::size(columnOrder), columnOrder);
 
                 // Attach the system small icon image list to the ListView
                 SHFILEINFOW sfi = {0};
-                hSysImageList = (HIMAGELIST)SHGetFileInfoW(L"C:\\", 0, &sfi, sizeof(sfi),
-                    SHGFI_SYSICONINDEX | SHGFI_SMALLICON);
+                hSysImageList = (HIMAGELIST)SHGetFileInfoW(L"file.txt", FILE_ATTRIBUTE_NORMAL, &sfi, sizeof(sfi),
+                    SHGFI_SYSICONINDEX | SHGFI_SMALLICON | SHGFI_USEFILEATTRIBUTES);
                 if (hSysImageList)
                     ListView_SetImageList(hListView, hSysImageList, LVSIL_SMALL);
             }
@@ -5272,7 +5210,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
                 SendMessage(hCloudBtn, WM_SETFONT, (WPARAM)hUIFont, TRUE);
 
             // Load saved cloud configuration
-            LoadCloudConfig();
+            if (!contextDemo) LoadCloudConfig();
             UpdateCloudButtonLabel();
 
             // Larger font for the toggle button glyph
@@ -5321,7 +5259,23 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
             // Defer index loading so the window appears immediately.
             // The actual load runs when WM_LOAD_CACHED_INDEX is processed
             // after the message loop starts pumping.
-            PostMessage(hWnd, WM_LOAD_CACHED_INDEX, 0, 0);
+            if (contextDemo)
+            {
+                EnableWindow(hSearchEdit, TRUE); EnableWindow(hFindButton, TRUE);
+                SendMessage(hSearchEdit, EM_SETREADONLY, TRUE, 0);
+                SetWindowTextW(hSearchEdit, warpDemo.request.query.c_str());
+                EnableWindow(hCloudBtn, FALSE); EnableWindow(hWarpWindow, FALSE);
+                PostMessage(hWnd, WM_LOAD_CACHED_INDEX, 0, 0);
+            }
+            else
+            {
+                warpWorker = std::make_unique<WarpContext::Worker>([hWnd](WarpContext::Result result) {
+                    auto payload = std::make_unique<WarpContext::Result>(std::move(result));
+                    if (PostMessage(hWnd, WM_WARP_RESULT, 0, (LPARAM)payload.get())) payload.release();
+                });
+                SetTimer(hWnd, IDT_WARP_REFRESH, 1000, NULL);
+                PostMessage(hWnd, WM_LOAD_CACHED_INDEX, 0, 0);
+            }
         }
         break;
     case WM_SIZE:
@@ -5691,6 +5645,12 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
         {
             HDC hdcStatic = (HDC)wParam;
             HWND hCtl = (HWND)lParam;
+            if (hCtl == hWarpContext || hCtl == hWarpStatus)
+            {
+                SetBkColor(hdcStatic, CurrentScheme().toolbarBg);
+                SetTextColor(hdcStatic, CurrentScheme().windowText);
+                return (LRESULT)hToolbarBrush;
+            }
             if (hCtl == hStatusText || hCtl == hSummaryText)
             {
                 const ColorScheme& cs = CurrentScheme();
@@ -5739,11 +5699,11 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
             const ColorScheme& cs = CurrentScheme();
 
             RECT rcToolbar = rc;
-            rcToolbar.bottom = TOOLBAR_ROW_HEIGHT;
+            rcToolbar.bottom = TOOLBAR_ROW_HEIGHT + 34;
             FillRect(hdc, &rcToolbar, hToolbarBrush ? hToolbarBrush : (HBRUSH)(COLOR_BTNFACE + 1));
 
             RECT rcRest = rc;
-            rcRest.top = TOOLBAR_ROW_HEIGHT;
+            rcRest.top = TOOLBAR_ROW_HEIGHT + 34;
             HBRUSH hRestBrush = CreateSolidBrush(cs.windowBg);
             FillRect(hdc, &rcRest, hRestBrush);
             DeleteObject(hRestBrush);
@@ -5842,6 +5802,12 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
     case WM_COMMAND:
         {
             int wmId = LOWORD(wParam);
+            if (wmId == IDC_WARP_CONTEXT || (wmId == IDC_WARP_WINDOW && HIWORD(wParam) == CBN_SELCHANGE))
+            {
+                ResetWarpContext();
+                RequestWarpContext();
+                break;
+            }
             
             if (wmId == IDC_FIND_BUTTON)
             {
@@ -5860,6 +5826,9 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
             // As-you-type: restart debounce timer on edit change
             if (HIWORD(wParam) == EN_CHANGE && (HWND)lParam == hSearchEdit)
             {
+                ResetWarpContext();
+                currentSearchKeyword.clear();
+                SetWindowTextW(hWarpStatus, L"Search changed; previous context discarded");
                 if (bTreeRenderedOnce && !fileMap.empty())
                 {
                     KillTimer(hWnd, IDT_SEARCH_DEBOUNCE);
@@ -5905,6 +5874,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 
             if (wmId == IDM_CTX_OPEN_FOLDER)
             {
+                if (contextDemo) break;
                 int sel = ListView_GetNextItem(hListView, -1, LVNI_SELECTED);
                 if (sel >= 0 && sel < (int)searchResults.size())
                 {
@@ -5944,12 +5914,17 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 
             if (wmId == IDC_CLOUD_BTN)
             {
+                if (contextDemo) break;
                 DialogBoxW(hInst, MAKEINTRESOURCE(IDD_CLOUD_CONFIG), hWnd, CloudConfigDlgProc);
                 break;
             }
 
             if (wmId >= IDC_DRIVE_BUTTON_BASE && wmId < IDC_DRIVE_BUTTON_BASE + (int)driveButtons.size())
             {
+                if (contextDemo) break;
+                ResetWarpContext();
+                baselineResults.clear();
+                currentSearchKeyword.clear();
                 int driveIdx = wmId - IDC_DRIVE_BUTTON_BASE;
                 ReadDriveAndBuildTree(hWnd, driveButtons[driveIdx].driveLetter);
                 break;
@@ -5969,10 +5944,48 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
         }
         break;
     case WM_TIMER:
+        if (wParam == IDT_WARP_REFRESH && !contextDemo)
+        {
+            if (warpContextResult.available && warpContextResult.expiresMs <= WarpContext::NowMs())
+            {
+                ResetWarpContext();
+                SetWindowTextW(hWarpStatus, L"WARP context expired; baseline results");
+            }
+            if (!warpInFlight && GetTickCount64() >= warpNextRefresh &&
+                GetForegroundWindow() == hWnd && !IsIconic(hWnd) && IsWindowVisible(hListView))
+                RequestWarpContext(true);
+            break;
+        }
         if (wParam == IDT_SEARCH_DEBOUNCE)
         {
             KillTimer(hWnd, IDT_SEARCH_DEBOUNCE);
             TriggerSearch(hWnd);
+        }
+        break;
+    case WM_WARP_RESULT:
+        {
+            std::unique_ptr<WarpContext::Result> result((WarpContext::Result*)lParam);
+            bool demoProbe = false;
+#ifdef FINDMYFILE_CONTEXT_DEMO_ONLY
+            demoProbe = !demoSmokeReport.empty();
+#endif
+            if (!result || result->generation != warpGeneration || (contextDemo && !demoProbe)) break;
+            if (result->available && result->expiresMs <= WarpContext::NowMs())
+            {
+                *result = {};
+                result->status = "context_expired";
+            }
+            warpInFlight = false;
+            const bool changed = result->available != warpContextResult.available ||
+                result->features.size() != warpContextResult.features.size() ||
+                !std::equal(result->features.begin(), result->features.end(), warpContextResult.features.begin(),
+                    [](const WarpContext::Feature& a, const WarpContext::Feature& b) {
+                        return a.key == b.key && a.delta == b.delta && a.reason == b.reason;
+                    });
+            warpContextResult = std::move(*result);
+            if (changed) ApplyWarpContext(warpContextResult);
+            const auto status = WarpContext::StatusText(warpContextResult);
+            SetWindowTextW(hWarpStatus, status.c_str());
         }
         break;
     case WM_USN_UPDATED:
@@ -5980,6 +5993,49 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
         break;
     case WM_LOAD_CACHED_INDEX:
         {
+            if (contextDemo)
+            {
+                ShowContextDemo();
+#ifdef FINDMYFILE_CONTEXT_DEMO_ONLY
+                if (!demoSmokeReport.empty())
+                {
+                    SendMessage(hWarpContext, BM_SETCHECK, BST_UNCHECKED, 0);
+                    SendMessage(hWnd, WM_COMMAND, MAKEWPARAM(IDC_WARP_CONTEXT, BN_CLICKED), (LPARAM)hWarpContext);
+                    wchar_t before[1024] = {}, after[1024] = {}, delta[32] = {};
+                    ListView_GetItemText(hListView, 0, 2, before, (int)std::size(before));
+                    const int count = ListView_GetItemCount(hListView);
+                    SendMessage(hWarpContext, BM_SETCHECK, BST_CHECKED, 0);
+                    SendMessage(hWnd, WM_COMMAND, MAKEWPARAM(IDC_WARP_CONTEXT, BN_CLICKED), (LPARAM)hWarpContext);
+                    ListView_GetItemText(hListView, 0, 2, after, (int)std::size(after));
+                    ListView_GetItemText(hListView, 0, 5, delta, (int)std::size(delta));
+                    ListView_SetItemState(hListView, 0, LVIS_SELECTED, LVIS_SELECTED);
+                    UpdatePropertiesPanel(0);
+                    wchar_t detail[4096] = {};
+                    GetWindowTextW(hPropertiesPanel, detail, (int)std::size(detail));
+                    bool passed = count > 0 && count == ListView_GetItemCount(hListView) &&
+                        wcscmp(before, after) != 0 && delta[0] == L'+' && wcstod(delta, nullptr) <= 8 &&
+                        wcsstr(detail, L"SYNTHETIC REPLAY") && !warpWorker;
+                    auto expired = new WarpContext::Result(warpDemo.result);
+                    expired->generation = warpGeneration;
+                    expired->expiresMs = WarpContext::NowMs() - 1;
+                    SendMessage(hWnd, WM_WARP_RESULT, 0, (LPARAM)expired);
+                    wchar_t fallback[1024] = {};
+                    ListView_GetItemText(hListView, 0, 2, fallback, (int)std::size(fallback));
+                    const bool expiryPassed = wcscmp(before, fallback) == 0 &&
+                        warpContextResult.status == "context_expired" &&
+                        std::all_of(searchResults.begin(), searchResults.end(),
+                            [](const SearchResult& item) { return item.warpBonus == 0 && item.warpReason.empty(); });
+                    passed = passed && expiryPassed;
+                    std::ofstream report(demoSmokeReport.c_str(), std::ios::binary);
+                    report << (passed ? "PASS" : "FAIL") << "\nBaseline: " << WideToUtf8(before) <<
+                        "\nContext: " << WideToUtf8(after) << "\nDelta: " << WideToUtf8(delta) <<
+                        "\nExpired callback fallback: " << (expiryPassed ? "PASS" : "FAIL") << "\n";
+                    demoExitCode = passed && report.good() ? 0 : 1;
+                    PostMessage(hWnd, WM_CLOSE, 0, 0);
+                }
+#endif
+                break;
+            }
             // Check if a saved index exists and load it.
             // This runs after the window is visible so the UI isn't blocked
             // during window creation.
@@ -6019,12 +6075,6 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
                     if (hStatusText)
                         SetWindowTextW(hStatusText, L"Index loaded from disk. Click a drive button to rescan.");
 
-                    // Pre-populate fullPathCache so WARP recency lookups work
-                    for (auto& pair : fileMap)
-                        BuildFullPath(pair.first, currentDriveLetter);
-
-                    QueryWarpActivity();
-                    BuildWarpRefMap();
                 }
                 else
                 {
@@ -6044,7 +6094,14 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
         }
         break;
     case WM_DESTROY:
-        SaveIndexToFile();
+        KillTimer(hWnd, IDT_WARP_REFRESH);
+        if (warpWorker) { warpWorker->Stop(); warpWorker.reset(); }
+        {
+            MSG queued;
+            while (PeekMessage(&queued, hWnd, WM_WARP_RESULT, WM_WARP_RESULT, PM_REMOVE))
+                delete (WarpContext::Result*)queued.lParam;
+        }
+        if (!contextDemo) SaveIndexToFile();
         CancelOAuthLogin();
         StopUsnMonitor();
         if (hPropToggleTooltip) { DestroyWindow(hPropToggleTooltip); hPropToggleTooltip = NULL; }
@@ -6055,7 +6112,11 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
         if (hStatusBrush) { DeleteObject(hStatusBrush); hStatusBrush = NULL; }
         if (hEditBrush) { DeleteObject(hEditBrush); hEditBrush = NULL; }
         if (hPropertiesBrush) { DeleteObject(hPropertiesBrush); hPropertiesBrush = NULL; }
+#ifdef FINDMYFILE_CONTEXT_DEMO_ONLY
+        PostQuitMessage(demoExitCode);
+#else
         PostQuitMessage(0);
+#endif
         break;
     default:
         return DefWindowProc(hWnd, message, wParam, lParam);
