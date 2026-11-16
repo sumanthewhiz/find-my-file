@@ -35,11 +35,19 @@ jobs:
       env:
         FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
+    - name: Select installed C++ toolset
+      shell: pwsh
+      run: |
+        $major = (Get-Item (Get-Command msbuild).Source).VersionInfo.FileMajorPart
+        $toolset = if ($major -ge 18) { 'v145' } else { 'v143' }
+        "FMF_TOOLSET=$toolset" >> $env:GITHUB_ENV
+
     - name: Build Release (${{ matrix.platform }})
       run: >
         msbuild "Find My File!.sln"
         /p:Configuration=Release
         /p:Platform=${{ matrix.msbuild_platform }}
+        /p:PlatformToolset=${{ env.FMF_TOOLSET }}
         /m
         /v:minimal
 
@@ -48,6 +56,7 @@ jobs:
         msbuild "Find My File!.vcxproj"
         /p:Configuration=Release
         /p:Platform=${{ matrix.project_platform }}
+        /p:PlatformToolset=${{ env.FMF_TOOLSET }}
         /p:ContextDemoOnly=true
         /m
         /v:minimal
@@ -65,7 +74,7 @@ jobs:
     - name: Test production context client and labeled search replay
       if: matrix.platform == 'x64'
       shell: pwsh
-      run: .\tests\run_context_quality.ps1 -Platform x64
+      run: .\tests\run_context_quality.ps1 -Platform x64 -Toolset $env:FMF_TOOLSET
 
     - name: Exercise actual showcase UI toggle
       if: matrix.platform == 'x64'

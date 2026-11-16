@@ -16,6 +16,9 @@ try {
             $msbuild = & $vswhere -latest -products '*' -requires Microsoft.Component.MSBuild -find 'MSBuild\**\Bin\MSBuild.exe' | Select-Object -First 1
         }
         if (!$msbuild) { throw 'MSBuild was not found.' }
+        if (!$Toolset) {
+            $Toolset = if ((Get-Item $msbuild).VersionInfo.FileMajorPart -ge 18) { 'v145' } else { 'v143' }
+        }
         $flags = @('/p:Configuration=Release', "/p:Platform=$Platform", '/m', '/nologo', '/v:minimal')
         if ($Toolset) { $flags += "/p:PlatformToolset=$Toolset" }
         & $msbuild 'tests\WarpContextTests.vcxproj' @flags

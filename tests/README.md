@@ -16,6 +16,9 @@ The wrapper builds `WarpContextTests.exe` unless `-NoBuild` is supplied, runs
 independent metric unit tests, then invokes the production context client and
 shared ranker. Results go to `build\context-eval-<platform>`:
 
+The wrapper and CI select `v145` for VS 18 and `v143` for VS 2022; `-Toolset`
+can explicitly override that choice.
+
 | File | Contents |
 |---|---|
 | `native.log` | Parser, relevance, exact/unseen, transport and worker checks |
