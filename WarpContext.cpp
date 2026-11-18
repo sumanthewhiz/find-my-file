@@ -178,6 +178,19 @@ namespace WarpContext
             if (value == "download_origin_observed_not_reading") return L"Download origin observed; reading is not inferred";
             return L"Supported WARP association";
         }
+        std::wstring FallbackReason(const std::string& value)
+        {
+            if (value == "truncated") return L"Relevant evidence exceeded the safety limit";
+            if (value == "no_qualified_evidence") return L"No qualified document or page activity in this window";
+            if (value == "stale") return L"Latest qualified current-context evidence is older than five minutes";
+            if (value == "not_present") return L"Current context is unavailable while away or locked";
+            if (value == "paused") return L"WARP capture is paused";
+            if (value == "privacy_redacted" || value == "excluded") return L"Privacy exclusions prevent this assessment";
+            if (value == "query_mismatch") return L"Query or match quality does not support a contextual boost";
+            if (value == "ambiguous_or_unqualified") return L"Artifact identity or activity attribution is uncertain";
+            if (value == "action_not_observed") return L"The requested action was not observed";
+            return L"No supported association with the selected task/window";
+        }
     }
 
     int64_t NowMs()
@@ -205,7 +218,23 @@ namespace WarpContext
         {
             const bool applied = std::any_of(result.features.begin(), result.features.end(),
                 [](const Feature& feature) { return feature.delta > 0; });
-            std::wstring text = applied ? L"WARP context applied (max +8)" : L"WARP: no supported boost; baseline order";
+            std::wstring text = applied ? L"WARP context applied (max +8)" : L"WARP: no task match for these candidates; baseline order";
+            if (!applied && !result.features.empty())
+            {
+                const auto& fallback = result.features.front().fallback;
+                const bool same = std::all_of(result.features.begin(), result.features.end(),
+                    [&](const Feature& feature) { return feature.fallback == fallback; });
+                if (same)
+                {
+                    if (fallback == "truncated") text = L"WARP evidence limit reached; baseline order";
+                    else if (fallback == "no_qualified_evidence") text = L"WARP: no qualified document/page activity; baseline order";
+                    else if (fallback == "stale") text = L"WARP context is older than 5 minutes; baseline order";
+                    else if (fallback == "not_present") text = L"WARP: user away/locked; baseline order";
+                    else if (fallback == "paused") text = L"WARP capture paused; baseline order";
+                    else if (fallback == "query_mismatch") text = L"WARP: no query-supported boost; baseline order";
+                    else if (fallback == "privacy_redacted") text = L"WARP privacy exclusions apply; baseline order";
+                }
+            }
             if (result.partial) text += L" (partial evidence)";
             return text;
         }
@@ -216,6 +245,13 @@ namespace WarpContext
         if (result.status == "invalid_response" || result.status == "untrusted_peer") return L"WARP response not accepted; baseline results";
         if (result.status == "timeout") return L"WARP timed out; baseline results";
         return L"WARP unavailable; baseline results";
+    }
+    std::wstring DeltaText(double delta, bool assessed)
+    {
+        if (!assessed) return L"\u2014";
+        if (delta <= 0) return L"0.0";
+        wchar_t text[32]; swprintf_s(text, L"+%.1f", delta);
+        return text;
     }
     std::string ContextRequest(int seconds, int64_t now)
     {
@@ -297,6 +333,7 @@ namespace WarpContext
                 feature.found = Bool(row, L"found");
                 const bool eligible = Bool(row, L"eligible");
                 const auto fallback = Text(row, L"fallback", 128);
+                feature.fallback = fallback;
                 const double delta = Number(row, L"score_delta");
                 if (delta < 0 || delta > 8 || (delta > 0 && (!eligible || !fallback.empty())))
                     throw std::runtime_error("invalid_response");
@@ -316,7 +353,7 @@ namespace WarpContext
                     if (!feature.reason.empty()) feature.reason += L"; ";
                     feature.reason += Reason(code);
                 }
-                if (feature.reason.empty()) feature.reason = L"No supported contextual boost";
+                if (feature.reason.empty()) feature.reason = FallbackReason(fallback);
                 result.features.push_back(std::move(feature));
             }
             result.available = true; result.status = "ok";

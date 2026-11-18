@@ -21,6 +21,7 @@ namespace WarpContext
     struct Feature
     {
         std::wstring key, reason;
+        std::string fallback;
         double delta = 0;
         bool found = false;
     };
@@ -47,13 +48,14 @@ namespace WarpContext
     int64_t NowMs();
     std::wstring NormalizePath(std::wstring path);
     std::wstring StatusText(const Result& result);
+    std::wstring DeltaText(double delta, bool assessed);
     std::string ContextRequest(int windowSeconds, int64_t nowMs);
     std::string CandidateRequest(const Request& request);
     Result DecodeScores(const std::string& json, const Request& request, int64_t nowMs);
     Result Evaluate(const Request& request, const Transport& exchange, const Cancelled& cancelled);
 
     // Alternate names/image are used only by the isolated pipe tests, never by the UI.
-    Transport LocalPipeTransport(unsigned budgetMs = 1500,
+    Transport LocalPipeTransport(unsigned budgetMs = 5000,
         std::vector<std::wstring> names = {}, std::wstring expectedImage = L"WARP!.exe");
 
     class Worker

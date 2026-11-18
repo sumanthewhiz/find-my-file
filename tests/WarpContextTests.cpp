@@ -141,6 +141,27 @@ namespace
             Check(Order(request, result) == Order(request, {}), "failure changed ranking");
         }
     }
+    void NoBoostDiagnosticsAreNotTransportFailures()
+    {
+        const auto request = Sample();
+        const std::pair<const wchar_t*, const wchar_t*> cases[] = {
+            {L"truncated", L"evidence limit"}, {L"no_qualified_evidence", L"no qualified"},
+            {L"stale", L"older than"}, {L"not_present", L"away/locked"},
+            {L"paused", L"paused"}, {L"query_mismatch", L"query-supported"}};
+        for (const auto& test : cases)
+        {
+            auto packet = Packet(request, {0, 0, 0});
+            for (const auto& value : packet.GetNamedArray(L"candidates"))
+                value.GetObject().Insert(L"fallback", JsonValue::CreateStringValue(test.first));
+            const auto result = DecodeScores(winrt::to_string(packet.Stringify()), request, NowMs());
+            Check(result.available && result.features.size() == request.candidates.size(), "valid no-boost packet rejected");
+            Check(StatusText(result).find(test.second) != std::wstring::npos, "specific fallback hidden");
+            Check(DeltaText(result.features[0].delta, true) == L"0.0", "assessed zero shown as blank");
+            Check(Order(request, result) == Order(request, {}), "diagnostic change altered baseline");
+        }
+        Check(DeltaText(0, false) == L"\u2014", "unassessed result must remain distinct");
+        Check(DeltaText(7.2, true) == L"+7.2", "positive delta display changed");
+    }
     void RelevanceAndBatchLimits()
     {
         auto request = Sample(); request.candidates[1].base = 15;
@@ -321,6 +342,7 @@ int wmain(int argc, wchar_t** argv)
         const std::pair<const char*, void(*)()> tests[] = {
             {"JsonRoundTripAndHistoricalBounds", JsonRoundTrip}, {"ExactUnseenAndFallback", ExactUnseenAndFallback},
             {"RejectMalformedFeatures", RejectMalformedFeatures}, {"ErrorFallbacks", ErrorFallbacks},
+            {"NoBoostDiagnosticsAreNotTransportFailures", NoBoostDiagnosticsAreNotTransportFailures},
             {"RelevanceAndBatchLimits", RelevanceAndBatchLimits}, {"TwoStageAndReferenceReuse", TwoStageAndReferenceReuse},
             {"PipeChunksAndPeer", PipeChunksAndPeer}, {"PipeTimeoutAndBound", PipeTimeoutAndBound},
             {"LatestRequestWins", LatestRequestWins}};

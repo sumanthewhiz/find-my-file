@@ -4261,12 +4261,8 @@ void PopulateSearchResults()
         ListView_SetItemText(hListView, (int)i, 4, (LPWSTR)quality);
 
         // WARP Boost column
-        wchar_t warpBuf[16] = {0};
-        if (sr.warpBonus > 0)
-            swprintf_s(warpBuf, 16, L"+%.1f", sr.warpBonus);
-        else
-            wcscpy_s(warpBuf, 16, L"\u2014");
-        ListView_SetItemText(hListView, (int)i, 5, warpBuf);
+        const auto warpText = WarpContext::DeltaText(sr.warpBonus, !sr.warpReason.empty());
+        ListView_SetItemText(hListView, (int)i, 5, (LPWSTR)warpText.c_str());
 
         // Total Score column
         wchar_t scoreBuf[16] = {0};
@@ -6015,6 +6011,18 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
                     bool passed = count > 0 && count == ListView_GetItemCount(hListView) &&
                         wcscmp(before, after) != 0 && delta[0] == L'+' && wcstod(delta, nullptr) <= 8 &&
                         wcsstr(detail, L"SYNTHETIC REPLAY") && !warpWorker;
+                    auto zero = new WarpContext::Result(warpDemo.result);
+                    zero->generation = warpGeneration;
+                    zero->expiresMs = WarpContext::NowMs() + 60000;
+                    for (auto& feature : zero->features)
+                    {
+                        feature.delta = 0;
+                        feature.reason = L"No supported association with the selected task/window";
+                    }
+                    SendMessage(hWnd, WM_WARP_RESULT, 0, (LPARAM)zero);
+                    wchar_t assessedZero[32] = {};
+                    ListView_GetItemText(hListView, 0, 5, assessedZero, (int)std::size(assessedZero));
+                    const bool zeroPassed = wcscmp(assessedZero, L"0.0") == 0;
                     auto expired = new WarpContext::Result(warpDemo.result);
                     expired->generation = warpGeneration;
                     expired->expiresMs = WarpContext::NowMs() - 1;
@@ -6025,10 +6033,11 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
                         warpContextResult.status == "context_expired" &&
                         std::all_of(searchResults.begin(), searchResults.end(),
                             [](const SearchResult& item) { return item.warpBonus == 0 && item.warpReason.empty(); });
-                    passed = passed && expiryPassed;
+                    passed = passed && zeroPassed && expiryPassed;
                     std::ofstream report(demoSmokeReport.c_str(), std::ios::binary);
                     report << (passed ? "PASS" : "FAIL") << "\nBaseline: " << WideToUtf8(before) <<
                         "\nContext: " << WideToUtf8(after) << "\nDelta: " << WideToUtf8(delta) <<
+                        "\nAssessed zero display: " << (zeroPassed ? "PASS" : "FAIL") <<
                         "\nExpired callback fallback: " << (expiryPassed ? "PASS" : "FAIL") << "\n";
                     demoExitCode = passed && report.good() ? 0 : 1;
                     PostMessage(hWnd, WM_CLOSE, 0, 0);

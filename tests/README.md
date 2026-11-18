@@ -31,6 +31,9 @@ pipes. They exercise immediate/async multi-part messages, wrong executable
 identity, timeout, size caps and latest-request cancellation. Relevance labels
 are read only by the Python scorer, not by the native predictor.
 
+Fallback diagnostics also distinguish an assessed zero from an unavailable
+assessment, and preserve the original order in each no-boost state.
+
 ## What the corpus establishes
 
 `fixtures\warp_search_replay.jsonl` contains **272 synthetic labeled cases**:

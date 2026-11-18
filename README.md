@@ -292,9 +292,18 @@ flowchart LR
 
 The client prefers `\\.\pipe\WarpFileActivityAPI-<session>`, with a legacy-name
 fallback, and checks server PID, user, session and executable name. This is not
-publisher/signature verification. An overall 1.5-second pipe budget, a 1 MiB
+publisher/signature verification. An overall five-second pipe budget, a 1 MiB
 message limit and generation checks keep stale completions out of the UI.
 The complete response is parsed before any features are accepted.
+This is a background budget, not a five-second UI wait: baseline results remain
+visible and a changed query cancels the previous request.
+
+**Reading Context +:** a positive value is a supported boost; **0.0** means WARP
+assessed that candidate and did not justify a boost; a dash means no assessment
+was applied (disabled, unavailable, expired, or outside the bounded batch).
+The status and properties explanation distinguish missing qualified activity,
+stale context, privacy exclusions, a real evidence-limit fallback and no task
+match. Partial source coverage alone does not require every score to be zero.
 
 Frozen references live at most 60 seconds. While the results window is active,
 the client revalidates the reference every five seconds; purge/clear/policy
