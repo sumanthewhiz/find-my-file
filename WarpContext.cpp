@@ -237,6 +237,7 @@ namespace WarpContext
                 }
             }
             if (result.partial) text += L" (partial evidence)";
+            if (result.elapsedMs) text += L" | " + std::to_wstring(result.elapsedMs) + L" ms";
             return text;
         }
         if (result.status == "forbidden" || result.status == "unauthorized") return L"WARP access denied; baseline results";
@@ -395,8 +396,9 @@ namespace WarpContext
                 if (!Bool(root, L"ok") || Number(root, L"api_version") != 2 || Bool(root, L"model_on_request_path") ||
                     Text(root.GetNamedObject(L"context"), L"schema") != "warp.task-context.v1")
                     throw std::runtime_error("invalid_response");
-                Expiry(root, NowMs());
+                result.expiresMs = Expiry(root, NowMs());
                 request.reference = Text(root, L"context_ref");
+                result.reference = request.reference;
             }
             Result combined; combined.generation = original.generation;
             for (size_t offset = 0; offset < original.candidates.size(); offset += MaxCandidates)
@@ -461,6 +463,10 @@ namespace WarpContext
     {
         try { winrt::init_apartment(winrt::apartment_type::multi_threaded); }
         catch (...) { return; }
+        std::string reference;
+        int windowSeconds = 0;
+        int64_t expiresMs = 0;
+        ULONGLONG obtainedAt = 0;
         for (;;)
         {
             Request request;
@@ -471,7 +477,18 @@ namespace WarpContext
                 request = std::move(m_request); m_pending = false;
             }
             const auto cancelled = [&] { return m_stopped || request.generation != m_generation; };
+            const bool reuse = request.reference.empty() && !reference.empty() &&
+                request.windowSeconds==windowSeconds && NowMs()<expiresMs && GetTickCount64()-obtainedAt<5000;
+            if (reuse) request.reference=reference;
+            const auto started=GetTickCount64();
             auto result = Evaluate(request, m_transportFactory ? m_transportFactory() : LocalPipeTransport(), cancelled);
+            result.elapsedMs=GetTickCount64()-started;
+            if ((result.available || result.status=="cancelled") && !result.reference.empty())
+            {
+                if (result.reference!=reference || request.windowSeconds!=windowSeconds) obtainedAt=GetTickCount64();
+                reference=result.reference; expiresMs=result.expiresMs; windowSeconds=request.windowSeconds;
+            }
+            else if (result.status!="cancelled") reference.clear();
             if (!cancelled()) m_completed(std::move(result));
         }
         winrt::uninit_apartment();

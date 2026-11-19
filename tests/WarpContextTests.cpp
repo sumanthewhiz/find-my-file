@@ -306,6 +306,41 @@ namespace
         catch (...) { failed = true; }
         Check(failed, "oversized message accepted");
     }
+    void RapidQueriesReuseOnlyAShortSameWindowLease()
+    {
+        std::mutex mutex; std::condition_variable done;
+        std::vector<Result> results;
+        std::atomic<int> contexts{0},scores{0};
+        std::atomic<bool> invalidated{false};
+        const auto now=NowMs();
+        const auto sample=Sample();
+        Worker worker([&](Result result) {
+            {std::lock_guard<std::mutex> lock(mutex);results.push_back(std::move(result));}
+            done.notify_one();
+        },[&] { return Transport([&](const std::string& text,const Cancelled&) {
+            const auto sent=JsonObject::Parse(winrt::to_hstring(text));
+            if(sent.GetNamedString(L"op")==L"GetSearchContext")
+            {++contexts;return winrt::to_string(Reference(sample).Stringify());}
+            ++scores;
+            if(invalidated.exchange(false))
+                return std::string("{\"api_version\":2,\"ok\":false,\"error\":{\"code\":\"context_invalidated\"}}");
+            return winrt::to_string(Packet(sample,{0,4.2,0},now).Stringify());
+        }); });
+        auto request=sample;request.reference.clear();
+        for (int i=0;i<5;++i)
+        {
+            if(i==1) request.query=L"budget plan";
+            if(i==2) request.windowSeconds=7200;
+            if(i==3) invalidated=true;
+            worker.Submit(request);
+            std::unique_lock<std::mutex> lock(mutex);
+            Check(done.wait_for(lock,std::chrono::seconds(3),[&]{return results.size()==size_t(i+1);}),"query refinement did not complete");
+            Check(results.back().available==(i!=3),"short lease response or invalidation was not respected");
+        }
+        worker.Stop();
+        Check(contexts==3 && scores==5,"lease reuse ignored its time window or retained an invalidated context");
+    }
+
     void LatestRequestWins()
     {
         const auto sample = Sample();
@@ -421,6 +456,7 @@ int wmain(int argc, wchar_t** argv)
             {"AllRetrievedCandidatesUseOneReferenceAndFailAtomically", AllRetrievedCandidatesUseOneReferenceAndFailAtomically},
             {"RelevanceAndBatchLimits", RelevanceAndBatchLimits}, {"TwoStageAndReferenceReuse", TwoStageAndReferenceReuse},
             {"PipeChunksAndPeer", PipeChunksAndPeer}, {"PipeTimeoutAndBound", PipeTimeoutAndBound},
+            {"RapidQueriesReuseOnlyAShortSameWindowLease", RapidQueriesReuseOnlyAShortSameWindowLease},
             {"LatestRequestWins", LatestRequestWins}};
         for (const auto& test : tests) { test.second(); std::cout << "PASS " << test.first << '\n'; }
         std::cout << std::size(tests) << " consumer tests passed\n";

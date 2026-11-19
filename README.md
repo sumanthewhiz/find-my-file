@@ -26,7 +26,7 @@ The regular **`Find My File!.exe`** provides the live integration below.
 ## Features
 
 ### Core Search & Indexing
-- **Lightning-fast MFT scanning** — Reads the NTFS Master File Table directly via `FSCTL_ENUM_USN_DATA`, indexing 4–5 million files in 2–5 seconds
+- **Direct MFT scanning** — Reads the NTFS Master File Table via `FSCTL_ENUM_USN_DATA` on a background worker, with entry-count progress and cancellation on close. Large indexes take time without blocking window painting or maximization.
 - **Multi-drive support** — Automatically detects and lists all fixed NTFS drives (C:, D:, E:, etc.) with per-drive scan buttons
 - **Rich search modes**:
   - **Exact token match** — Instant O(1) hash lookup for full filename/token matches
@@ -37,7 +37,7 @@ The regular **`Find My File!.exe`** provides the live integration below.
   - **Fuzzy/typo-tolerant match** — Levenshtein edit distance matching (max distance 1 for keywords 4–6 chars, max distance 2 for 7+ chars) catches common misspellings; exact matches always rank higher
 - **Scoped searches** — Select any folder in the tree view to restrict search results to that subtree
 - **Goop folder exclusion** — Global (unscoped) searches automatically exclude files from system, application, cache, and developer build directories — roughly 40–50% of all files on a typical device. The exclusion list covers 10 categories including `Windows\`, `Program Files\`, `AppData\`, `node_modules`, `.git`, `Cache`, `$Recycle.Bin`, NTFS metadata, and more. When you navigate to a specific folder in the tree and search from there, no exclusions apply — the scoped search returns everything under that folder.
-- **Persistent index cache** — On exit, the in-memory file map is saved to `%APPDATA%\FindMyFile\index.db` as a compact binary file. On the next launch, the cached index is loaded automatically — the window appears instantly and the search indexes are rebuilt in-memory in 1–3 seconds, skipping the MFT scan entirely. If no cache exists, the app falls back to a manual drive scan.
+- **Persistent index cache** — On exit, the file map and journal checkpoint are saved to `%APPDATA%\FindMyFile\index.db`. Loading and rebuilding search indexes run in the background. A valid checkpoint avoids a full scan; an expired checkpoint triggers a background refresh. The maximized window remains responsive.
 - **Live filesystem monitoring** — Background USN journal polling detects file creates, deletes, and renames in real time and updates the index incrementally
 - **WARP contextual ranking** — Uses [WARP Phase C](https://github.com/sumanthewhiz/WARP/tree/dev) task/evidence features conditioned on the query and selected time window. Applies at most **+8**, protects exact filenames, and never penalizes a file merely because WARP has not seen it. No model runs on the search request path.
 
@@ -57,13 +57,13 @@ The regular **`Find My File!.exe`** provides the live integration below.
 ### User Interface
 - **Tabbed layout** — Browse tab (tree view) and Search Results tab (list view + properties panel)
 - **Hierarchical tree view** — On-demand lazy loading: only one level of children is populated per expansion, keeping memory and startup time low
-- **Search results list** — Name, Context +, Match quality, Full Path, Type, Modified, Total Score, and Snippet, with contextual explanations in the properties panel
+- **Virtual search results list** — Name, Context +, Match quality, Full Path, Type, Modified, Total Score, and Snippet. Only visible rows are rendered; timestamps are captured with results rather than read from the filesystem while painting.
 - **Keyword highlighting** — Custom-drawn cells highlight every occurrence of the search keyword in the Name and Snippet columns
 - **Properties panel** — A resizable right-hand panel shows file name, type, path, size, timestamps (created/modified/accessed), attributes, and content match previews with `«keyword»` markers
 - **Splitter** — Drag the vertical splitter between the list view and properties panel to resize; a collapse/expand toggle button (» / «) hides or shows the panel entirely
 - **Dark mode** — A single click toggles between a light and dark color scheme, applied consistently to all controls including tree view, list view, headers, buttons, and edit boxes
 - **Owner-drawn buttons** — All buttons use rounded rectangles with hover/press visual feedback, matching the active color scheme
-- **As-you-type search** — A 300 ms debounce timer triggers a search automatically after typing stops; no need to press Enter or click Find
+- **As-you-type search** — A 300 ms debounce submits the latest query to a cancellable background worker. Typing does not synchronously rebuild the displayed result list; obsolete completions cannot replace a newer query.
 
 ### Search Ranking
 Results are scored and sorted by match quality:
@@ -263,8 +263,8 @@ Results are capped at 10,000 via `std::partial_sort` and full paths are built on
 
 ```mermaid
 flowchart LR
-    Query["Query + selected time window"] --> Retrieve["Existing MFT / Windows Search retrieval"]
-    Retrieve --> Baseline["Display baseline immediately"]
+    Query["Query + selected time window"] --> Retrieve["Background filename retrieval / explicit Windows Search"]
+    Retrieve --> Baseline["Virtual baseline results; do not wait for WARP"]
     Baseline --> Worker["Async: retrieved local files in batches of at most 256"]
     Worker --> Freeze["GetSearchContext: current or explicit interval"]
     Freeze --> Score["ScoreCandidates: query + names / authorized snippets"]
@@ -297,6 +297,10 @@ message limit and generation checks keep stale completions out of the UI.
 The complete response is parsed before any features are accepted.
 This is a background budget, not a five-second UI wait: baseline results remain
 visible and a changed query cancels the previous request.
+Rapid refinements in the same time mode can reuse an already validated context
+reference for at most five seconds. Candidate scores are always requested anew;
+window changes and invalidation discard the lease. The status line reports the
+measured WARP request time separately from filename-search time.
 
 **Reading Context +:** a positive value is a supported boost; **0.0** means WARP
 assessed that candidate and did not justify a boost; a dash means no assessment
@@ -398,8 +402,10 @@ multi-million-file indexes because 32-bit address space remains finite.
 
 **Deferred startup loading:**
 - `WM_CREATE` posts a `WM_LOAD_CACHED_INDEX` message to itself and returns immediately, so the window appears instantly
-- The actual index load runs when the message loop processes `WM_LOAD_CACHED_INDEX`, after the window is visible and painted
-- A "Loading cached index..." status message is displayed during the load
+- The handler starts a background index worker; it does not load or enumerate the drive on the UI thread.
+- Progress is coalesced onto the UI thread. Enumeration reports crossed entry-count thresholds and elapsed time, not only exact multiples of 50,000.
+- Scan/search controls cannot start reentrant work while the index is being replaced. Closing requests cooperative cancellation; an incomplete index does not overwrite the saved cache.
+- Filename queries run on a separate latest-request worker. Journal updates defer briefly while that worker reads the index, rather than blocking keyboard input.
 
 **Graceful fallback:** If no `index.db` exists (first launch) or the file is corrupted / has a version mismatch, the app behaves normally — Find buttons stay disabled until the user clicks a drive scan button.
 

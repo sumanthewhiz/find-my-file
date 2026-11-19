@@ -41,6 +41,8 @@ namespace
 
     void SeedIndex()
     {
+        StopFilenameWorker();
+        indexBuildCancelled=false;
         StopUsnMonitor();
         indexMemoryFailed = false;
         fileMap.clear(); childrenMap.clear(); timestampCache.clear(); pendingUsnChanges.clear();
@@ -166,6 +168,149 @@ namespace
         Check(fileMap.count(999) == 1, "index update was discarded");
     }
 
+    void ProgressPumpYieldsWhenMessagesKeepArriving()
+    {
+        struct Flood { int dispatched = 0; };
+        const wchar_t* name = L"FindMyFileProgressPumpTest";
+        WNDCLASSW cls{}; cls.hInstance = GetModuleHandleW(nullptr); cls.lpszClassName = name;
+        cls.lpfnWndProc = [](HWND window,UINT message,WPARAM wp,LPARAM lp) -> LRESULT {
+            if (message == WM_NCCREATE)
+                SetWindowLongPtrW(window,GWLP_USERDATA,(LONG_PTR)((CREATESTRUCTW*)lp)->lpCreateParams);
+            if (message == WM_APP+99)
+            {
+                auto* flood = (Flood*)GetWindowLongPtrW(window,GWLP_USERDATA);
+                if (++flood->dispatched < 2000) PostMessageW(window,WM_APP+99,0,0);
+                return 0;
+            }
+            return DefWindowProcW(window,message,wp,lp);
+        };
+        Check(RegisterClassW(&cls)!=0,"progress test class registration failed");
+        Flood flood;
+        HWND window = CreateWindowExW(0,name,L"",0,0,0,1,1,nullptr,nullptr,cls.hInstance,&flood);
+        Check(window!=nullptr,"progress test window unavailable");
+        PostMessageW(window,WM_APP+99,0,0);
+        UpdateProgress(15,L"Enumerating synthetic records");
+        const int dispatched = flood.dispatched;
+        MSG pending{};
+        while (PeekMessageW(&pending,window,WM_APP+99,WM_APP+99,PM_REMOVE)) {}
+        DestroyWindow(window); UnregisterClassW(name,cls.hInstance);
+        Check(dispatched==0,"progress reporting dispatched reentrant work instead of returning to the worker");
+    }
+
+    void ProgressAdvancesAcrossBatchBoundaries()
+    {
+        EnumerationProgress progress; progress.lastTick=1000;
+        Check(!progress.Due(49999,1050),"progress throttling reported too early");
+        Check(progress.Due(50137,1051),"batch crossing 50,000 entries left enumeration status unchanged");
+        Check(!progress.Due(50138,1052),"progress was not throttled");
+        Check(progress.Due(50200,1151),"slow enumeration did not report elapsed progress");
+    }
+
+    void FilenameSearchCancelsWithoutBlockingInput()
+    {
+        SeedIndex(); QueueGuide(); ProcessPendingUsnChanges();
+        HWND window=CreateWindowExW(0,L"STATIC",L"Async filename test",0,0,0,1,1,nullptr,nullptr,nullptr,nullptr);
+        HWND edit=CreateWindowExW(0,L"EDIT",L"old",WS_CHILD,0,0,1,1,window,(HMENU)IDC_SEARCH_EDIT,nullptr,nullptr);
+        Check(window && edit,"async search controls unavailable");
+        struct Cleanup {
+            HWND window;
+            ~Cleanup() {
+                StopFilenameWorker();
+                MSG message{};
+                while(PeekMessageW(&message,window,WM_FILENAME_RESULT,WM_FILENAME_RESULT,PM_REMOVE))
+                    delete (FilenameResult*)message.lParam;
+                hSearchEdit=nullptr; DestroyWindow(window);
+            }
+        } cleanup{window};
+        hSearchEdit=edit;
+        StartFilenameWorker(window);
+        {
+            std::lock_guard<std::mutex> busy(indexDataMutex);
+            TriggerSearch(window);
+            SetWindowTextW(edit,L"eval");
+            WndProc(window,WM_COMMAND,MAKEWPARAM(IDC_SEARCH_EDIT,EN_CHANGE),(LPARAM)edit);
+            TriggerSearch(window);
+        }
+        MSG message{}; const auto until=GetTickCount64()+5000;
+        while(!PeekMessageW(&message,window,WM_FILENAME_RESULT,WM_FILENAME_RESULT,PM_REMOVE) && GetTickCount64()<until)
+            Sleep(5);
+        Check(message.message==WM_FILENAME_RESULT,"latest background search never completed");
+        auto* result=(FilenameResult*)message.lParam;
+        const bool latest=result && result->request.query==L"eval" && result->request.generation==filenameGeneration;
+        const bool found=result && std::any_of(result->rows.begin(),result->rows.end(),
+            [](const SearchResult& row){return row.fileName==GuideName;});
+        FinishFilenameSearch(window,message.lParam);
+        Check(latest && found,"cancelled or incorrect filename results reached the UI");
+    }
+
+    void TypingDoesNotRebuildThousandsOfVisibleRows()
+    {
+        SeedIndex();
+        INITCOMMONCONTROLSEX controls{sizeof(controls),ICC_LISTVIEW_CLASSES}; InitCommonControlsEx(&controls);
+        HWND window=CreateWindowExW(0,L"STATIC",L"Virtual results test",0,0,0,1,1,nullptr,nullptr,nullptr,nullptr);
+        hSearchEdit=CreateWindowExW(0,L"EDIT",L"eval",WS_CHILD,0,0,1,1,window,(HMENU)IDC_SEARCH_EDIT,nullptr,nullptr);
+        hListView=CreateWindowExW(0,WC_LISTVIEW,L"",WS_CHILD|LVS_REPORT|LVS_OWNERDATA,0,0,1,1,window,(HMENU)IDC_LISTVIEW,nullptr,nullptr);
+        Check(window && hSearchEdit && hListView,"virtual results controls unavailable");
+        int changes=0;
+        SetWindowSubclass(hListView,[](HWND h,UINT message,WPARAM wp,LPARAM lp,UINT_PTR,DWORD_PTR context)->LRESULT {
+            if(message==LVM_SETITEMCOUNT || message==LVM_DELETEALLITEMS || message==LVM_INSERTITEMW) ++*(int*)context;
+            return DefSubclassProc(h,message,wp,lp);
+        },1,(DWORD_PTR)&changes);
+        SearchResult row{}; row.fileName=L"eval.md"; row.fullPath=L"C:\\Synthetic\\eval.md";
+        row.baseScore=row.matchScore=75; row.warpBonus=1.6; row.warpReason=L"Observed";
+        searchResults.assign(10000,row); baselineResults=searchResults; warpContextResult.available=true;
+        PopulateSearchResults();
+        Check(ListView_GetItemCount(hListView)==10000,"virtual result count missing");
+        changes=0;
+        WndProc(window,WM_COMMAND,MAKEWPARAM(IDC_SEARCH_EDIT,EN_CHANGE),(LPARAM)hSearchEdit);
+        const bool unchanged=changes==0;
+        wchar_t text[64]{};
+        NMLVDISPINFOW info{}; info.hdr.idFrom=IDC_LISTVIEW; info.hdr.code=LVN_GETDISPINFOW;
+        info.item.mask=LVIF_TEXT; info.item.iItem=9999; info.item.iSubItem=5; info.item.pszText=text; info.item.cchTextMax=64;
+        WndProc(window,WM_NOTIFY,IDC_LISTVIEW,(LPARAM)&info);
+        const bool cell=wcscmp(text,L"+1.6")==0;
+        KillTimer(window,IDT_SEARCH_DEBOUNCE); DestroyWindow(window); hSearchEdit=hListView=nullptr;
+        searchResults.clear(); baselineResults.clear();
+        Check(unchanged && !warpContextResult.available,"typing synchronously rebuilt previous result rows");
+        Check(cell,"virtual result text lost the Context+ column");
+    }
+
+    void IndexBuildCanBeCancelledBeforeItAcquiresTheIndex()
+    {
+        SeedIndex();
+        HWND window=CreateWindowExW(0,L"STATIC",L"Index cancellation test",0,0,0,1,1,nullptr,nullptr,nullptr,nullptr);
+        Check(window!=nullptr,"index cancellation window unavailable");
+        std::unique_lock<std::mutex> busy(indexDataMutex);
+        struct Cleanup {
+            HWND window; std::unique_lock<std::mutex>& busy;
+            ~Cleanup() {
+                indexBuildCancelled=true;
+                if(busy.owns_lock()) busy.unlock();
+                if(indexBuildThread.joinable()) indexBuildThread.join();
+                MSG message{};
+                while(PeekMessageW(&message,window,WM_INDEX_COMPLETE,WM_INDEX_COMPLETE,PM_REMOVE))
+                    delete (IndexBuildResult*)message.lParam;
+                indexBuildInProgress=false; indexBuildCancelled=false; closeAfterIndexBuild=false;
+                DestroyWindow(window);
+            }
+        } cleanup{window,busy};
+        StartIndexBuild(window,L"",false);
+        Check(indexBuildInProgress,"background index work was not started");
+        const auto worker=indexBuildThread.get_id();
+        WndProc(window,WM_COMMAND,IDC_DRIVE_BUTTON_BASE,0);
+        Check(indexBuildThread.get_id()==worker,"nested drive command started another build");
+        WndProc(window,WM_CLOSE,0,0);
+        Check(IsWindow(window) && indexBuildCancelled,"close destroyed the window while index work was active");
+        busy.unlock();
+        MSG message{}; const auto until=GetTickCount64()+5000;
+        while(!PeekMessageW(&message,window,WM_INDEX_COMPLETE,WM_INDEX_COMPLETE,PM_REMOVE) && GetTickCount64()<until)
+            Sleep(5);
+        Check(message.message==WM_INDEX_COMPLETE,"cancelled index work did not finish");
+        const bool cancelled=((IndexBuildResult*)message.lParam)->cancelled;
+        FinishIndexBuild(window,message.lParam);
+        Check(cancelled && !indexBuildInProgress && !usnCheckpointValid,"cancelled index became a persistable snapshot");
+    }
+
     void SortedLookupGrowthStaysWithinPointerMemoryBudget()
     {
         SeedIndex();
@@ -225,6 +370,20 @@ namespace
         Check(!searchResults.empty(),"timestamp-only update cleared prefix lookup");
     }
 
+    void RepeatedCreateDoesNotRebuildUnchangedLookup()
+    {
+        SeedIndex();
+        timestampCache[12]={};
+        UsnChange change{};
+        change.fileRef=12; change.parentRef=11; change.fileName=L"old-notes.txt";
+        change.reason=USN_REASON_FILE_CREATE|USN_REASON_CLOSE;
+        pendingUsnChanges.push_back(change);
+        bool changed=true;
+        { AllocationLimit limit(0); changed=ProcessPendingUsnChanges(); }
+        Check(!changed && !sortedTokensDirty && !indexMemoryFailed,
+            "repeated create/close invalidated an unchanged filename lookup");
+    }
+
     void CatchUpDefersLargeLookupRebuildUntilSearch()
     {
         SeedIndex();
@@ -251,6 +410,24 @@ namespace
             timestampCache.count(100000+MAX_UI_USN_CHANGES)==0,"UI catch-up exceeded its per-turn work bound");
         StopUsnMonitor();
         Check(timestampCache.count(100000+MAX_UI_USN_CHANGES)==1,"shutdown did not drain the remaining checkpoint changes");
+    }
+
+    void CatchUpYieldsToKeyboardMessages()
+    {
+        SeedIndex();
+        HWND window=CreateWindowExW(0,L"STATIC",L"Catch-up fairness test",0,0,0,1,1,nullptr,nullptr,nullptr,nullptr);
+        Check(window!=nullptr,"catch-up fairness window unavailable");
+        hMainWnd=window;
+        pendingUsnChanges.resize(MAX_UI_USN_CHANGES+1);
+        for(auto& change:pendingUsnChanges) {change.fileRef=12;change.reason=USN_REASON_BASIC_INFO_CHANGE;}
+        ProcessPendingUsnChanges();
+        MSG message{};
+        const bool immediatelyPosted=PeekMessageW(&message,window,WM_USN_UPDATED,WM_USN_UPDATED,PM_REMOVE)!=FALSE;
+        Sleep(25);
+        const bool timer=PeekMessageW(&message,window,WM_TIMER,WM_TIMER,PM_REMOVE)!=FALSE;
+        KillTimer(window,IDT_INDEX_UPDATES); hMainWnd=nullptr; DestroyWindow(window);
+        StopUsnMonitor();
+        Check(!immediatelyPosted && timer,"continuous posted catch-up work can starve keyboard input");
     }
 
     void CatchUpBackpressureIsBoundedAndCancellable()
@@ -326,6 +503,88 @@ namespace
             << " elapsed_ms=" << GetTickCount64()-started << " cache_written=false\n";
     }
 
+    void ProfileDriveEnumeration(const std::wstring& drive)
+    {
+        Check(drive.size()==1 && iswalpha(drive[0]),"provide one drive letter");
+        int files=0, directories=0;
+        const auto started=GetTickCount64();
+        Check(ReadDriveMFT(nullptr,drive,files,directories),"read-only MFT enumeration failed");
+        const auto enumerated=GetTickCount64();
+        BuildSearchIndex(drive);
+        PROCESS_MEMORY_COUNTERS_EX memory{};
+        GetProcessMemoryInfo(GetCurrentProcess(),reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&memory),sizeof(memory));
+        std::cout << "PASS full_drive_enumeration files=" << files << " directories=" << directories
+            << " enumeration_ms=" << enumerated-started << " indexing_ms=" << GetTickCount64()-enumerated
+            << " pointer_bits=" << sizeof(void*)*8 << " private_mb=" << memory.PrivateUsage/(1024*1024)
+            << " cache_written=false\n";
+    }
+
+    void ProfileCachedTyping()
+    {
+        Check(LoadIndexFromFile(),"existing cache unavailable");
+        INITCOMMONCONTROLSEX controls{sizeof(controls),ICC_LISTVIEW_CLASSES}; InitCommonControlsEx(&controls);
+        struct State {
+            std::atomic<bool> typed{false},applied{false},failed{false};
+            std::vector<double> inputMs;
+        } state;
+        WNDCLASSW cls{}; cls.hInstance=GetModuleHandleW(nullptr); cls.lpszClassName=L"FindMyFileCachedTypingProfile";
+        cls.lpfnWndProc=[](HWND window,UINT message,WPARAM wp,LPARAM lp)->LRESULT {
+            if(message==WM_NCCREATE)
+                SetWindowLongPtrW(window,GWLP_USERDATA,(LONG_PTR)((CREATESTRUCTW*)lp)->lpCreateParams);
+            if(message==WM_COMMAND || message==WM_TIMER || message==WM_FILENAME_RESULT || message==WM_NOTIFY)
+            {
+                const auto result=WndProc(window,message,wp,lp);
+                auto* state=(State*)GetWindowLongPtrW(window,GWLP_USERDATA);
+                if(message==WM_FILENAME_RESULT && currentSearchKeyword==L"eval" && state->typed) state->applied=true;
+                return result;
+            }
+            return DefWindowProcW(window,message,wp,lp);
+        };
+        Check(RegisterClassW(&cls)!=0,"typing profile class unavailable");
+        HWND window=CreateWindowExW(0,cls.lpszClassName,L"Read-only FindMyFile typing measurement",0,0,0,640,480,
+            nullptr,nullptr,cls.hInstance,&state);
+        Check(window!=nullptr,"typing profile window unavailable");
+        hSearchEdit=CreateWindowExW(0,L"EDIT",L"",WS_CHILD,0,0,600,26,window,(HMENU)IDC_SEARCH_EDIT,nullptr,nullptr);
+        hListView=CreateWindowExW(0,WC_LISTVIEW,L"",WS_CHILD|LVS_REPORT|LVS_OWNERDATA,0,30,600,400,window,(HMENU)IDC_LISTVIEW,nullptr,nullptr);
+        bTreeRenderedOnce=true;
+        StartFilenameWorker(window);
+        const auto started=GetTickCount64();
+        std::thread input([&] {
+            for(const auto* query:{L"e",L"ev",L"eva",L"eval"})
+            {
+                const auto begin=std::chrono::steady_clock::now();
+                if(wcscmp(query,L"eval")==0) state.typed=true;
+                DWORD_PTR ignored=0;
+                if(!SendMessageTimeoutW(hSearchEdit,WM_SETTEXT,0,(LPARAM)query,SMTO_ABORTIFHUNG,5000,&ignored))
+                {state.failed=true;return;}
+                state.inputMs.push_back(std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-begin).count());
+                Sleep(400);
+            }
+        });
+        const auto until=GetTickCount64()+60000;
+        while(!state.failed && !state.applied && GetTickCount64()<until)
+        {
+            MSG message{};
+            if(PeekMessageW(&message,nullptr,0,0,PM_REMOVE)) {TranslateMessage(&message);DispatchMessageW(&message);}
+            else MsgWaitForMultipleObjectsEx(0,nullptr,10,QS_ALLINPUT,MWMO_INPUTAVAILABLE);
+        }
+        input.join();
+        StopFilenameWorker();
+        MSG pending{};
+        while(PeekMessageW(&pending,window,WM_FILENAME_RESULT,WM_FILENAME_RESULT,PM_REMOVE))
+            delete (FilenameResult*)pending.lParam;
+        KillTimer(window,IDT_SEARCH_DEBOUNCE);
+        const auto rows=searchResults.size(),entries=fileMap.size();
+        const bool ok=state.applied && !state.failed;
+        DestroyWindow(window); UnregisterClassW(cls.lpszClassName,cls.hInstance);
+        hSearchEdit=hListView=nullptr; bTreeRenderedOnce=false;
+        Check(ok && !state.inputMs.empty(),"cached typing did not complete");
+        std::cout << "PASS cached_typing entries=" << entries << " result_count=" << rows
+            << " pointer_bits=" << sizeof(void*)*8
+            << " input_max_ms=" << *std::max_element(state.inputMs.begin(),state.inputMs.end())
+            << " elapsed_ms=" << GetTickCount64()-started << " cache_written=false\n";
+    }
+
     void QueryCachedIndex(const std::wstring& query, const std::wstring& target, bool refresh)
     {
         Check(LoadIndexFromFile(), "existing cached index unavailable");
@@ -391,6 +650,18 @@ int wmain(int argc, wchar_t** argv)
     if (FAILED(hr)) return 1;
     try
     {
+        if (argc==3 && wcscmp(argv[1],L"--enumeration-profile")==0)
+        {
+            ProfileDriveEnumeration(argv[2]);
+            RoUninitialize();
+            return 0;
+        }
+        if (argc==2 && wcscmp(argv[1],L"--typing-profile")==0)
+        {
+            ProfileCachedTyping();
+            RoUninitialize();
+            return 0;
+        }
         if (argc == 2 && wcscmp(argv[1],L"--startup-replay") == 0)
         {
             ReplayExistingCacheStartup();
@@ -411,12 +682,26 @@ int wmain(int argc, wchar_t** argv)
         std::cout << "PASS LaterMatchesAreNotSilentlyDroppedFromContextScoring\n";
         LiveIndexUpdatesDoNotRestartTheDisplayedSearch();
         std::cout << "PASS LiveIndexUpdatesDoNotRestartTheDisplayedSearch\n";
+        ProgressPumpYieldsWhenMessagesKeepArriving();
+        std::cout << "PASS ProgressPumpYieldsWhenMessagesKeepArriving\n";
+        ProgressAdvancesAcrossBatchBoundaries();
+        std::cout << "PASS ProgressAdvancesAcrossBatchBoundaries\n";
+        FilenameSearchCancelsWithoutBlockingInput();
+        std::cout << "PASS FilenameSearchCancelsWithoutBlockingInput\n";
+        TypingDoesNotRebuildThousandsOfVisibleRows();
+        std::cout << "PASS TypingDoesNotRebuildThousandsOfVisibleRows\n";
+        IndexBuildCanBeCancelledBeforeItAcquiresTheIndex();
+        std::cout << "PASS IndexBuildCanBeCancelledBeforeItAcquiresTheIndex\n";
         SortedLookupGrowthStaysWithinPointerMemoryBudget();
         std::cout << "PASS SortedLookupGrowthStaysWithinPointerMemoryBudget\n";
         AllocationFailurePreservesTheSavedCache();
         std::cout << "PASS AllocationFailurePreservesTheSavedCache\n";
+        RepeatedCreateDoesNotRebuildUnchangedLookup();
+        std::cout << "PASS RepeatedCreateDoesNotRebuildUnchangedLookup\n";
         CatchUpDefersLargeLookupRebuildUntilSearch();
         std::cout << "PASS CatchUpDefersLargeLookupRebuildUntilSearch\n";
+        CatchUpYieldsToKeyboardMessages();
+        std::cout << "PASS CatchUpYieldsToKeyboardMessages\n";
         CatchUpBackpressureIsBoundedAndCancellable();
         std::cout << "PASS CatchUpBackpressureIsBoundedAndCancellable\n";
         RoUninitialize();

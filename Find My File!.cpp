@@ -63,6 +63,10 @@
 #define WM_LOAD_CACHED_INDEX (WM_USER + 3)
 #define WM_WARP_RESULT      (WM_USER + 4)
 #define WM_USN_INVALIDATED  (WM_USER + 5)
+#define WM_INDEX_PROGRESS   (WM_USER + 6)
+#define WM_INDEX_COMPLETE   (WM_USER + 7)
+#define WM_FILENAME_RESULT  (WM_USER + 8)
+#define IDT_INDEX_UPDATES   6003
 #define IDC_WARP_CONTEXT    3005
 #define IDC_WARP_WINDOW     3006
 #define IDC_WARP_STATUS     3007
@@ -100,7 +104,15 @@ HBRUSH hEditBrush = NULL;
 HWND hDarkModeBtn = NULL;
 bool bDarkMode = false;
 bool bTreeRenderedOnce = false;
-bool indexMemoryFailed = false;
+std::atomic<bool> indexMemoryFailed{false};
+std::atomic<bool> indexBuildInProgress{false}, indexBuildCancelled{false};
+bool closeAfterIndexBuild = false;
+std::mutex indexDataMutex, indexProgressMutex;
+std::thread indexBuildThread;
+std::wstring indexProgressText;
+int indexProgressPercent = 0;
+bool indexProgressPosted = false;
+struct OperationCancelled : std::exception {};
 HIMAGELIST hSysImageList = NULL;
 std::unordered_map<std::wstring, int> iconCache;  // extension -> icon index
 int iFolderIcon = -1;  // cached folder icon index
@@ -289,6 +301,7 @@ WarpContext::Demo warpDemo;
 #ifdef FINDMYFILE_CONTEXT_DEMO_ONLY
 std::wstring demoSmokeReport;
 int demoExitCode = 0;
+unsigned demoTextCallbacks = 0;
 #endif
 
 // Goop folder exclusion cache: directory ref -> 1 (goop) / 0 (not goop).
@@ -307,9 +320,27 @@ struct SearchResult {
     int baseScore = 0;   // match type score before any bonuses (for quality label)
     double warpBonus = 0; // bounded contextual delta; matchScore remains the baseline
     std::wstring warpReason;
+    LONGLONG modifiedUtc = 0;
 };
 std::vector<SearchResult> searchResults;
 std::vector<SearchResult> baselineResults;
+struct FilenameRequest {
+    uint64_t generation = 0;
+    std::wstring query, drive, scope;
+    ULONGLONG scopeRef = 0;
+};
+struct FilenameResult {
+    FilenameRequest request;
+    std::vector<SearchResult> rows;
+    bool wildcard = false, failed = false;
+    double elapsedMs = 0;
+};
+std::mutex filenameMutex;
+std::condition_variable filenameCv;
+std::thread filenameThread;
+std::atomic<uint64_t> filenameGeneration{0};
+bool filenamePending = false, filenameStopping = false;
+FilenameRequest filenameRequest;
 
 // Drive buttons
 struct DriveButton {
@@ -334,7 +365,7 @@ void                CreateDriveButtons(HWND hWnd);
 void                LayoutControls(HWND hWnd);
 void                BuildSearchIndex(const std::wstring& drive);
 std::wstring        StemWord(const std::wstring& word);
-std::wstring        BuildFullPath(ULONGLONG fileRef, const std::wstring& drive);
+std::wstring        BuildFullPath(ULONGLONG fileRef, const std::wstring& drive, std::unordered_map<ULONGLONG,std::wstring>* cache = nullptr);
 void                PerformSearch(const std::wstring& keyword, ULONGLONG scopeRef = 0);
 void                PopulateSearchResults();
 void                LaunchSearchResult(int index);
@@ -344,10 +375,10 @@ int                 GetFileIconIndex(const std::wstring& fileName, bool isDirect
 void                AddFileToIndex(ULONGLONG fileRef, const std::wstring& lowerName);
 void                RemoveFileFromIndex(ULONGLONG fileRef, const std::wstring& lowerName);
 bool                StartUsnMonitor(const std::wstring& drive);
-void                StopUsnMonitor();
+void                StopUsnMonitor(bool applyPending = true);
 bool                ProcessPendingUsnChanges(bool drainAll = false);
 void                UpdatePropertiesPanel(int selectedIndex);
-void                RebuildSortedTokens();
+void                RebuildSortedTokens(const std::function<bool()>& cancelled = {});
 void                TriggerWindowsSearch(HWND hWnd);
 void                LoadCloudConfig();
 void                SaveCloudConfig();
@@ -370,7 +401,13 @@ static void RequestWarpContext(bool refresh = false);
 static void ShowContextDemo();
 static std::wstring GetIndexDbPath();
 static bool SaveIndexToFile(const std::wstring& path = {});
-static bool LoadIndexFromFile(const std::wstring& path = {});
+static bool LoadIndexFromFile(const std::wstring& path = {}, bool buildIndexes = true, bool verifyJournal = false);
+static void CancelFilenameSearch();
+static void StartFilenameWorker(HWND window);
+static void StopFilenameWorker();
+static void StartIndexBuild(HWND window, const std::wstring& drive, bool fromCache);
+static void FinishIndexBuild(HWND window, LPARAM payload);
+static void FinishFilenameSearch(HWND window, LPARAM payload);
 
 // Update the tooltip text for the properties toggle button to reflect its current action.
 static void UpdateToggleTooltip()
@@ -479,6 +516,19 @@ std::vector<std::wstring> GetFixedNtfsDrives()
 
 void UpdateProgress(int percentage, const std::wstring& status)
 {
+    if (indexBuildInProgress && hMainWnd &&
+        GetCurrentThreadId() != GetWindowThreadProcessId(hMainWnd,nullptr))
+    {
+        std::lock_guard<std::mutex> lock(indexProgressMutex);
+        indexProgressPercent = percentage;
+        indexProgressText = status;
+        if (!indexProgressPosted)
+        {
+            indexProgressPosted = true;
+            PostMessageW(hMainWnd,WM_INDEX_PROGRESS,0,0);
+        }
+        return;
+    }
     if (hProgressBar)
     {
         SendMessage(hProgressBar, PBM_SETPOS, (WPARAM)percentage, 0);
@@ -489,12 +539,6 @@ void UpdateProgress(int percentage, const std::wstring& status)
         SetWindowTextW(hStatusText, status.c_str());
     }
     
-    MSG msg;
-    while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE))
-    {
-        TranslateMessage(&msg);
-        DispatchMessage(&msg);
-    }
 }
 
 // Insert a tree item. If hasChildren is true, adds cChildren=1 so the [+] button appears.
@@ -563,8 +607,9 @@ void PopulateChildren(ULONGLONG parentRef, HTREEITEM hParentItem)
 }
 
 // Build full path for a file reference by walking up the parent chain
-std::wstring BuildFullPath(ULONGLONG fileRef, const std::wstring& drive)
+std::wstring BuildFullPath(ULONGLONG fileRef, const std::wstring& drive, std::unordered_map<ULONGLONG,std::wstring>* cache)
 {
+    auto& fullPathCache = cache ? *cache : ::fullPathCache;
     // Check cache first
     auto cacheIt = fullPathCache.find(fileRef);
     if (cacheIt != fullPathCache.end())
@@ -745,6 +790,7 @@ void BuildSearchIndex(const std::wstring& drive)
 
     for (auto& pair : fileMap)
     {
+        if (indexBuildCancelled) throw OperationCancelled{};
         ULONGLONG fileRef = pair.first;
         const FileEntry& entry = pair.second;
 
@@ -823,7 +869,7 @@ void BuildSearchIndex(const std::wstring& drive)
     }
 
     // Build sorted token vectors for O(log N) prefix range lookups
-    RebuildSortedTokens();
+    RebuildSortedTokens([] { return indexBuildCancelled.load(); });
 
     // Build trigram index for O(1) substring candidate lookup.
     // For each filename, extract every 3-character window and map it to the file ref.
@@ -831,6 +877,7 @@ void BuildSearchIndex(const std::wstring& drive)
     trigramIndex.reserve(32768);
     for (auto& pair : fileMap)
     {
+        if (indexBuildCancelled) throw OperationCancelled{};
         const std::wstring& ln = pair.second.lowerFileName;
         if (ln.length() < 3)
             continue;
@@ -846,6 +893,7 @@ void BuildSearchIndex(const std::wstring& drive)
     // Sort and deduplicate each posting list for fast intersection
     for (auto& kv : trigramIndex)
     {
+        if (indexBuildCancelled) throw OperationCancelled{};
         std::sort(kv.second.begin(), kv.second.end());
         kv.second.erase(std::unique(kv.second.begin(), kv.second.end()), kv.second.end());
     }
@@ -980,19 +1028,34 @@ void RemoveFileFromIndex(ULONGLONG fileRef, const std::wstring& lowerName)
 }
 
 // Rebuild the sorted token vectors after incremental changes.
-void RebuildSortedTokens()
+void RebuildSortedTokens(const std::function<bool()>& cancelled)
 {
+    sortedTokensDirty = true;
+    size_t visited=0;
+    auto checkpoint=[&] {
+        if (cancelled && (++visited & 1023)==0 && cancelled()) throw OperationCancelled{};
+    };
     sortedTokens.clear();
     sortedTokens.reserve(invertedIndex.size());
     for (auto& kv : invertedIndex)
+    {
+        checkpoint();
         sortedTokens.push_back(&kv.first);
-    auto less = [](const std::wstring* a, const std::wstring* b) { return *a < *b; };
+    }
+    size_t comparisons = 0;
+    auto less = [&](const std::wstring* a, const std::wstring* b) {
+        if (cancelled && (++comparisons & 1023)==0 && cancelled()) throw OperationCancelled{};
+        return *a < *b;
+    };
     std::sort(sortedTokens.begin(), sortedTokens.end(), less);
 
     sortedStemTokens.clear();
     sortedStemTokens.reserve(stemmedIndex.size());
     for (auto& kv : stemmedIndex)
+    {
+        checkpoint();
         sortedStemTokens.push_back(&kv.first);
+    }
     std::sort(sortedStemTokens.begin(), sortedStemTokens.end(), less);
     sortedTokensDirty = false;
 }
@@ -1003,8 +1066,9 @@ static void ReportIndexMemoryFailure()
     bUsnMonitorRunning = false;
     usnCheckpointValid = false;
     usnQueueSpace.notify_all();
-    sortedTokens.clear();
-    sortedStemTokens.clear();
+    if (indexBuildInProgress && hMainWnd &&
+        GetCurrentThreadId() != GetWindowThreadProcessId(hMainWnd,nullptr)) return;
+    CancelFilenameSearch();
     ResetWarpContext(false);
     searchResults.clear();
     baselineResults.clear();
@@ -1040,15 +1104,11 @@ bool ProcessPendingUsnChanges(bool drainAll) try
         return false;
 
     bool indexDirty = false;
-    const bool mayChangeTokens = std::any_of(changes.begin(), changes.end(), [](const UsnChange& change) {
-        return (change.reason & (USN_REASON_FILE_DELETE | USN_REASON_FILE_CREATE | USN_REASON_RENAME_NEW_NAME)) != 0;
-    });
-    if (mayChangeTokens)
-    {
+    auto invalidateLookup = [&] {
         sortedTokens.clear();
         sortedStemTokens.clear();
         sortedTokensDirty = true;
-    }
+    };
 
     for (auto& ch : changes)
     {
@@ -1060,6 +1120,7 @@ bool ProcessPendingUsnChanges(bool drainAll) try
             auto it = fileMap.find(fileRef);
             if (it != fileMap.end())
             {
+                invalidateLookup();
                 RemoveFileFromIndex(fileRef, it->second.lowerFileName);
                 ULONGLONG oldParent = it->second.parentReference & 0x0000FFFFFFFFFFFF;
                 auto cIt = childrenMap.find(oldParent);
@@ -1077,6 +1138,13 @@ bool ProcessPendingUsnChanges(bool drainAll) try
         else if (ch.reason & (USN_REASON_FILE_CREATE | USN_REASON_RENAME_NEW_NAME))
         {
             auto existing = fileMap.find(fileRef);
+            if (existing != fileMap.end() && existing->second.fileName==ch.fileName &&
+                existing->second.parentReference==parentRef && existing->second.isDirectory==ch.isDirectory)
+            {
+                timestampCache[fileRef]=ch.timestamp;
+                continue;
+            }
+            invalidateLookup();
             if (existing != fileMap.end())
             {
                 RemoveFileFromIndex(fileRef, existing->second.lowerFileName);
@@ -1120,7 +1188,7 @@ bool ProcessPendingUsnChanges(bool drainAll) try
     }
 
     if (indexDirty) fullPathCache.clear();
-    if (more && hMainWnd) PostMessage(hMainWnd, WM_USN_UPDATED, 0, 0);
+    if (more && hMainWnd) SetTimer(hMainWnd,IDT_INDEX_UPDATES,10,nullptr);
     return indexDirty;
 }
 catch (const std::bad_alloc&)
@@ -1133,6 +1201,18 @@ static bool JournalContainsCheckpoint(const USN_JOURNAL_DATA_V0& journal, ULONGL
 {
     return id != 0 && id == journal.UsnJournalID && cursor >= journal.FirstUsn &&
         cursor >= journal.LowestValidUsn && cursor <= journal.NextUsn;
+}
+
+static bool JournalCheckpointAvailable(const std::wstring& drive, ULONGLONG id, USN cursor)
+{
+    const auto path = L"\\\\.\\"+drive+L":";
+    HANDLE raw = CreateFileW(path.c_str(),GENERIC_READ,FILE_SHARE_READ|FILE_SHARE_WRITE,
+        nullptr,OPEN_EXISTING,0,nullptr);
+    if (raw==INVALID_HANDLE_VALUE) return false;
+    std::unique_ptr<void,decltype(&CloseHandle)> handle(raw,&CloseHandle);
+    USN_JOURNAL_DATA_V0 journal{}; DWORD bytes=0;
+    return DeviceIoControl(raw,FSCTL_QUERY_USN_JOURNAL,nullptr,0,&journal,sizeof(journal),&bytes,nullptr) &&
+        JournalContainsCheckpoint(journal,id,cursor);
 }
 
 static bool QueueUsnBatch(std::vector<UsnChange>& batch, USN nextUsn)
@@ -1236,7 +1316,11 @@ static void UsnMonitorThreadFunc(std::wstring drive) try
         }
 
         if (!QueueUsnBatch(batch, nextUsn)) break;
-        if (bytesReturned == sizeof(USN)) Sleep(USN_POLL_MS);
+        if (bytesReturned == sizeof(USN))
+        {
+            std::unique_lock<std::mutex> lock(usnMutex);
+            usnQueueSpace.wait_for(lock,std::chrono::milliseconds(USN_POLL_MS),[] { return !bUsnMonitorRunning; });
+        }
     }
 }
 catch (const std::bad_alloc&)
@@ -1275,13 +1359,13 @@ catch (const std::bad_alloc&)
     return false;
 }
 
-void StopUsnMonitor()
+void StopUsnMonitor(bool applyPending)
 {
     bUsnMonitorRunning.store(false);
     usnQueueSpace.notify_all();
     if (usnMonitorThread.joinable())
         usnMonitorThread.join();
-    ProcessPendingUsnChanges(true);
+    if (applyPending) ProcessPendingUsnChanges(true);
 }
 
 static bool ExactCandidate(const SearchResult& item)
@@ -1559,7 +1643,7 @@ static bool SaveIndexToFile(const std::wstring& suppliedPath)
     return MoveFileExW(tmpPath.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
 }
 
-static bool LoadIndexFromFile(const std::wstring& suppliedPath) try
+static bool LoadIndexFromFile(const std::wstring& suppliedPath, bool buildIndexes, bool verifyJournal) try
 {
     indexMemoryFailed = false;
     usnCheckpointValid = false;
@@ -1640,6 +1724,11 @@ static bool LoadIndexFromFile(const std::wstring& suppliedPath) try
             memcpy(&savedCursor, ptr, 8); ptr += 8;
         }
     }
+    if (ok && verifyJournal)
+    {
+        currentDriveLetter=drive;
+        if (!JournalCheckpointAvailable(drive,savedJournal,savedCursor)) return false;
+    }
 
     // fileMap
     DWORD fileCount = 0;
@@ -1655,6 +1744,7 @@ static bool LoadIndexFromFile(const std::wstring& suppliedPath) try
 
         for (DWORD i = 0; i < fileCount; i++)
         {
+            if ((i & 4095)==0 && indexBuildCancelled) throw OperationCancelled{};
             // Each record: 8 + 8 + 1 + 8 + 2 = 27 bytes minimum
             if (!canRead(27)) { ok = false; break; }
 
@@ -1725,7 +1815,7 @@ static bool LoadIndexFromFile(const std::wstring& suppliedPath) try
 
     // Rebuild search indexes from fileMap (1-3 seconds in-memory, far faster
     // than deserialising them from disk with millions of I/O calls)
-    BuildSearchIndex(drive);
+    if (buildIndexes) BuildSearchIndex(drive);
 
     return true;
 }
@@ -2072,8 +2162,9 @@ static bool IsAnyDepthGoopName(const std::wstring& name)
 // Determine whether the file at 'fileRef' lives under a goop folder.
 // Walks the parent chain from the file toward root, checking each ancestor
 // directory.  Uses goopCache for O(1) amortised repeat lookups.
-static bool IsInGoopFolder(ULONGLONG fileRef)
+static bool IsInGoopFolder(ULONGLONG fileRef, std::unordered_map<ULONGLONG,int8_t>* suppliedCache = nullptr)
 {
+    auto& goopCache = suppliedCache ? *suppliedCache : ::goopCache;
     // Walk ancestors, collecting refs along the way so we can cache the result
     // for every directory we visit.
     std::vector<ULONGLONG> chain;
@@ -2140,17 +2231,24 @@ static bool IsInGoopFolder(ULONGLONG fileRef)
     return false;
 }
 
-// Perform a search and populate searchResults sorted by match quality.
-// If scopeRef != 0, only include results that are descendants of that directory.
-void PerformSearch(const std::wstring& keyword, ULONGLONG scopeRef) try
+static FilenameResult ComputeFilenameSearch(const FilenameRequest& request, const std::function<bool()>& cancelled)
 {
-    searchResults.clear();
-    bWildcardSearch = false;
-    goopCache.clear();
+    FilenameResult result; result.request = request;
+    auto& searchResults = result.rows;
+    auto& bWildcardSearch = result.wildcard;
+    const auto& keyword = request.query;
+    const auto scopeRef = request.scopeRef;
+    std::unordered_map<ULONGLONG,int8_t> goopCache;
+    std::unordered_map<ULONGLONG,std::wstring> pathCache;
+    size_t work = 0;
+    auto checkpoint = [&] {
+        if ((++work & 255)==0 && cancelled && cancelled()) throw OperationCancelled{};
+    };
+    if (cancelled && cancelled()) throw OperationCancelled{};
 
     if (keyword.empty() || fileMap.empty())
-        return;
-    if (sortedTokensDirty) RebuildSortedTokens();
+        return result;
+    if (sortedTokensDirty) RebuildSortedTokens(cancelled);
 
     std::wstring lowerKeyword = keyword;
     for (auto& ch : lowerKeyword)
@@ -2209,10 +2307,11 @@ void PerformSearch(const std::wstring& keyword, ULONGLONG scopeRef) try
         searchResults.reserve(4096);
 
         auto processWildcardCandidate = [&](ULONGLONG ref, const FileEntry& entry) {
+            checkpoint();
             if (scopeRef != 0 && ref != scopeRef && !IsDescendantOf(ref, scopeRef))
                 return;
             // Exclude goop folders in global (unscoped) searches
-            if (scopeRef == 0 && IsInGoopFolder(ref))
+            if (scopeRef == 0 && IsInGoopFolder(ref,&goopCache))
                 return;
             if (!WildcardMatch(entry.lowerFileName.c_str(), lowerKeyword.c_str()))
                 return;
@@ -2276,8 +2375,13 @@ void PerformSearch(const std::wstring& keyword, ULONGLONG scopeRef) try
             std::sort(searchResults.begin(), searchResults.end(), cmpResults);
         }
         for (auto& sr : searchResults)
-            sr.fullPath = BuildFullPath(sr.fileRef, currentDriveLetter);
-        return;
+        {
+            checkpoint();
+            sr.fullPath = BuildFullPath(sr.fileRef,request.drive,&pathCache);
+            const auto time = timestampCache.find(sr.fileRef);
+            if (time != timestampCache.end()) sr.modifiedUtc = time->second.QuadPart;
+        }
+        return result;
     }
 
     // --- Normal (non-wildcard) search path ---
@@ -2289,6 +2393,7 @@ void PerformSearch(const std::wstring& keyword, ULONGLONG scopeRef) try
 
     // Helper lambda to insert/update a score
     auto addScore = [&](ULONGLONG ref, int score) {
+        checkpoint();
         auto res = matchScores.emplace(ref, score);
         if (!res.second && res.first->second < score)
             res.first->second = score;
@@ -2347,6 +2452,7 @@ void PerformSearch(const std::wstring& keyword, ULONGLONG scopeRef) try
         {
             for (ULONGLONG ref : *smallest)
             {
+                checkpoint();
                 if (matchScores.count(ref))
                     continue;
                 auto fIt = fileMap.find(ref);
@@ -2365,6 +2471,7 @@ void PerformSearch(const std::wstring& keyword, ULONGLONG scopeRef) try
         // Short keyword fallback — brute-force scan (only for 1-2 char queries)
         for (auto& pair : fileMap)
         {
+            checkpoint();
             if (matchScores.count(pair.first))
                 continue;
             const std::wstring& ln = pair.second.lowerFileName;
@@ -2427,6 +2534,7 @@ void PerformSearch(const std::wstring& keyword, ULONGLONG scopeRef) try
         // for fuzzy matching, but length filtering eliminates most candidates.
         for (const std::wstring* key : sortedTokens)
         {
+            checkpoint();
             const std::wstring& token = *key;
             int tLen = (int)token.length();
             if (tLen < minLen || tLen > maxLen)
@@ -2460,6 +2568,7 @@ void PerformSearch(const std::wstring& keyword, ULONGLONG scopeRef) try
     searchResults.reserve(matchScores.size());
     for (auto& pair : matchScores)
     {
+        checkpoint();
         ULONGLONG ref = pair.first;
         auto it = fileMap.find(ref);
         if (it == fileMap.end())
@@ -2469,7 +2578,7 @@ void PerformSearch(const std::wstring& keyword, ULONGLONG scopeRef) try
             continue;
 
         // Exclude goop folders in global (unscoped) searches
-        if (scopeRef == 0 && IsInGoopFolder(ref))
+        if (scopeRef == 0 && IsInGoopFolder(ref,&goopCache))
             continue;
 
         int base = pair.second;
@@ -2513,38 +2622,35 @@ void PerformSearch(const std::wstring& keyword, ULONGLONG scopeRef) try
     // Now build full paths only for the final result set
     for (auto& sr : searchResults)
     {
-        sr.fullPath = BuildFullPath(sr.fileRef, currentDriveLetter);
+        checkpoint();
+        sr.fullPath = BuildFullPath(sr.fileRef,request.drive,&pathCache);
+        const auto time = timestampCache.find(sr.fileRef);
+        if (time != timestampCache.end()) sr.modifiedUtc = time->second.QuadPart;
     }
+    return result;
+}
+
+void PerformSearch(const std::wstring& keyword, ULONGLONG scopeRef) try
+{
+    FilenameRequest request; request.query = keyword; request.scopeRef = scopeRef; request.drive = currentDriveLetter;
+    auto result = ComputeFilenameSearch(request,{});
+    searchResults = std::move(result.rows); bWildcardSearch = result.wildcard;
 }
 catch (const std::bad_alloc&)
 {
     ReportIndexMemoryFailure();
 }
 
-// Format a file's last-write time into a date/time string.
-// First tries the USN timestamp cache; falls back to querying the filesystem.
-static std::wstring FormatTimestamp(ULONGLONG fileRef, const std::wstring& fullPath)
+// Render the timestamp captured with the result, without filesystem I/O on the UI thread.
+static std::wstring FormatTimestamp(const SearchResult& item)
 {
     if (contextDemo) return L"Synthetic";
     FILETIME ft = {0, 0};
 
-    auto tsIt = timestampCache.find(fileRef);
-    if (tsIt != timestampCache.end() && tsIt->second.QuadPart != 0)
+    if (item.modifiedUtc != 0)
     {
-        ft.dwLowDateTime = (DWORD)(tsIt->second.QuadPart & 0xFFFFFFFF);
-        ft.dwHighDateTime = (DWORD)(tsIt->second.QuadPart >> 32);
-    }
-    else if (!fullPath.empty())
-    {
-        WIN32_FILE_ATTRIBUTE_DATA fad = {0};
-        if (GetFileAttributesExW(fullPath.c_str(), GetFileExInfoStandard, &fad))
-        {
-            ft = fad.ftLastWriteTime;
-            LARGE_INTEGER li;
-            li.LowPart = ft.dwLowDateTime;
-            li.HighPart = ft.dwHighDateTime;
-            timestampCache[fileRef] = li;
-        }
+        ft.dwLowDateTime = (DWORD)(item.modifiedUtc & 0xFFFFFFFF);
+        ft.dwHighDateTime = (DWORD)(item.modifiedUtc >> 32);
     }
 
     if (ft.dwLowDateTime == 0 && ft.dwHighDateTime == 0)
@@ -2603,22 +2709,79 @@ int GetFileIconIndex(const std::wstring& fileName, bool isDirectory)
     return sfi.iIcon;
 }
 
-// Execute the current search (called from Find button and debounce timer)
+static void CancelFilenameSearch()
+{
+    ++filenameGeneration;
+    std::lock_guard<std::mutex> lock(filenameMutex);
+    filenamePending = false;
+}
+
+static void StartFilenameWorker(HWND window)
+{
+    filenameStopping = false;
+    filenameThread = std::thread([window] {
+        for (;;)
+        {
+            FilenameRequest request;
+            {
+                std::unique_lock<std::mutex> lock(filenameMutex);
+                filenameCv.wait(lock,[] { return filenamePending || filenameStopping; });
+                if (filenameStopping) return;
+                request = std::move(filenameRequest); filenamePending = false;
+            }
+            auto cancelled = [&] { return request.generation != filenameGeneration || indexBuildInProgress; };
+            const auto start = GetTickCount64();
+            std::unique_ptr<FilenameResult> result;
+            try
+            {
+                result = std::make_unique<FilenameResult>(); result->request = request;
+                std::lock_guard<std::mutex> lock(indexDataMutex);
+                *result = ComputeFilenameSearch(request,cancelled);
+            }
+            catch (const OperationCancelled&) { continue; }
+            catch (const std::bad_alloc&)
+            {
+                if (!result)
+                {
+                    if (!cancelled()) PostMessageW(window,WM_USN_INVALIDATED,ERROR_NOT_ENOUGH_MEMORY,0);
+                    continue;
+                }
+                result->failed = true;
+            }
+            result->elapsedMs = double(GetTickCount64()-start);
+            if (!cancelled() && PostMessageW(window,WM_FILENAME_RESULT,0,(LPARAM)result.get()))
+                result.release();
+        }
+    });
+}
+
+static void StopFilenameWorker()
+{
+    ++filenameGeneration;
+    {
+        std::lock_guard<std::mutex> lock(filenameMutex);
+        filenameStopping = true; filenamePending = false;
+    }
+    filenameCv.notify_all();
+    if (filenameThread.joinable()) filenameThread.join();
+}
+
+// Submit only the latest query. Retrieval never touches the UI result vector.
 void TriggerSearch(HWND hWnd)
 {
     if (contextDemo) { ShowContextDemo(); return; }
-    ResetWarpContext();
+    if (indexBuildInProgress) return;
+    ResetWarpContext(false);
+    CancelFilenameSearch();
     baselineResults.clear();
     wchar_t searchText[512] = {0};
     GetWindowTextW(hSearchEdit, searchText, 512);
     std::wstring keyword(searchText);
     if (keyword.empty() || fileMap.empty())
+    {
+        SetWindowTextW(hStatusText,L"Enter a search term.");
         return;
-
-    currentSearchKeyword = keyword;
-    for (auto& ch : currentSearchKeyword)
-        ch = towlower(ch);
-    bWindowsSearch = false;
+    }
 
     // Determine search scope from selected tree node
     ULONGLONG scopeRef = 0;
@@ -2642,19 +2805,28 @@ void TriggerSearch(HWND hWnd)
         }
     }
 
-    LARGE_INTEGER searchFreq, searchT1, searchT2;
-    QueryPerformanceFrequency(&searchFreq);
-    QueryPerformanceCounter(&searchT1);
-
-    PerformSearch(keyword, scopeRef);
-    PopulateSearchResults();
-
-    QueryPerformanceCounter(&searchT2);
-    double searchElapsedMS = (searchT2.QuadPart - searchT1.QuadPart) * 1000.0 / searchFreq.QuadPart;
-
-    // Switch to Search Results tab
+    {
+        std::lock_guard<std::mutex> lock(filenameMutex);
+        filenameRequest = {filenameGeneration.load(),keyword,currentDriveLetter,currentSearchScope,scopeRef};
+        filenamePending = true;
+    }
+    filenameCv.notify_one();
+    SetWindowTextW(hStatusText,L"Searching filenames in the background...");
     TabCtrl_SetCurSel(hTabControl, 1);
     ShowTab(1);
+}
+
+static void FinishFilenameSearch(HWND hWnd, LPARAM payload)
+{
+    std::unique_ptr<FilenameResult> result((FilenameResult*)payload);
+    if (!result || indexBuildInProgress || result->request.generation != filenameGeneration) return;
+    if (result->failed) { ReportIndexMemoryFailure(); return; }
+    currentSearchKeyword = result->request.query;
+    for (auto& ch:currentSearchKeyword) ch = towlower(ch);
+    currentSearchScope = result->request.scope;
+    bWindowsSearch = false; bWildcardSearch = result->wildcard;
+    searchResults = std::move(result->rows);
+    PopulateSearchResults();
 
     std::wstring status = L"Found " + std::to_wstring(searchResults.size()) + L" results";
     if (searchResults.size() >= 10000)
@@ -2665,7 +2837,7 @@ void TriggerSearch(HWND hWnd)
     if (stemmed != currentSearchKeyword)
         status += L"  |  Stem: \"" + stemmed + L"\"";
     wchar_t timeBuf[64];
-    swprintf_s(timeBuf, 64, L"  |  %.1f ms", searchElapsedMS);
+    swprintf_s(timeBuf, 64, L"  |  %.1f ms", result->elapsedMs);
     status += timeBuf;
     SetWindowTextW(hStatusText, status.c_str());
     BeginWarpSearch();
@@ -3643,7 +3815,9 @@ INT_PTR CALLBACK CloudConfigDlgProc(HWND hDlg, UINT message, WPARAM wParam, LPAR
 void TriggerWindowsSearch(HWND hWnd)
 {
     if (contextDemo) { ShowContextDemo(); return; }
-    ResetWarpContext();
+    if (indexBuildInProgress) return;
+    CancelFilenameSearch();
+    ResetWarpContext(false);
     baselineResults.clear();
     wchar_t searchText[512] = {0};
     GetWindowTextW(hSearchEdit, searchText, 512);
@@ -4119,6 +4293,10 @@ void TriggerWindowsSearch(HWND hWnd)
 
             // Filename matches rank higher than content-only matches
             sr.matchScore = sr.baseScore = filenameMatch ? 60 : 20;
+            WIN32_FILE_ATTRIBUTE_DATA modified{};
+            if (GetFileAttributesExW(sr.fullPath.c_str(),GetFileExInfoStandard,&modified))
+                sr.modifiedUtc = (LONGLONG( modified.ftLastWriteTime.dwHighDateTime )<<32) |
+                    modified.ftLastWriteTime.dwLowDateTime;
             searchResults.push_back(std::move(sr));
 
             if (searchResults.size() >= MAX_RESULTS)
@@ -4316,50 +4494,16 @@ void UpdatePropertiesPanel(int selectedIndex)
     InvalidateRect(hPropertiesPanel, NULL, TRUE);
 }
 
-// Populate the ListView with search results
-void PopulateSearchResults()
+static std::wstring SearchCellText(const SearchResult& sr, int column)
 {
-    if (!hListView)
-        return;
-
-    // Clear the properties panel so stale data from a previous search doesn't linger
-    if (hPropertiesPanel)
+    switch (column)
     {
-        SetWindowTextW(hPropertiesPanel, L"");
-        InvalidateRect(hPropertiesPanel, NULL, TRUE);
-    }
-
-    SendMessage(hListView, WM_SETREDRAW, FALSE, 0);
-    ListView_DeleteAllItems(hListView);
-
-    for (size_t i = 0; i < searchResults.size(); i++)
+    case 0: return sr.fileName;
+    case 1: return sr.isDirectory ? L"Folder" : L"File";
+    case 2: return sr.fullPath;
+    case 3: return FormatTimestamp(sr);
+    case 4:
     {
-        const SearchResult& sr = searchResults[i];
-
-        LVITEMW lvi = {0};
-        lvi.mask = LVIF_TEXT | LVIF_PARAM | LVIF_IMAGE;
-        lvi.iItem = (int)i;
-        lvi.iSubItem = 0;
-        lvi.pszText = (LPWSTR)sr.fileName.c_str();
-        lvi.lParam = (LPARAM)i;
-        lvi.iImage = GetFileIconIndex(sr.fileName, sr.isDirectory);
-        ListView_InsertItem(hListView, &lvi);
-
-        // Type column
-        ListView_SetItemText(hListView, (int)i, 1,
-            (LPWSTR)(sr.isDirectory ? L"Folder" : L"File"));
-
-        // Full path column
-        ListView_SetItemText(hListView, (int)i, 2, (LPWSTR)sr.fullPath.c_str());
-
-        // Modified date column
-        std::wstring modDate = FormatTimestamp(sr.fileRef, sr.fullPath);
-        ListView_SetItemText(hListView, (int)i, 3, (LPWSTR)modDate.c_str());
-
-        // Match quality column
-        // MFT scores: Exact=100, Wildcard=90, Prefix=75, Token=50, Substring=40, Stem=30/25
-        // Bonuses: case match +15, recency +10/+7/+3
-        // Windows Search scores: Filename=60, Content=20
         const wchar_t* quality = L"";
         if (bWindowsSearch)
         {
@@ -4375,24 +4519,28 @@ void PopulateSearchResults()
         else if (sr.baseScore >= 40) quality = L"Substring";
         else if (sr.baseScore >= 25) quality = L"Stem";
         else if (sr.baseScore >= 15) quality = L"Fuzzy";
-        ListView_SetItemText(hListView, (int)i, 4, (LPWSTR)quality);
-
-        // WARP Boost column
-        const auto warpText = WarpContext::DeltaText(sr.warpBonus, !sr.warpReason.empty());
-        ListView_SetItemText(hListView, (int)i, 5, (LPWSTR)warpText.c_str());
-
-        // Total Score column
-        wchar_t scoreBuf[16] = {0};
-        swprintf_s(scoreBuf, 16, L"%.1f", sr.matchScore + sr.warpBonus);
-        ListView_SetItemText(hListView, (int)i, 6, scoreBuf);
-
-        // Snippet column — show content preview for Windows Search content matches
-        if (!sr.contentSnippet.empty())
-            ListView_SetItemText(hListView, (int)i, 7, (LPWSTR)sr.contentSnippet.c_str());
+        return quality;
     }
+    case 5: return WarpContext::DeltaText(sr.warpBonus,!sr.warpReason.empty());
+    case 6:
+    {
+        wchar_t score[32]; swprintf_s(score,L"%.1f",sr.matchScore+sr.warpBonus);
+        return score;
+    }
+    case 7: return sr.contentSnippet;
+    default: return {};
+    }
+}
 
-    SendMessage(hListView, WM_SETREDRAW, TRUE, 0);
-    InvalidateRect(hListView, NULL, TRUE);
+void PopulateSearchResults()
+{
+    if (!hListView) return;
+    if (hPropertiesPanel) SetWindowTextW(hPropertiesPanel,L"");
+    SendMessageW(hListView,WM_SETREDRAW,FALSE,0);
+    ListView_SetItemState(hListView,-1,0,LVIS_SELECTED|LVIS_FOCUSED);
+    ListView_SetItemCountEx(hListView,(int)searchResults.size(),0);
+    SendMessageW(hListView,WM_SETREDRAW,TRUE,0);
+    InvalidateRect(hListView,nullptr,FALSE);
 }
 
 // Launch a file or folder from search results
@@ -4440,6 +4588,17 @@ void ShowTab(int tabIndex)
     }
 }
 
+struct EnumerationProgress
+{
+    int lastEntries = 0;
+    ULONGLONG lastTick = 0;
+    bool Due(int entries, ULONGLONG tick)
+    {
+        if (entries-lastEntries<50000 && tick-lastTick<100) return false;
+        lastEntries=entries; lastTick=tick; return true;
+    }
+};
+
 bool ReadDriveMFT(HWND hWnd, const std::wstring& drive, int& totalFiles, int& totalDirs)
 {
     try
@@ -4451,10 +4610,9 @@ bool ReadDriveMFT(HWND hWnd, const std::wstring& drive, int& totalFiles, int& to
         
         if (hVolume == INVALID_HANDLE_VALUE)
         {
-            MessageBoxW(hWnd, L"Failed to open volume. Run as Administrator.",
-                L"Error", MB_OK | MB_ICONERROR);
             return false;
         }
+        std::unique_ptr<void,decltype(&CloseHandle)> volume(hVolume,&CloseHandle);
 
         DWORD bytesReturned = 0;
         
@@ -4473,8 +4631,6 @@ bool ReadDriveMFT(HWND hWnd, const std::wstring& drive, int& totalFiles, int& to
             if (!DeviceIoControl(hVolume, FSCTL_QUERY_USN_JOURNAL, NULL, 0,
                 &journalData, sizeof(journalData), &bytesReturned, NULL))
             {
-                CloseHandle(hVolume);
-                MessageBoxW(hWnd, L"Failed to query USN journal.", L"Error", MB_OK | MB_ICONERROR);
                 return false;
             }
         }
@@ -4501,9 +4657,10 @@ bool ReadDriveMFT(HWND hWnd, const std::wstring& drive, int& totalFiles, int& to
         int totalEntries = 0;
         
         UpdateProgress(15, L"Enumerating drive " + drive + L":...");
+        EnumerationProgress progress; progress.lastTick=GetTickCount64();
         
         bool enumerationComplete = false;
-        while (true)
+        while (!indexBuildCancelled)
         {
             BOOL result = DeviceIoControl(hVolume, FSCTL_ENUM_USN_DATA,
                 &enumData, sizeof(enumData),
@@ -4527,6 +4684,7 @@ bool ReadDriveMFT(HWND hWnd, const std::wstring& drive, int& totalFiles, int& to
             
             // First 8 bytes are the next start reference number
             ULONGLONG nextRef = *(ULONGLONG*)buffer.data();
+            if (nextRef<=enumData.StartFileReferenceNumber) return false;
             
             // Walk the USN_RECORD entries after the 8-byte header
             DWORD offset = sizeof(USN);
@@ -4582,7 +4740,7 @@ bool ReadDriveMFT(HWND hWnd, const std::wstring& drive, int& totalFiles, int& to
             }
             
             // Update progress periodically
-            if (totalEntries % 50000 == 0)
+            if (progress.Due(totalEntries,GetTickCount64()))
             {
                 std::wstring status = L"Reading drive " + drive + L": " +
                     std::to_wstring(totalEntries) + L" entries...";
@@ -4593,7 +4751,6 @@ bool ReadDriveMFT(HWND hWnd, const std::wstring& drive, int& totalFiles, int& to
             enumData.StartFileReferenceNumber = nextRef;
         }
         
-        CloseHandle(hVolume);
         if (!enumerationComplete) return false;
         usnCheckpointValid = true;
         
@@ -4618,6 +4775,7 @@ bool ReadDriveMFT(HWND hWnd, const std::wstring& drive, int& totalFiles, int& to
         
         return true;
     }
+    catch (const std::bad_alloc&) { throw; }
     catch (...)
     {
         return false;
@@ -4672,123 +4830,124 @@ void BuildTreeView(const std::wstring& drive)
     }
 }
 
+struct IndexBuildResult
+{
+    bool ok=false, cancelled=false, cached=false, memoryFailure=false;
+    std::wstring drive, error;
+    size_t files=0, directories=0;
+    ULONGLONG elapsedMs=0;
+};
+
+static void ClearIndexData()
+{
+    sortedTokens.clear(); sortedStemTokens.clear();
+    fileMap.clear(); childrenMap.clear(); invertedIndex.clear(); stemmedIndex.clear();
+    trigramIndex.clear(); fullPathCache.clear(); timestampCache.clear(); goopCache.clear();
+}
+
+static void StartIndexBuild(HWND window, const std::wstring& drive, bool fromCache) try
+{
+    if (contextDemo || indexBuildInProgress.exchange(true)) return;
+    indexBuildCancelled=false; indexMemoryFailed=false; usnCheckpointValid=false;
+    CancelFilenameSearch(); ResetWarpContext(false);
+    StopUsnMonitor(false);
+    bTreeRenderedOnce=false;
+    for (auto& button:driveButtons) EnableWindow(button.hButton,FALSE);
+    for (HWND control:{hSearchEdit,hFindButton,hWinSearchButton,hTreeView,hListView})
+        if (control) EnableWindow(control,FALSE);
+    searchResults.clear(); baselineResults.clear(); currentSearchKeyword.clear();
+    if (hTreeView) TreeView_DeleteAllItems(hTreeView);
+    treeItemToRef.clear(); PopulateSearchResults();
+    ShowWindow(hProgressBar,SW_SHOW); ShowWindow(hSummaryText,SW_HIDE);
+    UpdateProgress(0,fromCache ? L"Loading cached index in the background..." : L"Preparing drive scan...");
+    auto result=std::make_unique<IndexBuildResult>(); result->drive=drive;
+    indexBuildThread=std::thread([window,fromCache,result=std::move(result)]() mutable {
+        const auto started=GetTickCount64();
+        try
+        {
+            std::lock_guard<std::mutex> data(indexDataMutex);
+            { std::lock_guard<std::mutex> queue(usnMutex); pendingUsnChanges.clear(); }
+            ClearIndexData();
+            if (fromCache && LoadIndexFromFile({},false,true))
+            {
+                result->cached=true; result->drive=currentDriveLetter;
+            }
+            else
+            {
+                if (indexMemoryFailed) throw std::bad_alloc();
+                if (indexBuildCancelled) throw OperationCancelled{};
+                ClearIndexData();
+                if (result->drive.empty())
+                {
+                    if (!currentDriveLetter.empty()) result->drive=currentDriveLetter;
+                    else throw std::runtime_error("No reusable cache. Select a drive to scan.");
+                }
+                int files=0, directories=0;
+                if (!ReadDriveMFT(nullptr,result->drive,files,directories))
+                    throw std::runtime_error("The drive scan could not complete. Retry or check drive access.");
+                currentDriveLetter=result->drive;
+            }
+            if (indexBuildCancelled) throw OperationCancelled{};
+            UpdateProgress(92,L"Building filename search indexes...");
+            BuildSearchIndex(result->drive);
+            if (indexBuildCancelled) throw OperationCancelled{};
+            for (const auto& pair:fileMap)
+                if (pair.second.isDirectory) ++result->directories; else ++result->files;
+            result->ok=true;
+        }
+        catch (const OperationCancelled&) { result->cancelled=true; }
+        catch (const std::bad_alloc&) { result->memoryFailure=true; }
+        catch (const std::exception& error) { result->error=Utf8ToWide(error.what()); }
+        result->cancelled=result->cancelled || indexBuildCancelled;
+        if (!result->ok || result->cancelled) usnCheckpointValid=false;
+        result->elapsedMs=GetTickCount64()-started;
+        if (PostMessageW(window,WM_INDEX_COMPLETE,0,(LPARAM)result.get())) result.release();
+    });
+}
+catch (const std::bad_alloc&)
+{
+    indexBuildInProgress=false;
+    ReportIndexMemoryFailure();
+    for (auto& button:driveButtons) EnableWindow(button.hButton,TRUE);
+}
+catch (const std::system_error&)
+{
+    indexBuildInProgress=false;
+    for (auto& button:driveButtons) EnableWindow(button.hButton,TRUE);
+    SetWindowTextW(hStatusText,L"Cannot start background indexing. Retry the drive scan.");
+}
+
 void ReadDriveAndBuildTree(HWND hWnd, const std::wstring& drive)
 {
-    indexMemoryFailed = false;
-    try
+    StartIndexBuild(hWnd,drive,false);
+}
+
+static void FinishIndexBuild(HWND window, LPARAM payload)
+{
+    std::unique_ptr<IndexBuildResult> result((IndexBuildResult*)payload);
+    if (indexBuildThread.joinable()) indexBuildThread.join();
+    if (result && indexBuildCancelled) { result->cancelled=true; usnCheckpointValid=false; }
+    indexBuildInProgress=false;
+    for (auto& button:driveButtons) EnableWindow(button.hButton,TRUE);
+    ShowWindow(hProgressBar,SW_HIDE);
+    if (result && result->ok && !result->cancelled)
     {
-        // Show progress controls and hide summary
-        if (hProgressBar)
-            ShowWindow(hProgressBar, SW_SHOW);
-        if (hStatusText)
-            ShowWindow(hStatusText, SW_SHOW);
-        if (hSummaryText)
-            ShowWindow(hSummaryText, SW_HIDE);
-
-        UpdateProgress(0, L"Initializing...");
-
-        // Stop any existing USN monitor
-        StopUsnMonitor();
-
-        // Clear previous data
-        fileMap.clear();
-        childrenMap.clear();
-        treeItemToRef.clear();
-        invertedIndex.clear();
-        stemmedIndex.clear();
-        sortedTokens.clear();
-        sortedStemTokens.clear();
-        trigramIndex.clear();
-        fullPathCache.clear();
-        timestampCache.clear();
-        searchResults.clear();
-        baselineResults.clear();
-        goopCache.clear();
-
-        // Disable drive buttons during scan
-        for (auto& db : driveButtons)
-        {
-            EnableWindow(db.hButton, FALSE);
-        }
-
-        UpdateProgress(5, L"Opening drive " + drive + L":...");
-
-        LARGE_INTEGER freq, t1, t2;
-        QueryPerformanceFrequency(&freq);
-        QueryPerformanceCounter(&t1);
-
-        int totalFiles = 0;
-        int totalDirs = 0;
-        
-        if (ReadDriveMFT(hWnd, drive, totalFiles, totalDirs))
-        {
-            QueryPerformanceCounter(&t2);
-            double elapsedTimeMS = (t2.QuadPart - t1.QuadPart) * 1000.0 / freq.QuadPart;
-
-            // Update summary text
-            if (hSummaryText)
-            {
-                std::wstring summaryText = L"Drive " + drive + L":  |  MFT Read: " +
-                    std::to_wstring((int)elapsedTimeMS) +
-                    L" ms  |  Folders: " + std::to_wstring(totalDirs) +
-                    L"  |  Files: " + std::to_wstring(totalFiles);
-                SetWindowTextW(hSummaryText, summaryText.c_str());
-                ShowWindow(hSummaryText, SW_SHOW);
-            }
-
-            UpdateProgress(85, L"Building tree view...");
-            
-            currentDriveLetter = drive;
-            BuildTreeView(drive);
-            
-            UpdateProgress(92, L"Building search index...");
-            BuildSearchIndex(drive);
-
-            if (!bTreeRenderedOnce)
-            {
-                bTreeRenderedOnce = true;
-                if (hSearchEdit) EnableWindow(hSearchEdit, TRUE);
-                if (hFindButton) EnableWindow(hFindButton, TRUE);
-                if (hWinSearchButton) EnableWindow(hWinSearchButton, TRUE);
-            }
-
-            // Start live USN journal monitoring
-            StartUsnMonitor(drive);
-        }
-        else if (!indexMemoryFailed)
-        {
-            UpdateProgress(0, L"Failed to read drive " + drive + L":");
-        }
-
-        // Re-enable drive buttons
-        for (auto& db : driveButtons)
-        {
-            EnableWindow(db.hButton, TRUE);
-        }
-
-        // Hide progress bar after completion
-        Sleep(500);
-        if (hProgressBar)
-            ShowWindow(hProgressBar, SW_HIDE);
-        if (hStatusText && !indexMemoryFailed)
-            SetWindowTextW(hStatusText, L"Select a drive to scan...");
+        BuildTreeView(result->drive);
+        bTreeRenderedOnce=true;
+        for (HWND control:{hSearchEdit,hFindButton,hWinSearchButton,hTreeView,hListView})
+            if (control) EnableWindow(control,TRUE);
+        const auto summary=L"Drive "+result->drive+L":  |  Folders: "+std::to_wstring(result->directories)+
+            L"  |  Files: "+std::to_wstring(result->files)+L"  |  Index ready in "+std::to_wstring(result->elapsedMs)+L" ms";
+        SetWindowTextW(hSummaryText,summary.c_str()); ShowWindow(hSummaryText,SW_SHOW);
+        if (StartUsnMonitor(result->drive))
+            SetWindowTextW(hStatusText,L"Index ready. Filesystem changes are monitored in the background.");
+        else SetWindowTextW(hStatusText,L"Index ready; filesystem monitoring is unavailable. Rescan to refresh.");
     }
-    catch (const std::exception& e)
-    {
-        std::string error = "Exception: ";
-        error += e.what();
-        MessageBoxA(hWnd, error.c_str(), "Error", MB_OK | MB_ICONERROR);
-    }
-    catch (...)
-    {
-        MessageBoxW(hWnd, L"Unknown exception", L"Error", MB_OK | MB_ICONERROR);
-    }
-    
-    // Re-enable drive buttons on error path too
-    for (auto& db : driveButtons)
-    {
-        EnableWindow(db.hButton, TRUE);
-    }
+    else if (result && result->memoryFailure) ReportIndexMemoryFailure();
+    else SetWindowTextW(hStatusText,result && result->cancelled ?
+        L"Index operation cancelled. The previous saved cache is unchanged." :
+        (result ? result->error.c_str() : L"Index operation did not complete."));
+    if (closeAfterIndexBuild) { closeAfterIndexBuild=false; PostMessageW(window,WM_CLOSE,0,0); }
 }
 
 void CreateDriveButtons(HWND hWnd)
@@ -5147,6 +5306,17 @@ BOOL InitInstance(HINSTANCE hInstance, int nCmdShow)
 
 LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 {
+    if (indexBuildInProgress)
+    {
+        if (message==WM_CLOSE || (message==WM_COMMAND && LOWORD(wParam)==IDM_EXIT))
+        {
+            indexBuildCancelled=true; closeAfterIndexBuild=true;
+            SetWindowTextW(hStatusText,L"Cancelling index work before closing...");
+            return 0;
+        }
+        if (message==WM_COMMAND || message==WM_TIMER || message==WM_LOAD_CACHED_INDEX ||
+            message==WM_USN_UPDATED || message==WM_USN_INVALIDATED) return 0;
+    }
     switch (message)
     {
     case WM_CREATE:
@@ -5228,7 +5398,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 
             hListView = CreateWindowExW(
                 0, WC_LISTVIEW, L"",
-                WS_CHILD | WS_BORDER | WS_CLIPSIBLINGS | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
+                WS_CHILD | WS_BORDER | WS_CLIPSIBLINGS | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS | LVS_OWNERDATA,
                 0, 110, 0, 0, hWnd, (HMENU)IDC_LISTVIEW, hInst, NULL);
 
             if (hListView)
@@ -5393,6 +5563,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
             }
             else
             {
+                StartFilenameWorker(hWnd);
                 warpWorker = std::make_unique<WarpContext::Worker>([hWnd](WarpContext::Result result) {
                     auto payload = std::make_unique<WarpContext::Result>(std::move(result));
                     if (PostMessage(hWnd, WM_WARP_RESULT, 0, (LPARAM)payload.get())) payload.release();
@@ -5507,8 +5678,29 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
     case WM_NOTIFY:
         {
             NMHDR* pnmh = (NMHDR*)lParam;
+            if (pnmh->idFrom == IDC_LISTVIEW && pnmh->code == LVN_GETDISPINFOW)
+            {
+                auto* info = (NMLVDISPINFOW*)lParam;
+                const int row = info->item.iItem;
+                if (row>=0 && row<(int)searchResults.size())
+                {
+                    if ((info->item.mask & LVIF_TEXT) && info->item.pszText && info->item.cchTextMax>0)
+                    {
+#ifdef FINDMYFILE_CONTEXT_DEMO_ONLY
+                        ++demoTextCallbacks;
+#endif
+                        const auto text = SearchCellText(searchResults[row],info->item.iSubItem);
+                        wcsncpy_s(info->item.pszText,info->item.cchTextMax,text.c_str(),_TRUNCATE);
+                    }
+                    if (info->item.mask & LVIF_IMAGE)
+                        info->item.iImage = GetFileIconIndex(searchResults[row].fileName,searchResults[row].isDirectory);
+                    if (info->item.mask & LVIF_PARAM) info->item.lParam = row;
+                }
+                return 0;
+            }
             if (pnmh->idFrom == 1001 && pnmh->code == TVN_ITEMEXPANDING)
             {
+                if (indexBuildInProgress) return 0;
                 NMTREEVIEW* pnmtv = (NMTREEVIEW*)lParam;
                 if (pnmtv->action == TVE_EXPAND)
                 {
@@ -5950,9 +6142,11 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
             // As-you-type: restart debounce timer on edit change
             if (HIWORD(wParam) == EN_CHANGE && (HWND)lParam == hSearchEdit)
             {
-                ResetWarpContext();
+                CancelFilenameSearch();
+                ResetWarpContext(false);
                 currentSearchKeyword.clear();
-                SetWindowTextW(hWarpStatus, L"Search changed; previous context discarded");
+                SetWindowTextW(hWarpStatus, L"Query changed; showing previous results until the new search completes.");
+                SetWindowTextW(hStatusText,L"Waiting for typing to pause...");
                 if (bTreeRenderedOnce && !fileMap.empty())
                 {
                     KillTimer(hWnd, IDT_SEARCH_DEBOUNCE);
@@ -6060,7 +6254,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
                 DialogBox(hInst, MAKEINTRESOURCE(IDD_ABOUTBOX), hWnd, About);
                 break;
             case IDM_EXIT:
-                DestroyWindow(hWnd);
+                SendMessageW(hWnd,WM_CLOSE,0,0);
                 break;
             default:
                 return DefWindowProc(hWnd, message, wParam, lParam);
@@ -6068,6 +6262,12 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
         }
         break;
     case WM_TIMER:
+        if (wParam==IDT_INDEX_UPDATES)
+        {
+            KillTimer(hWnd,IDT_INDEX_UPDATES);
+            SendMessageW(hWnd,WM_USN_UPDATED,0,0);
+            break;
+        }
         if (wParam == IDT_WARP_REFRESH && !contextDemo)
         {
             if (warpContextResult.available && warpContextResult.expiresMs <= WarpContext::NowMs())
@@ -6093,7 +6293,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 #ifdef FINDMYFILE_CONTEXT_DEMO_ONLY
             demoProbe = !demoSmokeReport.empty();
 #endif
-            if (!result || result->generation != warpGeneration || (contextDemo && !demoProbe)) break;
+            if (!result || indexBuildInProgress || result->generation != warpGeneration || (contextDemo && !demoProbe)) break;
             if (result->available && result->expiresMs <= WarpContext::NowMs())
             {
                 *result = {};
@@ -6113,7 +6313,27 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
         }
         break;
     case WM_USN_UPDATED:
-        ProcessPendingUsnChanges();
+        {
+            std::unique_lock<std::mutex> lock(indexDataMutex,std::try_to_lock);
+            if (lock.owns_lock()) ProcessPendingUsnChanges();
+            else SetTimer(hWnd,IDT_INDEX_UPDATES,50,nullptr);
+        }
+        break;
+    case WM_FILENAME_RESULT:
+        FinishFilenameSearch(hWnd,lParam);
+        break;
+    case WM_INDEX_PROGRESS:
+        {
+            std::wstring text; int percent=0;
+            {
+                std::lock_guard<std::mutex> lock(indexProgressMutex);
+                text=indexProgressText; percent=indexProgressPercent; indexProgressPosted=false;
+            }
+            if (indexBuildInProgress) UpdateProgress(percent,text);
+        }
+        break;
+    case WM_INDEX_COMPLETE:
+        FinishIndexBuild(hWnd,lParam);
         break;
     case WM_USN_INVALIDATED:
         if (wParam == ERROR_NOT_ENOUGH_MEMORY)
@@ -6123,7 +6343,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
             ResetWarpContext();
             baselineResults.clear();
             ReadDriveAndBuildTree(hWnd, currentDriveLetter);
-            SetWindowTextW(hStatusText, L"Filesystem journal changed; index refreshed. Search again.");
+            SetWindowTextW(hStatusText,L"Filesystem journal changed; rebuilding the index in the background...");
         }
         break;
     case WM_LOAD_CACHED_INDEX:
@@ -6134,20 +6354,29 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 #ifdef FINDMYFILE_CONTEXT_DEMO_ONLY
                 if (!demoSmokeReport.empty())
                 {
+                    RedrawWindow(hListView,nullptr,nullptr,RDW_INVALIDATE|RDW_UPDATENOW);
+                    const bool rendered = demoTextCallbacks>0;
+                    auto cell = [&](int column,wchar_t* text,int size) {
+                        NMLVDISPINFOW info{};
+                        info.hdr.hwndFrom=hListView; info.hdr.idFrom=IDC_LISTVIEW; info.hdr.code=LVN_GETDISPINFOW;
+                        info.item.mask=LVIF_TEXT; info.item.iItem=0; info.item.iSubItem=column;
+                        info.item.pszText=text; info.item.cchTextMax=size;
+                        SendMessageW(hWnd,WM_NOTIFY,IDC_LISTVIEW,(LPARAM)&info);
+                    };
                     SendMessage(hWarpContext, BM_SETCHECK, BST_UNCHECKED, 0);
                     SendMessage(hWnd, WM_COMMAND, MAKEWPARAM(IDC_WARP_CONTEXT, BN_CLICKED), (LPARAM)hWarpContext);
                     wchar_t before[1024] = {}, after[1024] = {}, delta[32] = {};
-                    ListView_GetItemText(hListView, 0, 2, before, (int)std::size(before));
+                    cell(2,before,(int)std::size(before));
                     const int count = ListView_GetItemCount(hListView);
                     SendMessage(hWarpContext, BM_SETCHECK, BST_CHECKED, 0);
                     SendMessage(hWnd, WM_COMMAND, MAKEWPARAM(IDC_WARP_CONTEXT, BN_CLICKED), (LPARAM)hWarpContext);
-                    ListView_GetItemText(hListView, 0, 2, after, (int)std::size(after));
-                    ListView_GetItemText(hListView, 0, 5, delta, (int)std::size(delta));
+                    cell(2,after,(int)std::size(after));
+                    cell(5,delta,(int)std::size(delta));
                     ListView_SetItemState(hListView, 0, LVIS_SELECTED, LVIS_SELECTED);
                     UpdatePropertiesPanel(0);
                     wchar_t detail[4096] = {};
                     GetWindowTextW(hPropertiesPanel, detail, (int)std::size(detail));
-                    bool passed = count > 0 && count == ListView_GetItemCount(hListView) &&
+                    bool passed = rendered && count > 0 && count == ListView_GetItemCount(hListView) &&
                         wcscmp(before, after) != 0 && delta[0] == L'+' && wcstod(delta, nullptr) <= 8 &&
                         wcsstr(detail, L"SYNTHETIC REPLAY") && !warpWorker;
                     auto zero = new WarpContext::Result(warpDemo.result);
@@ -6160,14 +6389,14 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
                     }
                     SendMessage(hWnd, WM_WARP_RESULT, 0, (LPARAM)zero);
                     wchar_t assessedZero[32] = {};
-                    ListView_GetItemText(hListView, 0, 5, assessedZero, (int)std::size(assessedZero));
+                    cell(5,assessedZero,(int)std::size(assessedZero));
                     const bool zeroPassed = wcscmp(assessedZero, L"0.0") == 0;
                     auto expired = new WarpContext::Result(warpDemo.result);
                     expired->generation = warpGeneration;
                     expired->expiresMs = WarpContext::NowMs() - 1;
                     SendMessage(hWnd, WM_WARP_RESULT, 0, (LPARAM)expired);
                     wchar_t fallback[1024] = {};
-                    ListView_GetItemText(hListView, 0, 2, fallback, (int)std::size(fallback));
+                    cell(2,fallback,(int)std::size(fallback));
                     const bool expiryPassed = wcscmp(before, fallback) == 0 &&
                         warpContextResult.status == "context_expired" &&
                         std::all_of(searchResults.begin(), searchResults.end(),
@@ -6176,6 +6405,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
                     std::ofstream report(demoSmokeReport.c_str(), std::ios::binary);
                     report << (passed ? "PASS" : "FAIL") << "\nBaseline: " << WideToUtf8(before) <<
                         "\nContext: " << WideToUtf8(after) << "\nDelta: " << WideToUtf8(delta) <<
+                        "\nVirtual control rendering: " << (rendered ? "PASS" : "FAIL") <<
                         "\nAssessed zero display: " << (zeroPassed ? "PASS" : "FAIL") <<
                         "\nExpired callback fallback: " << (expiryPassed ? "PASS" : "FAIL") << "\n";
                     demoExitCode = passed && report.good() ? 0 : 1;
@@ -6184,58 +6414,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 #endif
                 break;
             }
-            // Check if a saved index exists and load it.
-            // This runs after the window is visible so the UI isn't blocked
-            // during window creation.
-            std::wstring dbPath = GetIndexDbPath();
-            if (!dbPath.empty() && GetFileAttributesW(dbPath.c_str()) != INVALID_FILE_ATTRIBUTES)
-            {
-                if (hStatusText)
-                    SetWindowTextW(hStatusText, L"Loading cached index...");
-                // Pump one paint so the status text is visible
-                MSG paintMsg;
-                while (PeekMessage(&paintMsg, hWnd, WM_PAINT, WM_PAINT, PM_REMOVE))
-                    DispatchMessage(&paintMsg);
-
-                if (LoadIndexFromFile())
-                {
-                    BuildTreeView(currentDriveLetter);
-                    bTreeRenderedOnce = true;
-                    if (hSearchEdit) EnableWindow(hSearchEdit, TRUE);
-                    if (hFindButton) EnableWindow(hFindButton, TRUE);
-                    if (hWinSearchButton) EnableWindow(hWinSearchButton, TRUE);
-
-                    int nFiles = 0, nDirs = 0;
-                    for (auto& kv : fileMap)
-                    {
-                        if (kv.second.isDirectory) nDirs++;
-                        else nFiles++;
-                    }
-                    if (hSummaryText)
-                    {
-                        std::wstring summary = L"Loaded cached index for " +
-                            currentDriveLetter + L":\\  |  Folders: " +
-                            std::to_wstring(nDirs) + L"  |  Files: " +
-                            std::to_wstring(nFiles);
-                        SetWindowTextW(hSummaryText, summary.c_str());
-                        ShowWindow(hSummaryText, SW_SHOW);
-                    }
-                    if (StartUsnMonitor(currentDriveLetter))
-                    {
-                        if (hStatusText)
-                            SetWindowTextW(hStatusText, L"Index loaded; catching up filesystem changes and monitoring live updates.");
-                    }
-                    else if (!indexMemoryFailed)
-                    {
-                        const auto drive = currentDriveLetter;
-                        if (hStatusText) SetWindowTextW(hStatusText, L"Cached index needs a filesystem refresh...");
-                        ReadDriveAndBuildTree(hWnd, drive);
-                    }
-
-                }
-                else if (hStatusText && !indexMemoryFailed)
-                    SetWindowTextW(hStatusText, L"Select a drive to scan...");
-            }
+            StartIndexBuild(hWnd,L"",true);
         }
         break;
     case WM_MOUSELEAVE:
@@ -6248,12 +6427,16 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
         }
         break;
     case WM_DESTROY:
+        StopFilenameWorker();
+        KillTimer(hWnd,IDT_INDEX_UPDATES);
         KillTimer(hWnd, IDT_WARP_REFRESH);
         if (warpWorker) { warpWorker->Stop(); warpWorker.reset(); }
         {
             MSG queued;
             while (PeekMessage(&queued, hWnd, WM_WARP_RESULT, WM_WARP_RESULT, PM_REMOVE))
                 delete (WarpContext::Result*)queued.lParam;
+            while (PeekMessage(&queued,hWnd,WM_FILENAME_RESULT,WM_FILENAME_RESULT,PM_REMOVE))
+                delete (FilenameResult*)queued.lParam;
         }
         StopUsnMonitor();
         if (!contextDemo) SaveIndexToFile();

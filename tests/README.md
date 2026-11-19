@@ -53,9 +53,34 @@ including deferred lookup rebuild and bounded UI work during replay,
 not merely cross-compiling the x86 executable. They use synthetic metadata, not
 the user's index.
 
+Responsiveness regressions cover progress without nested command dispatch,
+entry-count thresholds crossed by a batch, cancellation before an index worker
+acquires its data, latest-query completion while the index is busy, typing over
+10,000 virtual results without repopulating them, and short same-window WARP
+lease reuse with invalidation.
+
+For a real-machine measurement, close other FindMyFile windows and run from an
+**elevated PowerShell** after building the chosen architecture:
+
+```powershell
+.\tests\Measure-Responsiveness.ps1 -Platform ARM64 -FullScan
+.\tests\Measure-Responsiveness.ps1 -Platform Win32 -FullScan
+```
+
+This launches the regular app against its existing cache, optionally requests a
+C: rescan, samples UI responsiveness during indexing, types `eval` refinements,
+waits for baseline and WARP completion, and closes only its own instance.
+It writes aggregate timings/status to `build\responsiveness-<platform>.json`,
+not file names or activity records. It does not reset the cache; normal app
+shutdown may update it. This opt-in test is not a controlled performance benchmark.
+
 Explicit local diagnostics (not run in CI):
 
 ```powershell
+# Actual cached index + production handlers/search worker; hidden owned controls, no volume access or cache writes.
+.\build\tests\ARM64\SearchPipelineTests.exe --typing-profile
+# Full-drive enumeration/index timing (elevated; does not save the cache).
+.\build\tests\ARM64\SearchPipelineTests.exe --enumeration-profile C
 # Reads the existing cache, replays synthetic creates/deletes in memory, never saves it.
 .\build\tests\Win32\SearchPipelineTests.exe --startup-replay
 # Reads the existing index and contacts installed WARP; does not open the target.
@@ -131,7 +156,8 @@ Get-Content .\build\ui-smoke.txt
 ```
 
 This opens the **real application window**, toggles its actual checkbox through
-the normal handler, reads displayed list-view paths/deltas and the properties
+the normal handler, verifies native virtual-list paint callbacks, reads paths/deltas
+through the same display-info contract, and checks the properties
 panel, writes a report and closes. It checks that the top result changes, the
 candidate count is unchanged, the delta stays bounded and no live worker exists.
 It also delivers an expired callback through the real UI completion handler

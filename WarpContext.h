@@ -40,6 +40,7 @@ namespace WarpContext
         uint64_t generation = 0;
         bool available = false, partial = false;
         int64_t expiresMs = 0;
+        uint64_t elapsedMs = 0;
         std::string reference, status = "unavailable";
         std::vector<Feature> features;
     };
