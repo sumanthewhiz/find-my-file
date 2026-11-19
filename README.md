@@ -383,7 +383,8 @@ receive a contextual score.
 - Walks the mapped region with pointer arithmetic — no per-field `ReadFile` calls
 - After loading `fileMap`, calls `BuildSearchIndex()` to rebuild the search indexes; paths are resolved lazily.
 - Resumes the journal from the saved cursor (not the current head), catches up
-  offline changes, and refreshes an active filename search when new entries arrive.
+  offline changes, and makes changed entries available to the next search.
+  Unrelated filesystem activity does not restart the displayed query or clear its scores.
 
 **Deferred startup loading:**
 - `WM_CREATE` posts a `WM_LOAD_CACHED_INDEX` message to itself and returns immediately, so the window appears instantly

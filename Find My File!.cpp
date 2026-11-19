@@ -6035,8 +6035,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
         }
         break;
     case WM_USN_UPDATED:
-        if (ProcessPendingUsnChanges() && !currentSearchKeyword.empty() && !bWindowsSearch && !contextDemo)
-            SetTimer(hWnd, IDT_SEARCH_DEBOUNCE, SEARCH_DEBOUNCE_MS, NULL);
+        ProcessPendingUsnChanges();
         break;
     case WM_USN_INVALIDATED:
         if (!contextDemo && !currentDriveLetter.empty())

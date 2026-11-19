@@ -119,6 +119,23 @@ namespace
         Check(size_t(guide-request.candidates.begin()) >= WarpContext::MaxCandidates, "fixture did not exercise a later batch");
     }
 
+    void LiveIndexUpdatesDoNotRestartTheDisplayedSearch()
+    {
+        SeedIndex(); QueueGuide(); ProcessPendingUsnChanges(); CheckGuideRequest();
+        HWND window = CreateWindowExW(0,L"STATIC",L"FindMyFile pipeline test",0,0,0,1,1,nullptr,nullptr,nullptr,nullptr);
+        Check(window != nullptr, "hidden test window unavailable");
+        UsnChange change{};
+        change.fileRef = 999; change.parentRef = 11; change.fileName = L"unrelated-new.txt";
+        change.reason = USN_REASON_FILE_CREATE; pendingUsnChanges.push_back(std::move(change));
+        WndProc(window,WM_USN_UPDATED,0,0);
+        Sleep(SEARCH_DEBOUNCE_MS+50);
+        MSG message{};
+        const bool restarted = PeekMessageW(&message,window,WM_TIMER,WM_TIMER,PM_REMOVE) != FALSE;
+        DestroyWindow(window);
+        Check(!restarted, "background filesystem activity restarted the displayed search");
+        Check(fileMap.count(999) == 1, "index update was discarded");
+    }
+
     void QueryCachedIndex(const std::wstring& query, const std::wstring& target, bool refresh)
     {
         Check(LoadIndexFromFile(), "existing cached index unavailable");
@@ -196,6 +213,8 @@ int wmain(int argc, wchar_t** argv)
         std::cout << "PASS CacheResumesOnlyFromAValidDurableCheckpoint\n";
         LaterMatchesAreNotSilentlyDroppedFromContextScoring();
         std::cout << "PASS LaterMatchesAreNotSilentlyDroppedFromContextScoring\n";
+        LiveIndexUpdatesDoNotRestartTheDisplayedSearch();
+        std::cout << "PASS LiveIndexUpdatesDoNotRestartTheDisplayedSearch\n";
         RoUninitialize();
         return 0;
     }
