@@ -61,6 +61,7 @@
 #define WM_OAUTH_COMPLETE   (WM_USER + 2)
 #define WM_LOAD_CACHED_INDEX (WM_USER + 3)
 #define WM_WARP_RESULT      (WM_USER + 4)
+#define WM_USN_INVALIDATED  (WM_USER + 5)
 #define IDC_WARP_CONTEXT    3005
 #define IDC_WARP_WINDOW     3006
 #define IDC_WARP_STATUS     3007
@@ -117,6 +118,7 @@ struct UsnChange {
 std::vector<UsnChange> pendingUsnChanges;
 USN lastUsnProcessed = 0;
 ULONGLONG usnJournalId = 0;
+std::atomic<bool> usnCheckpointValid{false};
 HWND hMainWnd = NULL;
 
 // Properties panel
@@ -335,9 +337,9 @@ void                TriggerSearch(HWND hWnd);
 int                 GetFileIconIndex(const std::wstring& fileName, bool isDirectory);
 void                AddFileToIndex(ULONGLONG fileRef, const std::wstring& lowerName);
 void                RemoveFileFromIndex(ULONGLONG fileRef, const std::wstring& lowerName);
-void                StartUsnMonitor(const std::wstring& drive);
+bool                StartUsnMonitor(const std::wstring& drive);
 void                StopUsnMonitor();
-void                ProcessPendingUsnChanges();
+bool                ProcessPendingUsnChanges();
 void                UpdatePropertiesPanel(int selectedIndex);
 void                RebuildSortedTokens();
 void                TriggerWindowsSearch(HWND hWnd);
@@ -361,8 +363,8 @@ static void ResetWarpContext(bool restoreOrder = true);
 static void RequestWarpContext(bool refresh = false);
 static void ShowContextDemo();
 static std::wstring GetIndexDbPath();
-static bool SaveIndexToFile();
-static bool LoadIndexFromFile();
+static bool SaveIndexToFile(const std::wstring& path = {});
+static bool LoadIndexFromFile(const std::wstring& path = {});
 
 // Update the tooltip text for the properties toggle button to reflect its current action.
 static void UpdateToggleTooltip()
@@ -996,7 +998,7 @@ void RebuildSortedTokens()
 }
 
 // Process pending USN changes (called on the UI thread via WM_USN_UPDATED).
-void ProcessPendingUsnChanges()
+bool ProcessPendingUsnChanges()
 {
     std::vector<UsnChange> changes;
     {
@@ -1005,7 +1007,7 @@ void ProcessPendingUsnChanges()
     }
 
     if (changes.empty())
-        return;
+        return false;
 
     bool indexDirty = false;
 
@@ -1083,6 +1085,13 @@ void ProcessPendingUsnChanges()
         RebuildSortedTokens();
         fullPathCache.clear();
     }
+    return indexDirty;
+}
+
+static bool JournalContainsCheckpoint(const USN_JOURNAL_DATA_V0& journal, ULONGLONG id, USN cursor)
+{
+    return id != 0 && id == journal.UsnJournalID && cursor >= journal.FirstUsn &&
+        cursor >= journal.LowestValidUsn && cursor <= journal.NextUsn;
 }
 
 // Background thread: poll USN journal for new changes.
@@ -1092,7 +1101,12 @@ static void UsnMonitorThreadFunc(std::wstring drive)
     HANDLE hVolume = CreateFileW(volumePath.c_str(), GENERIC_READ,
         FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
     if (hVolume == INVALID_HANDLE_VALUE)
+    {
+        usnCheckpointValid = false;
+        bUsnMonitorRunning = false;
+        if (hMainWnd) PostMessage(hMainWnd, WM_USN_INVALIDATED, 0, 0);
         return;
+    }
 
     const DWORD bufferSize = 64 * 1024;
     std::vector<BYTE> buffer(bufferSize);
@@ -1115,10 +1129,12 @@ static void UsnMonitorThreadFunc(std::wstring drive)
             buffer.data(), bufferSize,
             &bytesReturned, NULL);
 
-        if (!ok || bytesReturned <= sizeof(USN))
+        if (!ok || bytesReturned < sizeof(USN))
         {
-            Sleep(USN_POLL_MS);
-            continue;
+            usnCheckpointValid = false;
+            bUsnMonitorRunning = false;
+            if (hMainWnd) PostMessage(hMainWnd, WM_USN_INVALIDATED, 0, 0);
+            break;
         }
 
         USN nextUsn = *(USN*)buffer.data();
@@ -1165,13 +1181,13 @@ static void UsnMonitorThreadFunc(std::wstring drive)
         }
 
         lastUsnProcessed = nextUsn;
-        Sleep(USN_POLL_MS);
+        if (bytesReturned == sizeof(USN)) Sleep(USN_POLL_MS);
     }
 
     CloseHandle(hVolume);
 }
 
-void StartUsnMonitor(const std::wstring& drive)
+bool StartUsnMonitor(const std::wstring& drive)
 {
     StopUsnMonitor();
 
@@ -1182,17 +1198,17 @@ void StartUsnMonitor(const std::wstring& drive)
     {
         DWORD bytesReturned = 0;
         USN_JOURNAL_DATA_V0 journalData = {0};
-        if (DeviceIoControl(hVolume, FSCTL_QUERY_USN_JOURNAL, NULL, 0,
-            &journalData, sizeof(journalData), &bytesReturned, NULL))
-        {
-            lastUsnProcessed = journalData.NextUsn;
-            usnJournalId = journalData.UsnJournalID;
-        }
+        const bool valid = DeviceIoControl(hVolume, FSCTL_QUERY_USN_JOURNAL, NULL, 0,
+            &journalData, sizeof(journalData), &bytesReturned, NULL) && usnCheckpointValid &&
+            JournalContainsCheckpoint(journalData, usnJournalId, lastUsnProcessed);
         CloseHandle(hVolume);
+        if (!valid) { usnCheckpointValid = false; return false; }
     }
+    else { usnCheckpointValid = false; return false; }
 
     bUsnMonitorRunning.store(true);
     usnMonitorThread = std::thread(UsnMonitorThreadFunc, drive);
+    return true;
 }
 
 void StopUsnMonitor()
@@ -1200,8 +1216,7 @@ void StopUsnMonitor()
     bUsnMonitorRunning.store(false);
     if (usnMonitorThread.joinable())
         usnMonitorThread.join();
-    std::lock_guard<std::mutex> lock(usnMutex);
-    pendingUsnChanges.clear();
+    ProcessPendingUsnChanges();
 }
 
 static bool ExactCandidate(const SearchResult& item)
@@ -1253,6 +1268,26 @@ static void ResetWarpContext(bool restoreOrder)
     if (restoreOrder && hadFeatures) ApplyWarpContext(warpContextResult);
 }
 
+static WarpContext::Request BuildWarpRequest()
+{
+    WarpContext::Request request;
+    request.query = currentSearchKeyword;
+    const int windows[] = {0, 1800, 7200, 86400};
+    const int selection = (int)SendMessage(hWarpWindow, CB_GETCURSEL, 0, 0);
+    request.windowSeconds = windows[(selection >= 0 && selection < 4) ? selection : 0];
+    std::set<std::wstring> keys;
+    for (const auto& item : baselineResults)
+    {
+        if (item.isDirectory || !item.cloudSource.empty() || item.fullPath.empty() || item.baseScore < 20 ||
+            item.fullPath.find(L"://") != std::wstring::npos) continue;
+        const auto key = WarpContext::NormalizePath(item.fullPath);
+        if (!keys.insert(key).second) continue;
+        request.candidates.push_back({key, item.fileName, item.contentSnippet, double(item.baseScore), ExactCandidate(item)});
+        if (request.candidates.size() == WarpContext::MaxCandidates) break;
+    }
+    return request;
+}
+
 static void RequestWarpContext(bool refresh)
 {
     warpNextRefresh = GetTickCount64() + 5000;
@@ -1269,23 +1304,9 @@ static void RequestWarpContext(bool refresh)
         return;
     }
     if (!warpWorker || baselineResults.empty() || currentSearchKeyword.empty()) return;
-    WarpContext::Request request;
-    request.query = currentSearchKeyword;
-    const int windows[] = {0, 1800, 7200, 86400};
-    const int selection = (int)SendMessage(hWarpWindow, CB_GETCURSEL, 0, 0);
-    request.windowSeconds = windows[(selection >= 0 && selection < 4) ? selection : 0];
+    auto request = BuildWarpRequest();
     if (refresh && warpContextResult.available && warpContextResult.expiresMs > WarpContext::NowMs())
         request.reference = warpContextResult.reference;
-    std::set<std::wstring> keys;
-    for (const auto& item : baselineResults)
-    {
-        if (item.isDirectory || !item.cloudSource.empty() || item.fullPath.empty() || item.baseScore < 20 ||
-            item.fullPath.find(L"://") != std::wstring::npos) continue;
-        const auto key = WarpContext::NormalizePath(item.fullPath);
-        if (!keys.insert(key).second) continue;
-        request.candidates.push_back({key, item.fileName, item.contentSnippet, double(item.baseScore), ExactCandidate(item)});
-        if (request.candidates.size() == WarpContext::MaxCandidates) break;
-    }
     if (request.candidates.empty())
     {
         SetWindowTextW(hWarpStatus, L"No eligible local candidates; baseline results");
@@ -1333,11 +1354,13 @@ static void ShowContextDemo()
 // operations.
 // ---------------------------------------------------------------------------
 //
-// Binary format v2 (all values little-endian, native x64):
+// Binary format v3 (all values little-endian):
 //   [8]  magic "FMF_IDX\0"
-//   [4]  format version (2)
+//   [4]  format version (3)
 //   [4]  drive letter length (wchar_t count)
 //   [n]  drive letter (wchar_t, no NUL)
+//   [8]  journal ID (0 means the cache needs a rescan)
+//   [8]  next unread USN after all applied changes
 //   [4]  file entry count
 //   per entry (fixed 25 bytes + variable strings):
 //     [8]  fileReference
@@ -1352,7 +1375,7 @@ static void ShowContextDemo()
 // zero-copy, zero-syscall-per-record reads.
 
 static const char INDEX_MAGIC[8] = {'F','M','F','_','I','D','X','\0'};
-static const DWORD INDEX_VERSION = 2;
+static const DWORD INDEX_VERSION = 3;
 
 static std::wstring GetIndexDbPath()
 {
@@ -1417,12 +1440,12 @@ struct BufferedWriter {
     }
 };
 
-static bool SaveIndexToFile()
+static bool SaveIndexToFile(const std::wstring& suppliedPath)
 {
-    if (fileMap.empty() || currentDriveLetter.empty())
+    if (fileMap.empty() || currentDriveLetter.empty() || usnMonitorThread.joinable())
         return false;
 
-    std::wstring path = GetIndexDbPath();
+    std::wstring path = suppliedPath.empty() ? GetIndexDbPath() : suppliedPath;
     if (path.empty()) return false;
 
     std::wstring tmpPath = path + L".tmp";
@@ -1442,6 +1465,8 @@ static bool SaveIndexToFile()
     w.PutU32((DWORD)currentDriveLetter.size());
     if (!currentDriveLetter.empty())
         w.Append(currentDriveLetter.data(), currentDriveLetter.size() * sizeof(wchar_t));
+    w.PutU64(usnCheckpointValid ? usnJournalId : 0);
+    w.PutU64(usnCheckpointValid ? (ULONGLONG)lastUsnProcessed : 0);
 
     // fileMap entries
     w.PutU32((DWORD)fileMap.size());
@@ -1466,13 +1491,13 @@ static bool SaveIndexToFile()
         return false;
     }
 
-    DeleteFileW(path.c_str());
-    return MoveFileW(tmpPath.c_str(), path.c_str()) != 0;
+    return MoveFileExW(tmpPath.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
 }
 
-static bool LoadIndexFromFile()
+static bool LoadIndexFromFile(const std::wstring& suppliedPath)
 {
-    std::wstring path = GetIndexDbPath();
+    usnCheckpointValid = false;
+    std::wstring path = suppliedPath.empty() ? GetIndexDbPath() : suppliedPath;
     if (path.empty()) return false;
 
     // Memory-map the entire file for zero-copy, zero-syscall-per-record reads
@@ -1522,7 +1547,7 @@ static bool LoadIndexFromFile()
     DWORD version = 0;
     if (ok && canRead(4)) { memcpy(&version, ptr, 4); ptr += 4; }
     else ok = false;
-    if (ok && version != INDEX_VERSION) ok = false;
+    if (ok && version != 2 && version != INDEX_VERSION) ok = false;
 
     // Drive letter
     std::wstring drive;
@@ -1537,6 +1562,18 @@ static bool LoadIndexFromFile()
             else ok = false;
         }
         else if (ok && driveLen == 0) ok = false;
+    }
+
+    ULONGLONG savedJournal = 0;
+    USN savedCursor = 0;
+    if (ok && version >= 3)
+    {
+        if (!canRead(16)) ok = false;
+        else
+        {
+            memcpy(&savedJournal, ptr, 8); ptr += 8;
+            memcpy(&savedCursor, ptr, 8); ptr += 8;
+        }
     }
 
     // fileMap
@@ -1617,6 +1654,9 @@ static bool LoadIndexFromFile()
     }
 
     currentDriveLetter = drive;
+    usnJournalId = savedJournal;
+    lastUsnProcessed = savedCursor;
+    usnCheckpointValid = version >= 3 && savedJournal != 0 && savedCursor >= 0;
 
     // Rebuild search indexes from fileMap (1-3 seconds in-memory, far faster
     // than deserialising them from disk with millions of I/O calls)
@@ -4362,6 +4402,10 @@ bool ReadDriveMFT(HWND hWnd, const std::wstring& drive, int& totalFiles, int& to
             }
         }
 
+        usnJournalId = journalData.UsnJournalID;
+        lastUsnProcessed = journalData.NextUsn;
+        usnCheckpointValid = false;
+
         // Buffer for enumeration results
         const DWORD bufferSize = 128 * 1024; // 128KB buffer for better throughput
         std::vector<BYTE> buffer(bufferSize);
@@ -4381,6 +4425,7 @@ bool ReadDriveMFT(HWND hWnd, const std::wstring& drive, int& totalFiles, int& to
         
         UpdateProgress(15, L"Enumerating drive " + drive + L":...");
         
+        bool enumerationComplete = false;
         while (true)
         {
             BOOL result = DeviceIoControl(hVolume, FSCTL_ENUM_USN_DATA,
@@ -4392,7 +4437,10 @@ bool ReadDriveMFT(HWND hWnd, const std::wstring& drive, int& totalFiles, int& to
             {
                 DWORD err = GetLastError();
                 if (err == ERROR_HANDLE_EOF)
+                {
+                    enumerationComplete = true;
                     break;
+                }
                 // Any other error - stop
                 break;
             }
@@ -4469,6 +4517,8 @@ bool ReadDriveMFT(HWND hWnd, const std::wstring& drive, int& totalFiles, int& to
         }
         
         CloseHandle(hVolume);
+        if (!enumerationComplete) return false;
+        usnCheckpointValid = true;
         
         totalFiles = fileCount;
         totalDirs = dirCount;
@@ -5985,7 +6035,17 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
         }
         break;
     case WM_USN_UPDATED:
-        ProcessPendingUsnChanges();
+        if (ProcessPendingUsnChanges() && !currentSearchKeyword.empty() && !bWindowsSearch && !contextDemo)
+            SetTimer(hWnd, IDT_SEARCH_DEBOUNCE, SEARCH_DEBOUNCE_MS, NULL);
+        break;
+    case WM_USN_INVALIDATED:
+        if (!contextDemo && !currentDriveLetter.empty())
+        {
+            ResetWarpContext();
+            baselineResults.clear();
+            ReadDriveAndBuildTree(hWnd, currentDriveLetter);
+            SetWindowTextW(hStatusText, L"Filesystem journal changed; index refreshed. Search again.");
+        }
         break;
     case WM_LOAD_CACHED_INDEX:
         {
@@ -6081,8 +6141,17 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
                         SetWindowTextW(hSummaryText, summary.c_str());
                         ShowWindow(hSummaryText, SW_SHOW);
                     }
-                    if (hStatusText)
-                        SetWindowTextW(hStatusText, L"Index loaded from disk. Click a drive button to rescan.");
+                    if (StartUsnMonitor(currentDriveLetter))
+                    {
+                        if (hStatusText)
+                            SetWindowTextW(hStatusText, L"Index loaded; catching up filesystem changes and monitoring live updates.");
+                    }
+                    else
+                    {
+                        const auto drive = currentDriveLetter;
+                        if (hStatusText) SetWindowTextW(hStatusText, L"Cached index needs a filesystem refresh...");
+                        ReadDriveAndBuildTree(hWnd, drive);
+                    }
 
                 }
                 else
@@ -6110,9 +6179,9 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
             while (PeekMessage(&queued, hWnd, WM_WARP_RESULT, WM_WARP_RESULT, PM_REMOVE))
                 delete (WarpContext::Result*)queued.lParam;
         }
+        StopUsnMonitor();
         if (!contextDemo) SaveIndexToFile();
         CancelOAuthLogin();
-        StopUsnMonitor();
         if (hPropToggleTooltip) { DestroyWindow(hPropToggleTooltip); hPropToggleTooltip = NULL; }
         if (hToggleFont) { DeleteObject(hToggleFont); hToggleFont = NULL; }
         if (hHeaderFont) { DeleteObject(hHeaderFont); hHeaderFont = NULL; }

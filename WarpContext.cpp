@@ -176,6 +176,7 @@ namespace WarpContext
             if (value == "observed_in_requested_interval") return L"Observed in the selected time window";
             if (value == "same_directory_or_repository_association") return L"Same directory/project association (not proof of use)";
             if (value == "download_origin_observed_not_reading") return L"Download origin observed; reading is not inferred";
+            if (value == "recent_file_observation") return L"Direct file activity in the current 15-minute window (not a primary-task claim)";
             return L"Supported WARP association";
         }
         std::wstring FallbackReason(const std::string& value)

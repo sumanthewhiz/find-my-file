@@ -12,7 +12,7 @@ are required.
 .\tests\run_context_quality.ps1 -Platform x64 -NoBuild
 ```
 
-The wrapper builds `WarpContextTests.exe` unless `-NoBuild` is supplied, runs
+The wrapper builds `WarpContextTests.exe` and `SearchPipelineTests.exe` unless `-NoBuild` is supplied, runs
 independent metric unit tests, then invokes the production context client and
 shared ranker. Results go to `build\context-eval-<platform>`:
 
@@ -33,6 +33,27 @@ are read only by the Python scorer, not by the native predictor.
 
 Fallback diagnostics also distinguish an assessed zero from an unavailable
 assessment, and preserve the original order in each no-boost state.
+
+`SearchPipelineTests` compiles the application's actual filename retrieval,
+index/cache, journal-application and request-builder code. Default tests use
+only synthetic metadata and temporary caches: an `eval` prefix search must
+retrieve a newly created Markdown guide and send its actual filename and match
+tier. They also verify v3 checkpoint persistence, queued-change draining, legacy
+v2 invalidation, and rotated/expired journal rejection.
+
+Explicit local diagnostics (not run in CI):
+
+```powershell
+# Reads the existing index and contacts installed WARP; does not open the target.
+.\build\tests\x64\SearchPipelineTests.exe --cached-query eval 'C:\Work\Search Evals Guide.md'
+# Bypasses retrieval to isolate the production serializer/pipe/scorer, window in seconds.
+.\build\tests\x64\WarpContextTests.exe --live-probe eval 'C:\Work\Search Evals Guide.md' 7200
+```
+
+These report the requested target's presence, match tier and score, plus aggregate
+fallback counts; they do not dump unrelated file names or activity. The explicit
+`--refresh-cached-query` variant requires elevation and rebuilds/saves the local
+index from the MFT before the same diagnostic. It is not a default test.
 
 ## What the corpus establishes
 

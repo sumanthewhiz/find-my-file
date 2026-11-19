@@ -217,7 +217,7 @@ Local VS 18 builds can add `/p:PlatformToolset=v145`.
 | `baselineResults` / `warpContextResult` | Baseline candidates and short-lived contextual features. Kept in memory only, independent of the persistent index. |
 | `WarpContext::Worker` | One cancellable worker, a single latest pending request, generation-bound UI completion, and bounded local pipe calls. |
 | `goopCache` (`unordered_map<ULONGLONG, int8_t>`) | Per-search cache mapping directory refs to goop status (1 = goop, 0 = clean). Avoids re-walking the parent chain for directories already classified during the current search. Cleared at the start of each search. |
-| `index.db` (binary file) | Persistent on-disk cache at `%APPDATA%\FindMyFile\index.db`. Stores `fileMap` entries and timestamps in a compact v2 binary format. Loaded via memory-mapped I/O on startup; saved via buffered writes on exit. |
+| `index.db` (binary file) | Persistent on-disk cache at `%APPDATA%\FindMyFile\index.db`. Stores file metadata, timestamps and a journal checkpoint in v3 format. Loaded via memory-mapped I/O; offline changes are replayed or the index is refreshed. |
 
 ### MFT Reading Pipeline
 
@@ -321,6 +321,9 @@ The shared ranker is copied byte-for-byte from WARP; the evaluator checks its
 hash against the recorded source. A same-directory association is a hypothesis,
 not proof that an unseen file was used. Current task features, not a blanket
 popularity score, determine the bounded delta.
+Direct activity on a matching file within the current 15-minute window can earn a smaller
+**+1.6** even after switching to another task. The explanation distinguishes
+that from a primary-task match. A no-boost status is not a transport error.
 
 ### Reproduce the synthetic evaluation
 
@@ -349,24 +352,34 @@ FindMyFile does not call a model.
 
 The app saves the in-memory file index to disk on exit so subsequent launches can skip the MFT scan.
 
-**Binary format v2** (`%APPDATA%\FindMyFile\index.db`):
+**Binary format v3** (`%APPDATA%\FindMyFile\index.db`):
 
 | Section | Contents |
 |---------|----------|
-| Header | 8-byte magic (`FMF_IDX\0`), 4-byte format version (2) |
+| Header | 8-byte magic (`FMF_IDX\0`), 4-byte format version (3) |
 | Drive | 4-byte length + wchar_t drive letter |
+| Journal checkpoint | 8-byte USN journal ID + 8-byte next unread USN; ID 0 requires a rescan |
 | File entries | 4-byte count, then per entry: 8-byte fileReference, 8-byte parentReference, 1-byte isDirectory, 8-byte timestamp, 2-byte fileName length + wchar_t fileName |
 
-Only `fileMap` and `timestampCache` are persisted. The inverted, stemmed, and trigram search indexes are **not** serialized — they are rebuilt from `fileMap` via `BuildSearchIndex()` on load, which takes 1–3 seconds in-memory. This is far faster than the previous approach of serializing and deserializing the indexes with millions of individual I/O operations.
+File metadata, timestamps and the applied journal checkpoint are persisted.
+The inverted, stemmed, and trigram indexes are rebuilt in memory on load.
+The journal must still contain that checkpoint and have the same ID; otherwise
+the app automatically refreshes the MFT. Old v2 caches are readable but trigger
+a one-time refresh because they cannot prove which offline changes were missed.
+An observed WARP file must still be retrieved by the search index before it can
+receive a contextual score.
 
 **Save path** (`SaveIndexToFile`, called from `WM_DESTROY`):
 - Uses a `BufferedWriter` with a 4 MB buffer that coalesces millions of tiny field writes into a small number of large `WriteFile` calls
 - Writes to a `.tmp` file first, then does an atomic rename for crash safety
+- Stops and joins the monitor, applies pending changes, then saves the matching cursor and metadata
 
 **Load path** (`LoadIndexFromFile`, called from `WM_LOAD_CACHED_INDEX`):
 - Uses memory-mapped I/O (`CreateFileMapping` + `MapViewOfFile`) for zero-copy, zero-syscall-per-record reads
 - Walks the mapped region with pointer arithmetic — no per-field `ReadFile` calls
 - After loading `fileMap`, calls `BuildSearchIndex()` to rebuild the search indexes; paths are resolved lazily.
+- Resumes the journal from the saved cursor (not the current head), catches up
+  offline changes, and refreshes an active filename search when new entries arrive.
 
 **Deferred startup loading:**
 - `WM_CREATE` posts a `WM_LOAD_CACHED_INDEX` message to itself and returns immediately, so the window appears instantly

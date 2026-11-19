@@ -23,7 +23,11 @@ try {
         if ($Toolset) { $flags += "/p:PlatformToolset=$Toolset" }
         & $msbuild 'tests\WarpContextTests.vcxproj' @flags
         if ($LASTEXITCODE) { throw "Native build failed ($LASTEXITCODE)." }
+        & $msbuild 'tests\SearchPipelineTests.vcxproj' @flags
+        if ($LASTEXITCODE) { throw "Search pipeline build failed ($LASTEXITCODE)." }
     }
+    & "build\tests\$Platform\SearchPipelineTests.exe"
+    if ($LASTEXITCODE) { throw 'Real search pipeline regressions failed.' }
     & python -m unittest discover -s tests -p 'test_*.py'
     if ($LASTEXITCODE) { throw 'Metric unit tests failed.' }
     & python 'tests\evaluate_context.py' --native-bin "build\tests\$Platform\WarpContextTests.exe" --output-dir "build\context-eval-$Platform"

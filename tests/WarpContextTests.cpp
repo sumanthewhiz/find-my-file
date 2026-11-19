@@ -330,6 +330,33 @@ namespace
         std::cout << "Replayed " << count << " real WARP feature packets through the consumer\n";
         return 0;
     }
+
+    int LiveProbe(const std::wstring& query, const std::wstring& path, int seconds)
+    {
+        Request request; request.query = query; request.windowSeconds = seconds;
+        request.candidates.push_back({path, std::filesystem::path(path).filename().wstring(), L"", 75, false});
+        auto transport = LocalPipeTransport();
+        const auto started = GetTickCount64();
+        const auto result = Evaluate(request, [&](const std::string& text, const Cancelled& cancelled) {
+            const auto sent = JsonObject::Parse(winrt::to_hstring(text));
+            const auto operation = winrt::to_string(sent.GetNamedString(L"op"));
+            std::cout << "operation=" << operation;
+            if (operation == "ScoreCandidates")
+            {
+                const auto row = sent.GetNamedArray(L"candidates").GetObjectAt(0);
+                std::cout << " query_matches_input=" << (sent.GetNamedString(L"query") == query)
+                    << " path_matches_input=" << (NormalizePath(std::wstring(row.GetNamedString(L"key"))) == NormalizePath(path))
+                    << " base_score=" << row.GetNamedNumber(L"base_score");
+            }
+            std::cout << '\n';
+            return transport(text, cancelled);
+        }, [] { return false; });
+        std::cout << "available=" << result.available << " status=" << result.status
+            << " elapsed_ms=" << GetTickCount64()-started << '\n';
+        for (const auto& feature : result.features)
+            std::cout << "found=" << feature.found << " fallback=" << feature.fallback << " delta=" << feature.delta << '\n';
+        return result.available ? 0 : 1;
+    }
 }
 
 int wmain(int argc, wchar_t** argv)
@@ -339,6 +366,8 @@ int wmain(int argc, wchar_t** argv)
     try
     {
         if (argc == 4 && wcscmp(argv[1], L"--replay") == 0) return Replay(argv[2], argv[3]);
+        if (argc == 5 && wcscmp(argv[1], L"--live-probe") == 0)
+            return LiveProbe(argv[2], argv[3], _wtoi(argv[4]));
         const std::pair<const char*, void(*)()> tests[] = {
             {"JsonRoundTripAndHistoricalBounds", JsonRoundTrip}, {"ExactUnseenAndFallback", ExactUnseenAndFallback},
             {"RejectMalformedFeatures", RejectMalformedFeatures}, {"ErrorFallbacks", ErrorFallbacks},
