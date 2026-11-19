@@ -265,7 +265,7 @@ Results are capped at 10,000 via `std::partial_sort` and full paths are built on
 flowchart LR
     Query["Query + selected time window"] --> Retrieve["Existing MFT / Windows Search retrieval"]
     Retrieve --> Baseline["Display baseline immediately"]
-    Baseline --> Worker["Async: up to 256 unique eligible local files"]
+    Baseline --> Worker["Async: retrieved local files in batches of at most 256"]
     Worker --> Freeze["GetSearchContext: current or explicit interval"]
     Freeze --> Score["ScoreCandidates: query + names / authorized snippets"]
     Score --> Validate["SDK JSON, reference / expiry / key / bound validation"]
@@ -311,6 +311,10 @@ invalidation discards its features. Expiry is also checked locally. Unchanged
 features do not rebuild the results list. Queries, candidate metadata and
 context features are not added to FindMyFile's persistent index, and WARP's
 search API does not persist them either.
+All eligible files in the retrieved set (at most 10,000) are assessed, not only
+the first 256. Batches share one frozen reference and the same overall timeout;
+an error or invalidation in any batch discards the entire response. Reranking
+still preserves the original candidate set and exact-match guard.
 
 The integration requests WARP's **activity** scope. If a restrictive policy is
 configured, `Find My File!.exe` must be allowed in the existing client/activity

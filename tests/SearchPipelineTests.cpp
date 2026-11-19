@@ -51,6 +51,8 @@ namespace
         Check(found->base == 75 && !found->exact, "eval prefix score/exact flag incorrect");
         Check(found->name == GuideName, "candidate filename corrupted");
         auto serializable = request; serializable.reference = "synthetic-context";
+        if (serializable.candidates.size() > WarpContext::MaxCandidates)
+            serializable.candidates.resize(WarpContext::MaxCandidates);
         Check(!WarpContext::CandidateRequest(serializable).empty(), "real candidate request rejected");
     }
 
@@ -93,6 +95,28 @@ namespace
         std::ofstream output(legacy, std::ios::binary); output.write(bytes.data(), bytes.size()); output.close();
         Check(LoadIndexFromFile(legacy), "legacy cache must remain readable for display");
         Check(!usnCheckpointValid, "legacy cache incorrectly treated as current");
+    }
+
+    void LaterMatchesAreNotSilentlyDroppedFromContextScoring()
+    {
+        SeedIndex();
+        for (int i = 0; i < 300; ++i)
+        {
+            UsnChange change{};
+            change.fileRef = 100+i; change.parentRef = 11;
+            change.fileName = L"eval-" + std::to_wstring(i) + L".txt";
+            change.reason = USN_REASON_FILE_CREATE;
+            pendingUsnChanges.push_back(std::move(change));
+        }
+        QueueGuide();
+        Check(ProcessPendingUsnChanges(), "journal changes missing");
+        CheckGuideRequest();
+        const auto request = BuildWarpRequest();
+        Check(request.candidates.size() == 301, "retrieved files truncated at one API batch");
+        const auto key = WarpContext::NormalizePath(SyntheticGuide);
+        const auto guide = std::find_if(request.candidates.begin(), request.candidates.end(),
+            [&](const WarpContext::Candidate& item) { return item.key == key; });
+        Check(size_t(guide-request.candidates.begin()) >= WarpContext::MaxCandidates, "fixture did not exercise a later batch");
     }
 
     void QueryCachedIndex(const std::wstring& query, const std::wstring& target, bool refresh)
@@ -170,6 +194,8 @@ int wmain(int argc, wchar_t** argv)
         std::cout << "PASS NewlyCreatedMarkdownIsRetrievedAndScored\n";
         CacheResumesOnlyFromAValidDurableCheckpoint();
         std::cout << "PASS CacheResumesOnlyFromAValidDurableCheckpoint\n";
+        LaterMatchesAreNotSilentlyDroppedFromContextScoring();
+        std::cout << "PASS LaterMatchesAreNotSilentlyDroppedFromContextScoring\n";
         RoUninitialize();
         return 0;
     }

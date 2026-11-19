@@ -1283,7 +1283,7 @@ static WarpContext::Request BuildWarpRequest()
         const auto key = WarpContext::NormalizePath(item.fullPath);
         if (!keys.insert(key).second) continue;
         request.candidates.push_back({key, item.fileName, item.contentSnippet, double(item.baseScore), ExactCandidate(item)});
-        if (request.candidates.size() == WarpContext::MaxCandidates) break;
+        if (request.candidates.size() == WarpContext::MaxSearchCandidates) break;
     }
     return request;
 }

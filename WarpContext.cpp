@@ -370,9 +370,22 @@ namespace WarpContext
         {
             Request request = original;
             if (cancelled()) throw std::runtime_error("cancelled");
-            // Validate before contacting the service; the reference is supplied by the next step.
+            if (original.candidates.empty() || original.candidates.size() > MaxSearchCandidates)
+                throw std::runtime_error("invalid_request");
+            std::set<std::wstring> keys;
+            for (const auto& candidate : original.candidates)
+                if (!keys.insert(NormalizePath(candidate.key)).second) throw std::runtime_error("invalid_request");
+            auto batch = [&](size_t offset) {
+                const auto end = std::min(original.candidates.size(), offset + MaxCandidates);
+                request.candidates.assign(original.candidates.begin()+offset, original.candidates.begin()+end);
+            };
+            // Validate the entire retrieved set before sending any query/candidate data.
             if (request.reference.empty()) request.reference = "validation";
-            CandidateRequest(request);
+            for (size_t offset = 0; offset < original.candidates.size(); offset += MaxCandidates)
+            {
+                batch(offset);
+                CandidateRequest(request);
+            }
             request.reference = original.reference;
             if (request.reference.empty())
             {
@@ -385,10 +398,25 @@ namespace WarpContext
                 Expiry(root, NowMs());
                 request.reference = Text(root, L"context_ref");
             }
-            if (cancelled()) throw std::runtime_error("cancelled");
-            const auto response = exchange(CandidateRequest(request), cancelled);
-            if (cancelled()) throw std::runtime_error("cancelled");
-            return DecodeScores(response, request, NowMs());
+            Result combined; combined.generation = original.generation;
+            for (size_t offset = 0; offset < original.candidates.size(); offset += MaxCandidates)
+            {
+                if (cancelled()) throw std::runtime_error("cancelled");
+                batch(offset);
+                const auto response = exchange(CandidateRequest(request), cancelled);
+                if (cancelled()) throw std::runtime_error("cancelled");
+                auto decoded = DecodeScores(response, request, NowMs());
+                if (!decoded.available) return decoded;
+                if (offset && (decoded.expiresMs != combined.expiresMs || decoded.reference != combined.reference))
+                    throw std::runtime_error("invalid_response");
+                combined.reference = decoded.reference; combined.expiresMs = decoded.expiresMs;
+                combined.partial = combined.partial || decoded.partial;
+                combined.features.insert(combined.features.end(),
+                    std::make_move_iterator(decoded.features.begin()), std::make_move_iterator(decoded.features.end()));
+            }
+            if (combined.expiresMs <= NowMs()) throw std::runtime_error("context_expired");
+            combined.available = true; combined.status = "ok";
+            return combined;
         }
         catch (const std::runtime_error& error) { result.status = error.what(); }
         catch (...) { result.status = "invalid_response"; }

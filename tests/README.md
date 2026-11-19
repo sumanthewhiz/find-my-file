@@ -40,6 +40,10 @@ only synthetic metadata and temporary caches: an `eval` prefix search must
 retrieve a newly created Markdown guide and send its actual filename and match
 tier. They also verify v3 checkpoint persistence, queued-change draining, legacy
 v2 invalidation, and rotated/expired journal rejection.
+The later-match regression puts the Markdown guide after 300 stronger baseline
+matches. A separate 600-candidate transport test verifies 256/256/88 batching,
+one frozen reference, delivery of the last candidate's score and atomic
+fallback if the final batch is invalidated.
 
 Explicit local diagnostics (not run in CI):
 

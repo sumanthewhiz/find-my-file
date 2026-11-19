@@ -11,6 +11,7 @@
 namespace WarpContext
 {
     constexpr size_t MaxCandidates = 256;
+    constexpr size_t MaxSearchCandidates = 10000;
     constexpr size_t MaxMessageBytes = 1024 * 1024;
     struct Candidate
     {

@@ -162,6 +162,52 @@ namespace
         Check(DeltaText(0, false) == L"\u2014", "unassessed result must remain distinct");
         Check(DeltaText(7.2, true) == L"+7.2", "positive delta display changed");
     }
+    void AllRetrievedCandidatesUseOneReferenceAndFailAtomically()
+    {
+        Request request; request.query = L"eval";
+        for (int i = 0; i < 600; ++i)
+        {
+            const auto name = L"eval-" + std::to_wstring(i) + L".md";
+            request.candidates.push_back({L"C:\\Synthetic\\"+name,name,L"",75,false});
+        }
+        const auto now = NowMs();
+        int contextCalls = 0, scoreCalls = 0;
+        std::vector<uint32_t> sizes;
+        bool failLast = false;
+        auto exchange = [&](const std::string& text, const Cancelled&) {
+            const auto root = JsonObject::Parse(winrt::to_hstring(text));
+            if (root.GetNamedString(L"op") == L"GetSearchContext")
+            {
+                ++contextCalls; Request reference; reference.reference = "one-frozen-reference";
+                return winrt::to_string(Reference(reference).Stringify());
+            }
+            ++scoreCalls;
+            Check(root.GetNamedString(L"context_ref") == L"one-frozen-reference", "context changed between batches");
+            const auto rows = root.GetNamedArray(L"candidates");
+            sizes.push_back(rows.Size());
+            if (failLast && scoreCalls == 3)
+                return std::string("{\"api_version\":2,\"ok\":false,\"error\":{\"code\":\"context_invalidated\"}}");
+            Request chunk; chunk.reference = "one-frozen-reference";
+            std::vector<double> deltas;
+            for (const auto& value : rows)
+            {
+                const auto row = value.GetObject();
+                chunk.candidates.push_back({std::wstring(row.GetNamedString(L"key")),
+                    std::wstring(row.GetNamedString(L"name")),L"",row.GetNamedNumber(L"base_score"),false});
+                deltas.push_back(row.GetNamedString(L"name") == L"eval-599.md" ? 4.2 : 0);
+            }
+            return winrt::to_string(Packet(chunk,deltas,now).Stringify());
+        };
+        auto result = Evaluate(request, exchange, [] { return false; });
+        Check(result.available && result.features.size() == 600, "later retrieved candidates not assessed");
+        Check(contextCalls == 1 && sizes == std::vector<uint32_t>({256,256,88}), "unbounded request or multiple contexts");
+        Check(result.features.back().delta == 4.2, "last-batch boost lost");
+        failLast = true; contextCalls = scoreCalls = 0; sizes.clear();
+        result = Evaluate(request, exchange, [] { return false; });
+        Check(!result.available && result.features.empty() && result.status == "context_invalidated",
+            "partial batches survived invalidation");
+    }
+
     void RelevanceAndBatchLimits()
     {
         auto request = Sample(); request.candidates[1].base = 15;
@@ -372,6 +418,7 @@ int wmain(int argc, wchar_t** argv)
             {"JsonRoundTripAndHistoricalBounds", JsonRoundTrip}, {"ExactUnseenAndFallback", ExactUnseenAndFallback},
             {"RejectMalformedFeatures", RejectMalformedFeatures}, {"ErrorFallbacks", ErrorFallbacks},
             {"NoBoostDiagnosticsAreNotTransportFailures", NoBoostDiagnosticsAreNotTransportFailures},
+            {"AllRetrievedCandidatesUseOneReferenceAndFailAtomically", AllRetrievedCandidatesUseOneReferenceAndFailAtomically},
             {"RelevanceAndBatchLimits", RelevanceAndBatchLimits}, {"TwoStageAndReferenceReuse", TwoStageAndReferenceReuse},
             {"PipeChunksAndPeer", PipeChunksAndPeer}, {"PipeTimeoutAndBound", PipeTimeoutAndBound},
             {"LatestRequestWins", LatestRequestWins}};
