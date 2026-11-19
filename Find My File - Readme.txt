@@ -23,7 +23,7 @@ FEATURES
     in real time and the index updates automatically
   - WARP context ranking (optional): bounded query-specific boosts, exact-match
     protection, no unseen-file penalty, and baseline fallback without WARP.
-    Select current context, past 30 minutes, past 2 hours, or past 24 hours.
+    Select Current context (15m), past 30 minutes, past 2 hours, or past 24 hours.
 
   Windows Search Integration
   - Full-text content search via the Windows Search Indexer
@@ -83,9 +83,14 @@ USAGE
        - Double-click to open the file
   6. Right-click a result for: Open, Copy Path, Open Containing Folder.
   7. Scope searches by selecting a folder in the tree before searching.
+     Select the drive root to search the whole drive again.
   8. Use wildcards: *.pdf, report_202?.*, *budget*
   9. Toggle WARP context to compare baseline/context ranking. Inspect Context +
      and the properties explanation. No model runs in the search request.
+     Choose a past window for older activity: Current covers only 15 minutes.
+     A 0.0 score is an assessed result without a boost; a dash is unassessed.
+     WARP summaries are not additional search results, and zero scores do not
+     hide matching files.
 
   Cloud Setup:
 

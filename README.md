@@ -289,6 +289,8 @@ flowchart LR
 5. Select **Past 30 minutes**, **Past 2 hours**, or **Past 24 hours** to correlate
    with evidence in that interval instead of today's dominant task. These are
    ranking contexts, not hard filters claiming every result was opened.
+   **Current context (15m)** considers the last 15 minutes; a file mentioned in an
+   older or wider WARP summary need not receive a boost in that current window.
 
 The client prefers `\\.\pipe\WarpFileActivityAPI-<session>`, with a legacy-name
 fallback, and checks server PID, user, session and executable name. This is not
@@ -319,11 +321,24 @@ All eligible files in the retrieved set (at most 10,000) are assessed, not only
 the first 256. Batches share one frozen reference and the same overall timeout;
 an error or invalidation in any batch discards the entire response. Reranking
 still preserves the original candidate set and exact-match guard.
+Local 8.3 short paths are expanded before candidate deduplication and score
+matching, consistent with WARP's file identity. Windows Search can return both
+short and long aliases: they now share one assessment without dropping either
+visible result or invalidating the rest of the batch. Expansion is best-effort
+and does not resolve UNC or mapped-network paths.
+Response decoding indexes candidates by canonical key once per batch, rather
+than repeatedly normalizing every candidate for each returned score.
+
+If a known file seems missing, select the drive root in **Browse** to remove a
+previous folder restriction, then search again. WARP reranks retrieved files;
+it does not import the `summary_files` list as extra search results. For an older
+observation, choose the corresponding time window and inspect **Context +** and
+the result's full path. A zero score does not remove a result.
 
 The integration requests WARP's **activity** scope. If a restrictive policy is
 configured, `Find My File!.exe` must be allowed in the existing client/activity
 lists. The app does not weaken policy or change registry settings. The status
-line distinguishes unavailable, denied, expired and invalid responses.
+line distinguishes unavailable, denied, expired, rejected requests and invalid responses.
 
 The shared ranker is copied byte-for-byte from WARP; the evaluator checks its
 hash against the recorded source. A same-directory association is a hypothesis,

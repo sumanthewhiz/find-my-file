@@ -13,6 +13,7 @@
 #include <cmath>
 #include <filesystem>
 #include <fstream>
+#include <map>
 #include <memory>
 #include <set>
 #include <stdexcept>
@@ -58,6 +59,33 @@ namespace WarpContext
             if (text.size() > chars) text.resize(chars);
             if (!text.empty() && text.back() >= 0xD800 && text.back() <= 0xDBFF) text.pop_back();
             return text;
+        }
+        void ExpandLocalShortPath(std::wstring& path)
+        {
+            if (path.size() < 3 || path.size() > 32767 || path[1] != L':' || path[2] != L'\\' ||
+                !((path[0] >= L'A' && path[0] <= L'Z') || (path[0] >= L'a' && path[0] <= L'z')))
+                return;
+            bool shortName = false;
+            for (size_t i = 0; i + 1 < path.size(); ++i)
+                if (path[i] == L'~' && path[i + 1] >= L'0' && path[i + 1] <= L'9') { shortName = true; break; }
+            if (!shortName) return;
+            const wchar_t root[] = {path[0], L':', L'\\', L'\0'};
+            if (GetDriveTypeW(root) == DRIVE_REMOTE) return;
+
+            // Match WARP's local 8.3 identity expansion, without resolving network paths.
+            const bool extended = path.size() >= MAX_PATH;
+            const auto query = extended ? L"\\\\?\\" + path : path;
+            std::wstring expanded(query.size() + 64, L'\0');
+            DWORD size = GetLongPathNameW(query.c_str(), expanded.data(), (DWORD)expanded.size());
+            if (size >= expanded.size())
+            {
+                expanded.assign(size, L'\0');
+                size = GetLongPathNameW(query.c_str(), expanded.data(), (DWORD)expanded.size());
+            }
+            if (size == 0 || size >= expanded.size()) return;
+            expanded.resize(size);
+            if (extended && expanded.compare(0, 4, L"\\\\?\\") == 0) expanded.erase(0, 4);
+            path = std::move(expanded);
         }
         std::string ErrorCode(const JsonObject& root)
         {
@@ -205,6 +233,7 @@ namespace WarpContext
         if (path.compare(0, 8, L"\\\\?\\UNC\\") == 0) path = L"\\\\" + path.substr(8);
         else if (path.compare(0, 4, L"\\\\?\\") == 0) path.erase(0, 4);
         if (path.empty()) return path;
+        ExpandLocalShortPath(path);
         const int size = LCMapStringEx(LOCALE_NAME_INVARIANT, LCMAP_LOWERCASE,
             path.data(), static_cast<int>(path.size()), nullptr, 0, nullptr, nullptr, 0);
         if (size <= 0) return {};
@@ -244,6 +273,7 @@ namespace WarpContext
         if (result.status == "unknown_op") return L"WARP Phase C update required; baseline results";
         if (result.status == "context_invalidated") return L"WARP context cleared/changed; baseline results";
         if (result.status == "context_expired") return L"WARP context expired; baseline results";
+        if (result.status == "invalid_request") return L"WARP rejected the search request; baseline results";
         if (result.status == "invalid_response" || result.status == "untrusted_peer") return L"WARP response not accepted; baseline results";
         if (result.status == "timeout") return L"WARP timed out; baseline results";
         return L"WARP unavailable; baseline results";
@@ -322,15 +352,17 @@ namespace WarpContext
             const auto rows = root.GetNamedArray(L"candidates");
             if (request.candidates.empty() || rows.Size() != request.candidates.size() || rows.Size() > MaxCandidates)
                 throw std::runtime_error("invalid_response");
-            std::set<std::wstring> expected, seen;
-            for (const auto& item : request.candidates) expected.insert(NormalizePath(item.key));
+            std::map<std::wstring, const Candidate*> expected;
+            std::set<std::wstring> seen;
+            for (const auto& item : request.candidates) expected.emplace(NormalizePath(item.key), &item);
             if (expected.size() != request.candidates.size()) throw std::runtime_error("invalid_response");
             for (const auto& value : rows)
             {
                 const auto row = value.GetObject();
                 Feature feature;
                 feature.key = NormalizePath(std::wstring(row.GetNamedString(L"key")));
-                if (!expected.count(feature.key) || !seen.insert(feature.key).second)
+                const auto expectedCandidate = expected.find(feature.key);
+                if (expectedCandidate == expected.end() || !seen.insert(feature.key).second)
                     throw std::runtime_error("invalid_response");
                 feature.found = Bool(row, L"found");
                 const bool eligible = Bool(row, L"eligible");
@@ -339,8 +371,7 @@ namespace WarpContext
                 const double delta = Number(row, L"score_delta");
                 if (delta < 0 || delta > 8 || (delta > 0 && (!eligible || !fallback.empty())))
                     throw std::runtime_error("invalid_response");
-                const auto candidate = std::find_if(request.candidates.begin(), request.candidates.end(),
-                    [&](const Candidate& item) { return NormalizePath(item.key) == feature.key; });
+                const auto* candidate = expectedCandidate->second;
                 feature.delta = WarpSearch::BoundedDelta({candidate->base, delta, candidate->exact});
                 const auto reasons = row.GetNamedArray(L"reasons"), support = row.GetNamedArray(L"evidence_refs");
                 if (reasons.Size() > 16 || support.Size() > 16 || (delta > 0 && (!reasons.Size() || !support.Size())))

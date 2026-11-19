@@ -5,6 +5,8 @@
 #include "..\Find My File!.cpp"
 #include <psapi.h>
 #include <iostream>
+#include <winrt/Windows.Foundation.Collections.h>
+#include <winrt/Windows.Data.Json.h>
 #pragma comment(lib, "psapi.lib")
 
 namespace
@@ -149,6 +151,69 @@ namespace
         const auto guide = std::find_if(request.candidates.begin(), request.candidates.end(),
             [&](const WarpContext::Candidate& item) { return item.key == key; });
         Check(size_t(guide-request.candidates.begin()) >= WarpContext::MaxCandidates, "fixture did not exercise a later batch");
+    }
+
+    bool ShortPathAliasesShareOneContextAssessment()
+    {
+        SeedIndex();
+        wchar_t temporary[MAX_PATH]; GetTempPathW(MAX_PATH, temporary);
+        const auto folder = std::filesystem::path(temporary) /
+            (L"findmyfile-alias-" + std::to_wstring(GetCurrentProcessId()) + L"-" + std::to_wstring(GetTickCount64()));
+        std::filesystem::create_directory(folder);
+        struct Cleanup {
+            std::filesystem::path path;
+            ~Cleanup() { std::error_code ec; std::filesystem::remove_all(path, ec); }
+        } cleanup{folder};
+        const auto file = folder / L"context-evals-long-filename.md";
+        { std::ofstream output(file, std::ios::binary); output << "Synthetic alias regression"; }
+        std::vector<wchar_t> buffer(32768);
+        const DWORD length = GetShortPathNameW(file.c_str(), buffer.data(), (DWORD)buffer.size());
+        Check(length > 0 && length < buffer.size(), "cannot obtain test file's short path");
+        const std::wstring alias(buffer.data(), length);
+        if (_wcsicmp(alias.c_str(), file.c_str()) == 0) return false;
+
+        SearchResult row{};
+        row.fileName = file.filename().wstring(); row.fullPath = alias;
+        row.matchScore = row.baseScore = 60;
+        currentSearchKeyword = L"evals"; bWindowsSearch = true; bWildcardSearch = false;
+        baselineResults = {row};
+        row.fullPath = file.wstring(); baselineResults.push_back(row);
+        row.fileName = GuideName; row.fullPath = SyntheticGuide; baselineResults.push_back(row);
+        auto request = BuildWarpRequest();
+        Check(request.candidates.size() == 2, "short and long paths reached WARP as duplicate canonical candidates");
+        const auto canonical = WarpContext::NormalizePath(file.wstring());
+        Check(request.candidates[0].key == canonical, "short path was not expanded before scoring");
+
+        request.reference = "synthetic-alias-context";
+        request.candidates[0].key = alias;
+        using namespace winrt::Windows::Data::Json;
+        const auto assessed = WarpContext::Evaluate(request, [&](const std::string& text, const WarpContext::Cancelled&) {
+            const auto sent = JsonObject::Parse(winrt::to_hstring(text));
+            const auto rows = sent.GetNamedArray(L"candidates");
+            Check(rows.Size() == 2 && rows.GetObjectAt(0).GetNamedString(L"key") == canonical,
+                "wire request retained the short-path alias");
+            auto response = JsonObject::Parse(LR"({"api_version":2,"ok":true,"context_ref":"synthetic-alias-context",
+                "rule_version":"phase-c-rank-1","partial":false,"max_score_delta":8,
+                "exact_matches_first":true,"query_and_candidates_persisted":false})");
+            response.Insert(L"expires_ms", JsonValue::CreateNumberValue(double(WarpContext::NowMs()+60000)));
+            JsonArray features;
+            for (const auto& value : rows)
+            {
+                auto feature = JsonObject::Parse(LR"({"found":true,"eligible":true,"fallback":"","score_delta":4.2,
+                    "reasons":["observed_in_requested_interval"],"evidence_refs":["synthetic:alias"]})");
+                feature.Insert(L"key", value.GetObject().GetNamedValue(L"key"));
+                features.Append(feature);
+            }
+            response.Insert(L"candidates", features);
+            return winrt::to_string(response.Stringify());
+        }, [] { return false; });
+        Check(assessed.available && assessed.features.size() == 2, "canonical response rejected for a short-path candidate");
+        ApplyWarpContext(assessed);
+        Check(searchResults.size() == 3, "context alias deduplication removed visible baseline rows");
+        Check(std::all_of(searchResults.begin(), searchResults.end(),
+            [](const SearchResult& result) { return result.warpBonus == 4.2 && !result.warpReason.empty(); }),
+            "an alias or unrelated guide lost its supported context score");
+        return true;
     }
 
     void LiveIndexUpdatesDoNotRestartTheDisplayedSearch()
@@ -680,6 +745,9 @@ int wmain(int argc, wchar_t** argv)
         std::cout << "PASS CacheResumesOnlyFromAValidDurableCheckpoint\n";
         LaterMatchesAreNotSilentlyDroppedFromContextScoring();
         std::cout << "PASS LaterMatchesAreNotSilentlyDroppedFromContextScoring\n";
+        if (ShortPathAliasesShareOneContextAssessment())
+            std::cout << "PASS ShortPathAliasesShareOneContextAssessment\n";
+        else std::cout << "SKIP ShortPathAliasesShareOneContextAssessment (volume does not create 8.3 aliases)\n";
         LiveIndexUpdatesDoNotRestartTheDisplayedSearch();
         std::cout << "PASS LiveIndexUpdatesDoNotRestartTheDisplayedSearch\n";
         ProgressPumpYieldsWhenMessagesKeepArriving();

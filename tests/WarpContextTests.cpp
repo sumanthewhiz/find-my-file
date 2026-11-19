@@ -133,12 +133,15 @@ namespace
     void ErrorFallbacks()
     {
         const auto request = Sample();
-        for (const auto code : {"forbidden", "unknown_op", "context_expired", "context_invalidated"})
+        for (const auto code : {"forbidden", "unknown_op", "context_expired", "context_invalidated", "invalid_request"})
         {
             const auto text = std::string("{\"api_version\":2,\"ok\":false,\"error\":{\"code\":\"") + code + "\",\"message\":\"test\"}}";
             const auto result = DecodeScores(text, request, NowMs());
             Check(!result.available && result.status == code, "error code not preserved");
             Check(Order(request, result) == Order(request, {}), "failure changed ranking");
+            if (result.status == "invalid_request")
+                Check(StatusText(result).find(L"rejected") != std::wstring::npos,
+                    "request validation failure mislabeled as a missing WARP connection");
         }
     }
     void NoBoostDiagnosticsAreNotTransportFailures()
@@ -213,6 +216,13 @@ namespace
         auto request = Sample(); request.candidates[1].base = 15;
         const auto result = DecodeScores(winrt::to_string(Packet(request, {0, 8, 0}).Stringify()), request, NowMs());
         Check(result.available && result.features[1].delta == 0, "weak relevance rescued by context");
+        request.candidates[0].exact = false;
+        auto reordered = Packet(request, {4.2, 8, 0});
+        auto rows = reordered.GetNamedArray(L"candidates");
+        const auto first = rows.GetAt(0); rows.SetAt(0, rows.GetAt(1)); rows.SetAt(1, first);
+        const auto byKey = DecodeScores(winrt::to_string(reordered.Stringify()), request, NowMs());
+        Check(byKey.available && byKey.features[0].delta == 0 && byKey.features[1].delta == 4.2,
+            "response order changed which candidate's relevance bound was applied");
         request.candidates.resize(257);
         int calls = 0;
         const auto invalid = Evaluate(request, [&](const std::string&, const Cancelled&) { ++calls; return ""; }, [] { return false; });

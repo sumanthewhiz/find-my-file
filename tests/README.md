@@ -44,6 +44,14 @@ The later-match regression puts the Markdown guide after 300 stronger baseline
 matches. A separate 600-candidate transport test verifies 256/256/88 batching,
 one frozen reference, delivery of the last candidate's score and atomic
 fallback if the final batch is invalidated.
+The short-path regression creates a temporary file with an NTFS 8.3 alias and
+passes both spellings through the production request builder, serializer,
+decoder and rank application. It verifies one canonical assessment, retention
+of both visible rows, and an unaffected third candidate. It explicitly skips
+when the temporary volume does not generate 8.3 aliases; it never enables that
+filesystem setting or requires administrator privileges.
+Reordered feature packets must still use each candidate's own relevance bound,
+not the position of its row in the response.
 
 Memory/catch-up regressions rebuild 20,000 long tokens within a pointer-sized
 allocation budget, check prefix lookup after map growth/deletion, inject an

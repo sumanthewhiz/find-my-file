@@ -5346,7 +5346,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
             hWarpWindow = CreateWindowExW(0, L"COMBOBOX", L"",
                 WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST,
                 190, 42, 180, 160, hWnd, (HMENU)IDC_WARP_WINDOW, hInst, NULL);
-            for (const auto label : {L"Current context", L"Past 30 minutes", L"Past 2 hours", L"Past 24 hours"})
+            for (const auto label : {L"Current context (15m)", L"Past 30 minutes", L"Past 2 hours", L"Past 24 hours"})
                 SendMessage(hWarpWindow, CB_ADDSTRING, 0, (LPARAM)label);
             SendMessage(hWarpWindow, CB_SETCURSEL, 0, 0);
             hWarpStatus = CreateWindowExW(0, L"STATIC", L"Context is checked only after retrieving search candidates.",
