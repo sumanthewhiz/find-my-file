@@ -386,6 +386,16 @@ receive a contextual score.
   offline changes, and makes changed entries available to the next search.
   Unrelated filesystem activity does not restart the displayed query or clear its scores.
 
+Sorted prefix/fuzzy lookup lists reference the existing index keys rather than
+duplicating millions of filename/token strings. Journal catch-up holds at most
+8,192 pending changes and waits for the UI consumer instead of growing an
+unbounded backlog. Each UI turn applies at most 128 changes; the sorted lookup
+view is rebuilt once when a search needs it, not after every catch-up batch.
+Allocation failure stops the incomplete update, disables
+search on that partial state, and leaves the previous saved cache unchanged.
+Win32 release builds are large-address-aware; ARM64/x64 are still preferred for
+multi-million-file indexes because 32-bit address space remains finite.
+
 **Deferred startup loading:**
 - `WM_CREATE` posts a `WM_LOAD_CACHED_INDEX` message to itself and returns immediately, so the window appears instantly
 - The actual index load runs when the message loop processes `WM_LOAD_CACHED_INDEX`, after the window is visible and painted

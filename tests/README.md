@@ -45,9 +45,19 @@ matches. A separate 600-candidate transport test verifies 256/256/88 batching,
 one frozen reference, delivery of the last candidate's score and atomic
 fallback if the final batch is invalidated.
 
+Memory/catch-up regressions rebuild 20,000 long tokens within a pointer-sized
+allocation budget, check prefix lookup after map growth/deletion, inject an
+allocation failure without overwriting the saved cache, and exercise queue
+backpressure, draining and stop cancellation. CI runs these on **Win32 and x64**,
+including deferred lookup rebuild and bounded UI work during replay,
+not merely cross-compiling the x86 executable. They use synthetic metadata, not
+the user's index.
+
 Explicit local diagnostics (not run in CI):
 
 ```powershell
+# Reads the existing cache, replays synthetic creates/deletes in memory, never saves it.
+.\build\tests\Win32\SearchPipelineTests.exe --startup-replay
 # Reads the existing index and contacts installed WARP; does not open the target.
 .\build\tests\x64\SearchPipelineTests.exe --cached-query eval 'C:\Work\Search Evals Guide.md'
 # Bypasses retrieval to isolate the production serializer/pipe/scorer, window in seconds.

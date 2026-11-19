@@ -76,6 +76,15 @@ jobs:
       shell: pwsh
       run: .\tests\run_context_quality.ps1 -Platform x64 -Toolset $env:FMF_TOOLSET
 
+    - name: Exercise 32-bit index memory and catch-up regressions
+      if: matrix.platform == 'x86'
+      shell: pwsh
+      run: |
+        msbuild tests\SearchPipelineTests.vcxproj /p:Configuration=Release /p:Platform=Win32 /p:PlatformToolset=$env:FMF_TOOLSET /m /v:minimal
+        if ($LASTEXITCODE) { throw 'Win32 pipeline build failed.' }
+        .\build\tests\Win32\SearchPipelineTests.exe
+        if ($LASTEXITCODE) { throw 'Win32 pipeline tests failed.' }
+
     - name: Exercise actual showcase UI toggle
       if: matrix.platform == 'x64'
       shell: pwsh

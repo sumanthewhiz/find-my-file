@@ -1,6 +1,35 @@
 #include <filesystem>
+#include <cstdlib>
+#include <future>
+#include <new>
 #include "..\Find My File!.cpp"
+#include <psapi.h>
 #include <iostream>
+#pragma comment(lib, "psapi.lib")
+
+namespace
+{
+    thread_local size_t allocationBudget = SIZE_MAX;
+    struct AllocationLimit
+    {
+        explicit AllocationLimit(size_t bytes) { allocationBudget = bytes; }
+        ~AllocationLimit() { allocationBudget = SIZE_MAX; }
+    };
+}
+
+void* operator new(size_t bytes)
+{
+    if (bytes > allocationBudget) throw std::bad_alloc();
+    void* memory = std::malloc(bytes ? bytes : 1);
+    if (!memory) throw std::bad_alloc();
+    if (allocationBudget != SIZE_MAX) allocationBudget -= bytes;
+    return memory;
+}
+void* operator new[](size_t bytes) { return ::operator new(bytes); }
+void operator delete(void* memory) noexcept { std::free(memory); }
+void operator delete[](void* memory) noexcept { std::free(memory); }
+void operator delete(void* memory, size_t) noexcept { std::free(memory); }
+void operator delete[](void* memory, size_t) noexcept { std::free(memory); }
 
 namespace
 {
@@ -13,6 +42,7 @@ namespace
     void SeedIndex()
     {
         StopUsnMonitor();
+        indexMemoryFailed = false;
         fileMap.clear(); childrenMap.clear(); timestampCache.clear(); pendingUsnChanges.clear();
         currentDriveLetter = L"C";
         const auto add = [](ULONGLONG id, ULONGLONG parent, const std::wstring& name, bool directory) {
@@ -109,7 +139,7 @@ namespace
             pendingUsnChanges.push_back(std::move(change));
         }
         QueueGuide();
-        Check(ProcessPendingUsnChanges(), "journal changes missing");
+        Check(ProcessPendingUsnChanges(true), "journal changes missing");
         CheckGuideRequest();
         const auto request = BuildWarpRequest();
         Check(request.candidates.size() == 301, "retrieved files truncated at one API batch");
@@ -134,6 +164,166 @@ namespace
         DestroyWindow(window);
         Check(!restarted, "background filesystem activity restarted the displayed search");
         Check(fileMap.count(999) == 1, "index update was discarded");
+    }
+
+    void SortedLookupGrowthStaysWithinPointerMemoryBudget()
+    {
+        SeedIndex();
+        const std::wstring prefix = L"unique-eval-" + std::wstring(120,L'x') + L"-";
+        for (int i = 0; i < 20000; ++i)
+            invertedIndex[prefix+std::to_wstring(i)] = {12};
+        decltype(sortedTokens){}.swap(sortedTokens);
+        decltype(sortedStemTokens){}.swap(sortedStemTokens);
+        {
+            AllocationLimit limit((invertedIndex.size()+stemmedIndex.size())*sizeof(void*)+4096);
+            RebuildSortedTokens();
+        }
+        size_t matches = 0;
+        ForEachPrefixMatch(sortedTokens,invertedIndex,prefix,
+            [&](const std::wstring&,const std::vector<ULONGLONG>&){ ++matches; });
+        Check(matches == 20000, "prefix lookup lost tokens after memory-bounded rebuild");
+        invertedIndex.rehash(invertedIndex.bucket_count()*2);
+        matches = 0;
+        ForEachPrefixMatch(sortedTokens,invertedIndex,prefix,
+            [&](const std::wstring&,const std::vector<ULONGLONG>&){ ++matches; });
+        Check(matches == 20000, "rehashing invalidated sorted lookup");
+        invertedIndex.erase(prefix+L"0");
+        RebuildSortedTokens();
+        matches = 0;
+        ForEachPrefixMatch(sortedTokens,invertedIndex,prefix,
+            [&](const std::wstring&,const std::vector<ULONGLONG>&){ ++matches; });
+        Check(matches == 19999, "deleted token remained in sorted lookup");
+    }
+
+    void AllocationFailurePreservesTheSavedCache()
+    {
+        SeedIndex();
+        wchar_t temporary[MAX_PATH]; GetTempPathW(MAX_PATH,temporary);
+        const auto folder = std::filesystem::path(temporary) /
+            (L"findmyfile-memory-" + std::to_wstring(GetCurrentProcessId()) + L"-" + std::to_wstring(GetTickCount64()));
+        std::filesystem::create_directory(folder);
+        struct Cleanup { std::filesystem::path path; ~Cleanup(){ std::error_code ec; std::filesystem::remove_all(path,ec); } } cleanup{folder};
+        const auto cache = (folder/L"index.db").wstring();
+        usnJournalId = 19; lastUsnProcessed = 1200; usnCheckpointValid = true;
+        Check(SaveIndexToFile(cache),"initial cache save failed");
+        const auto bytes = std::filesystem::file_size(cache);
+        QueueGuide();
+        bool applied = true;
+        {
+            AllocationLimit limit(0);
+            applied = ProcessPendingUsnChanges();
+        }
+        Check(!applied && indexMemoryFailed && !usnCheckpointValid,"allocation failure escaped or remained persistable");
+        Check(!SaveIndexToFile(cache),"partial update overwrote the previous cache");
+        Check(std::filesystem::file_size(cache) == bytes,"cached snapshot changed after allocation failure");
+        Check(LoadIndexFromFile(cache),"previous cache could not be recovered");
+        Check(!fileMap.count(20) && !indexMemoryFailed,"partial journal row survived recovery");
+        UsnChange timestamp{}; timestamp.fileRef = 12; timestamp.reason = USN_REASON_BASIC_INFO_CHANGE;
+        pendingUsnChanges.push_back(timestamp);
+        Check(!ProcessPendingUsnChanges(),"timestamp-only update incorrectly changed token index");
+        currentSearchKeyword = L"old"; PerformSearch(L"old");
+        Check(!searchResults.empty(),"timestamp-only update cleared prefix lookup");
+    }
+
+    void CatchUpDefersLargeLookupRebuildUntilSearch()
+    {
+        SeedIndex();
+        for (int i=0; i<20000; ++i)
+            invertedIndex[L"existing-eval-"+std::to_wstring(i)] = {12};
+        RebuildSortedTokens();
+        decltype(sortedTokens){}.swap(sortedTokens);
+        QueueGuide();
+        bool applied = false;
+        {
+            AllocationLimit limit(16384);
+            applied = ProcessPendingUsnChanges();
+        }
+        Check(applied && !indexMemoryFailed,"catch-up rebuilt the entire token view under memory pressure");
+        CheckGuideRequest();
+        std::vector<UsnChange> batch(MAX_UI_USN_CHANGES+1);
+        for (size_t i=0;i<batch.size();++i)
+        {
+            batch[i].fileRef = 100000+i; batch[i].reason = USN_REASON_BASIC_INFO_CHANGE;
+        }
+        pendingUsnChanges = std::move(batch);
+        ProcessPendingUsnChanges();
+        Check(timestampCache.count(100000+MAX_UI_USN_CHANGES-1)==1 &&
+            timestampCache.count(100000+MAX_UI_USN_CHANGES)==0,"UI catch-up exceeded its per-turn work bound");
+        StopUsnMonitor();
+        Check(timestampCache.count(100000+MAX_UI_USN_CHANGES)==1,"shutdown did not drain the remaining checkpoint changes");
+    }
+
+    void CatchUpBackpressureIsBoundedAndCancellable()
+    {
+        SeedIndex();
+        std::vector<UsnChange> full(MAX_PENDING_USN_CHANGES);
+        for (auto& change:full) { change.fileRef = 12; change.reason = USN_REASON_BASIC_INFO_CHANGE; }
+        auto run = [&](bool stop) {
+            bUsnMonitorRunning = true; lastUsnProcessed = 100;
+            Check(QueueUsnBatch(full,200),"initial catch-up batch rejected");
+            std::promise<void> entered; auto entering = entered.get_future();
+            auto producer = std::async(std::launch::async,[&] {
+                std::vector<UsnChange> next(1);
+                next[0].fileRef = 12; next[0].reason = USN_REASON_BASIC_INFO_CHANGE;
+                entered.set_value();
+                return QueueUsnBatch(next,300);
+            });
+            entering.wait();
+            const bool blocked = producer.wait_for(std::chrono::milliseconds(50)) == std::future_status::timeout;
+            size_t queued = 0;
+            { std::lock_guard<std::mutex> lock(usnMutex); queued = pendingUsnChanges.size(); }
+            if (stop) StopUsnMonitor(); else ProcessPendingUsnChanges();
+            const bool finished = producer.wait_for(std::chrono::seconds(2)) == std::future_status::ready;
+            if (!finished) { bUsnMonitorRunning = false; usnQueueSpace.notify_all(); }
+            const bool accepted = producer.get();
+            StopUsnMonitor();
+            Check(blocked && queued == MAX_PENDING_USN_CHANGES,"catch-up producer ran beyond its memory bound");
+            Check(finished && accepted == !stop,"blocked catch-up did not resume/cancel correctly");
+            Check(lastUsnProcessed == (stop ? 200 : 300),"journal cursor skipped an unqueued batch");
+        };
+        run(false);
+        run(true);
+    }
+
+    void ReplayExistingCacheStartup()
+    {
+        const auto started = GetTickCount64();
+        Check(LoadIndexFromFile(),"existing cached index unavailable");
+        const auto count = fileMap.size();
+        ULONGLONG first = 0;
+        for (const auto& pair:fileMap) first = (std::max)(first,pair.first);
+        ++first;
+        const std::wstring prefix = L"fmfstartupreplay"+std::to_wstring(GetCurrentProcessId())+L"-";
+        const size_t records = 1024;
+        for (bool remove : {false,true})
+        {
+            std::vector<UsnChange> batch(records);
+            for (size_t i=0;i<records;++i)
+            {
+                batch[i].fileRef = first+i; batch[i].parentRef = 5;
+                batch[i].fileName = prefix+std::to_wstring(i)+L".txt";
+                batch[i].reason = remove ? USN_REASON_FILE_DELETE : USN_REASON_FILE_CREATE;
+            }
+            bUsnMonitorRunning = true;
+            Check(QueueUsnBatch(batch,lastUsnProcessed),"synthetic catch-up batch rejected");
+            for (;;)
+            {
+                { std::lock_guard<std::mutex> lock(usnMutex); if(pendingUsnChanges.empty()) break; }
+                ProcessPendingUsnChanges();
+                Check(!indexMemoryFailed,"cached catch-up exhausted memory");
+            }
+            currentSearchKeyword = prefix;
+            PerformSearch(prefix);
+            Check(!indexMemoryFailed,"cached lookup rebuild exhausted memory");
+            Check(searchResults.size() == (remove ? 0 : records),"cached search missed synthetic create/delete changes");
+        }
+        StopUsnMonitor();
+        PROCESS_MEMORY_COUNTERS_EX memory{};
+        GetProcessMemoryInfo(GetCurrentProcess(),reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&memory),sizeof(memory));
+        std::cout << "PASS existing_cache_startup_replay entries=" << count
+            << " synthetic_changes=" << records*2 << " pointer_bits=" << sizeof(void*)*8
+            << " private_mb=" << memory.PrivateUsage/(1024*1024)
+            << " elapsed_ms=" << GetTickCount64()-started << " cache_written=false\n";
     }
 
     void QueryCachedIndex(const std::wstring& query, const std::wstring& target, bool refresh)
@@ -201,6 +391,12 @@ int wmain(int argc, wchar_t** argv)
     if (FAILED(hr)) return 1;
     try
     {
+        if (argc == 2 && wcscmp(argv[1],L"--startup-replay") == 0)
+        {
+            ReplayExistingCacheStartup();
+            RoUninitialize();
+            return 0;
+        }
         if (argc == 4 && (wcscmp(argv[1], L"--cached-query") == 0 || wcscmp(argv[1], L"--refresh-cached-query") == 0))
         {
             QueryCachedIndex(argv[2], argv[3], wcscmp(argv[1], L"--refresh-cached-query") == 0);
@@ -215,6 +411,14 @@ int wmain(int argc, wchar_t** argv)
         std::cout << "PASS LaterMatchesAreNotSilentlyDroppedFromContextScoring\n";
         LiveIndexUpdatesDoNotRestartTheDisplayedSearch();
         std::cout << "PASS LiveIndexUpdatesDoNotRestartTheDisplayedSearch\n";
+        SortedLookupGrowthStaysWithinPointerMemoryBudget();
+        std::cout << "PASS SortedLookupGrowthStaysWithinPointerMemoryBudget\n";
+        AllocationFailurePreservesTheSavedCache();
+        std::cout << "PASS AllocationFailurePreservesTheSavedCache\n";
+        CatchUpDefersLargeLookupRebuildUntilSearch();
+        std::cout << "PASS CatchUpDefersLargeLookupRebuildUntilSearch\n";
+        CatchUpBackpressureIsBoundedAndCancellable();
+        std::cout << "PASS CatchUpBackpressureIsBoundedAndCancellable\n";
         RoUninitialize();
         return 0;
     }
